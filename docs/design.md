@@ -43,7 +43,8 @@ src/
   analyze/          analyze.ts report.ts
   runtime/          shim.ts firefox-compat-shim.js oauth-bridge.ts debug-ring.js
   sign/             amo.ts
-  firefox/          locate.ts profiles.ts rdp.ts bidi.ts install.ts storage.ts
+  firefox/          locate.ts appconstants.ts profiles.ts cityhash.ts bidi.ts launch.ts
+                    install.ts extensions-json.ts storage.ts snappy.ts structured-clone.ts
                     platform/darwin.ts platform/win32.ts platform/linux.ts
 scripts/
   gen-compat.ts     builds the native/unsupported columns of compat-data.ts from MDN data
@@ -73,15 +74,17 @@ Progress lines stay stable so the Viaduct app can map them to phases the way it 
 ## Manifest transform
 
 - Set `browser_specific_settings.gecko.id` from `--addon-id`, or use the derived ID described under signing.
-- Set `browser_specific_settings.gecko.strict_min_version` from `--min-firefox`. The default is the current ESR major version.
-- With `--platforms android` or `all`, also write `browser_specific_settings.gecko_android`.
+- Set `browser_specific_settings.gecko.strict_min_version` from `--min-firefox`. The default is 153, the current ESR. It is a constant in the source, raised at each new ESR (175 arrives on 2027-06-29).
+- With `--platforms android` or `all`, also write `browser_specific_settings.gecko_android` (an empty object enables Android without a version range).
+- Write `browser_specific_settings.gecko.data_collection_permissions` only when `--data-collection <list>` is given (for example `--data-collection none`). The tool can't know what a third-party extension collects, so it never fills this in on its own. AMO requires the key for new add-ons; when it's missing, the AMO route passes on AMO's warning.
 - Convert `background.service_worker` into `background.scripts`. Firefox runs background scripts as event pages rather than service workers. Scripts loaded through a literal `importScripts(...)` list are moved into the `scripts` array ahead of the worker, using viaduct-cli's hoisting logic. `background.type: "module"` is kept because Firefox supports module background scripts.
 - Rewrite `chrome-extension://` to `moz-extension://` in staged sources.
 - Remove `key`, `update_url` and `minimum_chrome_version`.
-- Map `side_panel` to `sidebar_action`. `--panel-query` controls the query string on the sidebar page, with the same default as viaduct-cli.
+- Map `side_panel` to `sidebar_action`, with `open_at_install: false` so Firefox does not open the sidebar on install. `--panel-query` controls the query string on the sidebar page, with the same default as viaduct-cli.
 - Replace `externally_connectable` with the page bridge from viaduct-cli's `oauth-bridge.ts`. `--no-oauth-bridge` turns this off.
-- Run `dnr.ts` with Firefox's declarativeNetRequest rule limits and supported actions.
-- Change `incognito: "split"` to `"spanning"` and warn, because Firefox does not support split mode.
+- Run `dnr.ts` with Firefox's declarativeNetRequest limits: 20 enabled static rulesets, 30,000 static rules, 5,000 dynamic and 5,000 session rules, and 1,000 regex rules. Rules using conditions Firefox lacks (`responseHeaders`, `excludedResponseHeaders`, `domains`, `excludedDomains`) or resource types `webbundle`/`webtransport` are dropped with a warning, because Firefox drops invalid static rules silently.
+- Delete `incognito: "split"` (giving the default, `spanning`) and warn. Firefox would otherwise fall back to `not_allowed`.
+- Keep `content_scripts[].world: "MAIN"` (Firefox 128+) and MV3 `host_permissions` (granted at install from Firefox 127). When `--min-firefox` is set lower than those versions, `--analyze` reports them.
 
 ## Compatibility table
 
@@ -93,7 +96,7 @@ Progress lines stay stable so the Viaduct app can map them to phases the way it 
 
 - `chrome.sidePanel.*` on top of `sidebarAction`.
 - `chrome.offscreen.*` using a hidden iframe in the event page, since Firefox's background page has a DOM.
-- `chrome.identity.getAuthToken` on top of `launchWebAuthFlow`, ported from viaduct-cli's `identity-polyfill.js`.
+- `chrome.identity.getAuthToken`, `removeCachedAuthToken` and `getProfileUserInfo` on top of `launchWebAuthFlow`, ported from viaduct-cli's `identity-polyfill.js`. Firefox implements only `getRedirectURL` and `launchWebAuthFlow`.
 - `chrome://favicon` and `_favicon` URLs.
 - Smaller `runtime` and `tabs` gaps found while testing against the extension corpus.
 
@@ -106,7 +109,7 @@ The shim is injected first in background scripts, every content script and every
 `--sign auto` is the default. It uses the first route that applies and prints which one it chose and why:
 
 1. `amo`, when AMO credentials are configured.
-2. `unsigned`, when the target Firefox is Nightly, Developer Edition, ESR or an unbranded build. These builds can turn off signature enforcement.
+2. `unsigned`, when the target Firefox build lets the user turn off signature enforcement. That is decided by reading `MOZ_REQUIRE_SIGNING` from the install's `omni.ja` (`modules/AppConstants.sys.mjs`). Nightly, Developer Edition, ESR and unbranded builds allow it; release and beta don't.
 3. `temporary` otherwise.
 
 `--sign amo|unsigned|temporary` forces a route. A forced route that cannot work, for example `unsigned` against release Firefox, fails with an explanation.
@@ -115,20 +118,23 @@ The shim is injected first in background scripts, every content script and every
 
 Credentials come from `--amo-key` and `--amo-secret`, the environment variables `LAVADUCT_AMO_KEY` and `LAVADUCT_AMO_SECRET`, web-ext's `WEB_EXT_API_KEY` and `WEB_EXT_API_SECRET`, or the config file, in that order of precedence.
 
-`sign/amo.ts` talks to AMO's v5 API:
+`sign/amo.ts` talks to AMO's v5 API, following what web-ext does:
 
-1. Build a JWT (HS256 via `node:crypto`) with `iss` set to the key, a random `jti`, and a 60-second expiry. A fresh token is made for every request.
-2. Upload the `.xpi` with `channel=unlisted` and poll the upload until validation finishes. Validation errors are added to the conversion report and the run exits 1.
-3. Create the add-on, or a new version if the add-on ID already exists on the account.
-4. Poll the version until its file is signed, then download the signed `.xpi`.
+1. Every request carries `Authorization: JWT <token>`, an HS256 token (via `node:crypto`) with `iss` set to the key, `iat` now and `exp` 300 seconds later. A fresh token is made for each request.
+2. `POST /api/v5/addons/upload/` with the `.xpi` and `channel=unlisted`, then poll `GET /api/v5/addons/upload/<uuid>/` every second until `processed` is true. If `valid` is false, AMO's validation messages are added to the conversion report and the run exits 1. AMO's warnings are printed but don't stop the run.
+3. `PUT /api/v5/addons/addon/<guid>/` with `{"version":{"upload":"<uuid>"}}`. This creates the add-on (201) or a new version of it (200). Unlisted add-ons need no other metadata.
+4. Poll `GET /api/v5/addons/addon/<guid>/versions/<version_id>/` every 5 seconds. `file.status` of `public` means signed; `disabled` means rejected and ends the run with exit 1.
+5. Download `file.url`, sending the JWT header (AMO answers 404 without it for unlisted files).
 
-AMO add-on IDs belong to whoever submits them first, so an ID like `dark-reader@viaduct` would collide between users. The derived ID is `<chromeId>.<salt>@lavaduct`, where `chromeId` is the Web Store ID (or a hash of the manifest name for local inputs) and `salt` is 8 random hex characters created once and kept in the state directory. The same user converting the same extension always gets the same ID, so updates replace the existing add-on and keep its storage.
+A 429 response is retried after its `Retry-After` delay. AMO allows about 10 submissions per user per hour, so a large batch will wait; the CLI prints how long. A 403 on the PUT means the add-on ID belongs to another AMO account, and the run says so.
 
-AMO will not sign the same version number twice for one add-on. Signed files are cached in the state directory by add-on ID and a SHA-256 of the packed contents, so re-running an unchanged conversion reuses the cached file. If the contents changed but the upstream version did not, the signed build gets a fourth version component one higher than the last one signed. If the upstream version already has four components, the run fails and suggests `--addon-version <x.y.z.w>`.
+AMO add-on IDs belong to whoever submits them first, so an ID like `dark-reader@viaduct` would collide between users. The derived ID is `<chromeId>.<salt>@lavaduct`, where `chromeId` is the Web Store ID (or a hash of the manifest name for local inputs) and `salt` is 8 random hex characters created once and kept in the state directory. The derived ID has at most 80 characters from `[A-Za-z0-9._-]`, AMO's limit. The same user converting the same extension always gets the same ID, so updates replace the existing add-on and keep its storage.
 
-If signing has not finished after 15 minutes, the run stores the upload ID against the add-on ID and content hash, prints the AMO status URL, and exits 1. The next run with the same input resumes polling instead of uploading again.
+AMO never accepts a version number that was used before for that add-on, even if that version was rejected or deleted. Signed files are cached in the state directory by add-on ID and a SHA-256 of the packed contents, so re-running an unchanged conversion reuses the cached file without contacting AMO. The state directory also records every version submitted per add-on ID. When the contents changed but the upstream version did not, or the PUT returns 409 because the version was used before, the build gets a fourth version component one higher than the highest one recorded, and is re-uploaded. If the upstream version already has four components, the run fails and suggests `--addon-version <x.y.z.w>`.
 
-Unlisted add-ons are still subject to Mozilla's add-on policies and can be reviewed after signing. Obfuscated code may be rejected, and a signed add-on can later be disabled. The README states this, and the first AMO run on a machine prints a one-time notice.
+If signing has not finished after 15 minutes, the run stores the add-on ID, version ID and content hash, prints the AMO status URL, and exits 1. The next run with the same input resumes polling that version instead of uploading again.
+
+Unlisted add-ons are still subject to Mozilla's add-on policies and can be reviewed after signing. Obfuscated or minified code may be rejected, a signed add-on can later be disabled, and from 2026-12-01 Mozilla's policy requires source code for machine-generated or minified code. The README states this, and the first AMO run on a machine prints a one-time notice.
 
 ### Unsigned route
 
@@ -136,25 +142,38 @@ Write `user_pref("xpinstall.signatures.required", false);` to the profile's `use
 
 ### Installing a signed or unsigned .xpi
 
-The CLI launches the chosen Firefox with the profile and the `.xpi` path (`firefox -P <profile> <file.xpi>`, or `--profile <path>` for a path). Firefox shows its normal install prompt, and this works whether Firefox is already running or not. `--no-launch` stops once the `.xpi` is written. `--verify` polls the profile's `extensions.json` until the add-on ID is present, enabled and at the expected version, and fails after 60 seconds.
+The CLI launches the chosen Firefox with the profile and the absolute `.xpi` path: `firefox -P <name> <file.xpi>` for a registered profile, `firefox --profile <path> <file.xpi>` otherwise. Firefox shows its normal install prompt. If Firefox is already running with that profile, the running instance shows the prompt; the path has to be absolute because macOS does not pass the working directory along. `--no-launch` stops once the `.xpi` is written. `--verify` polls the profile's `extensions.json` until the add-on ID is present, enabled and at the expected version, and fails after 120 seconds, which leaves the user time to accept the prompt.
 
 ### Temporary route
 
-The CLI starts Firefox with a remote debugging port and installs the add-on over WebDriver BiDi with `webExtension.install` (`firefox/bidi.ts`). When the Firefox version does not support that command, it uses the older remote debugging protocol's `installTemporaryAddon` instead (`firefox/rdp.ts`). Both clients use only Node built-ins.
+The CLI installs the add-on over WebDriver BiDi (`firefox/bidi.ts`, using Node's built-in `WebSocket`). It needs Firefox 138 or later, where `webExtension.install` installs temporarily and skips the signature check; older versions are below the default minimum anyway.
 
-By default the temporary add-on goes into a dedicated `lavaduct` profile, which the CLI creates if needed, so remote debugging is never turned on in the user's own profile. `--profile` puts it in a named profile instead; the CLI writes the required devtools prefs to that profile's `user.js` and lists them in its output. The add-on is removed when Firefox restarts.
+1. Start Firefox with `--remote-debugging-port 0` and the profile. The flag only works at process start, so the profile must not already be open in a running Firefox.
+2. Read the port from `<profile>/WebDriverBiDiServer.json` (`ws_port`).
+3. Connect to `ws://127.0.0.1:<port>/session`, send `session.new` with empty capabilities, then `webExtension.install` with `{type: "path", path: <absolute staged directory>}`.
+4. Send `session.end` and disconnect. Firefox keeps running with the add-on loaded.
+
+Temporary add-ons are loaded in place, so the staged directory has to stay on disk while Firefox runs; it lives in the output directory, not in scratch space. No prefs are written. While the remote agent runs, Firefox shows its remote-control indicator and applies its automation prefs for that session.
+
+By default the add-on goes into a dedicated `lavaduct` profile, which the CLI creates if needed, so the user's own profile is never opened under remote control. `--profile` uses another profile instead; if that profile is open, the CLI quits Firefox and relaunches it with the flag, unless `--no-firefox-restart` is set, in which case it refuses. The add-on is removed when Firefox restarts.
 
 ## Firefox discovery
 
 `firefox/locate.ts` finds installs on each OS:
 
 - macOS: known `.app` names in `/Applications` and `~/Applications`, then `mdfind` on Mozilla's bundle identifiers for release, Developer Edition and Nightly.
-- Windows: `reg query` on `HKLM` and `HKCU\SOFTWARE\Mozilla\<product>\<version>\Main\PathToExe`, with Program Files as a fallback.
+- Windows: `reg query` on `HKLM` and `HKCU` under `SOFTWARE\Mozilla\{Mozilla Firefox, Firefox Developer Edition, Nightly, Mozilla Developer Preview}`, recursively for `PathToExe`, in both the 64-bit and 32-bit registry views. The version subkeys are named like `153.6.0 ESR (x64 en-US)`. Each `PathToExe` is checked to exist, since keys can be stale.
 - Linux: `firefox`, `firefox-esr`, `firefox-developer-edition` and `firefox-nightly` on `PATH`, plus snap and flatpak installs.
 
-The channel comes from `defaults/pref/channel-prefs.js` and the version from `application.ini` in the install directory. `--firefox <path|channel>` selects an install; without it the CLI uses the release channel if present, otherwise the first install found.
+`firefox/appconstants.ts` reads `modules/AppConstants.sys.mjs` out of the install's `omni.ja` (with the zip reader, which must follow the central-directory offset because `omni.ja` stores it at the start of the file) and takes `MOZ_REQUIRE_SIGNING`, `MOZ_UPDATE_CHANNEL` and the version from it. The channel is for display; the signing flag decides the unsigned route. `--firefox <path|channel>` selects an install; without it the CLI uses the release channel if present, otherwise the first install found.
 
-`firefox/profiles.ts` reads `profiles.ini` and `installs.ini` from each OS's profile root, including the snap (`~/snap/firefox/common/.mozilla/firefox`) and flatpak (`~/.var/app/org.mozilla.firefox/.mozilla/firefox`) locations. Each install's default profile comes from its `[Install<hash>] Default=` entry. `--profile` takes a profile name or a path. A profile counts as in use when its `lock` or `.parentlock` is held.
+`firefox/profiles.ts` reads `profiles.ini` and `installs.ini` from each OS's profile root:
+
+- macOS: `~/Library/Application Support/Firefox`.
+- Windows: `%APPDATA%\Mozilla\Firefox`.
+- Linux: `~/.mozilla/firefox`, and `${XDG_CONFIG_HOME:-~/.config}/mozilla/firefox` (used from Firefox 147 when the first doesn't exist), snap's `~/snap/firefox/common/.mozilla/firefox`, and flatpak's `~/.var/app/org.mozilla.firefox/.mozilla/firefox` and `~/.var/app/org.mozilla.firefox/config/mozilla/firefox`.
+
+Each install's default profile comes from its `[Install<hash>] Default=` entry, where the hash is CityHash64 of the UTF-16LE install directory (the directory holding the binary; `Contents/MacOS` on macOS), as unpadded uppercase hex (`firefox/cityhash.ts`). Snap installs have no `[Install…]` section, so their default is the profile marked `Default=1`. Profiles created only through Firefox's newer profile manager are stored in a SQLite database instead of `profiles.ini` and are not listed; `--profile <path>` still works for them. `--profile` takes a profile name or a path. A profile counts as in use when its lock is held: `lock`/`.parentlock` on macOS and Linux, `parent.lock` on Windows.
 
 ## Commands
 
@@ -173,7 +192,7 @@ The channel comes from `defaults/pref/channel-prefs.js` and the version from `ap
 | `--install`, `--install-dir`, `--verify` | `--install`, `--profile`, `--firefox`, `--verify` |
 | `--no-safari-restart` | `--no-firefox-restart` |
 | `--background-launch` | `--no-launch` |
-| `--team <id>` | `--sign <route>`, `--amo-key`, `--amo-secret`, `--addon-version` |
+| `--team <id>` | `--sign <route>`, `--amo-key`, `--amo-secret`, `--addon-version`, `--data-collection` |
 | `--no-shim`, `--no-oauth-bridge`, `--panel-query`, `--debug` | same |
 | `--keep-module` | dropped, module background scripts are always kept |
 | `--force`, `--strict`, `--analyze`, `--json`, `--report`, `--config` | same; config file is `lavaduct.config.json` |
@@ -184,9 +203,14 @@ The channel comes from `defaults/pref/channel-prefs.js` and the version from `ap
 
 `--list` reads `extensions.json` in the chosen profile, or every profile of the chosen install, and prints each add-on's name, ID, version and enabled state. Add-ons this CLI installed are marked.
 
-`--uninstall <name|id>` deletes `<profile>/extensions/<id>.xpi` while Firefox is closed; Firefox drops the add-on on its next start. If Firefox is running, the CLI quits it, removes the file and relaunches it. With `--no-firefox-restart` it refuses instead. The signed-file cache entry for that ID is removed too.
+`--uninstall <name|id>` starts Firefox headless on the profile with `--remote-debugging-port 0` and calls BiDi `webExtension.uninstall`, which removes the add-on and its data the same way about:addons does. If the profile is open, the CLI quits Firefox first and relaunches it afterwards, unless `--no-firefox-restart` is set, in which case it refuses. The signed-file cache entry for that ID is removed too.
 
-`--logs <name|id>` prints the `--debug` ring buffer from a profile. It maps the add-on ID to its internal UUID through `extensions.webextensions.uuids` in `prefs.js`, opens `storage/default/moz-extension+++<uuid>^userContextId=4294967295/idb/*.sqlite` read-only with `node:sqlite`, and decodes the stored value. Firefox stores IndexedDB values Snappy-compressed in its structured-clone format; `firefox/storage.ts` contains a Snappy decoder ported from viaduct-app's `Snappy.swift` and a structured-clone decoder for the plain-data subset the ring buffer uses (objects, arrays, strings, numbers, booleans, null).
+`--logs <name|id>` prints the `--debug` ring buffer from a profile:
+
+1. Map the add-on ID to its internal UUID through the `extensions.webextensions.uuids` pref in `prefs.js`.
+2. Copy `storage/default/moz-extension+++<uuid>^userContextId=4294967295/idb/3647222921wleabcEoxlt-eengsairo.sqlite` and its `-wal` file into a temp directory. Firefox holds an exclusive lock on the live file on macOS and Linux, and opening it directly would also leave a `-shm` file in the profile.
+3. Open the copy with `node:sqlite` (imported only here, since Node 22 prints an experimental warning when it loads) and read the row of object store `storage-local-data` whose key is `__viaduct_debug_log__` in IndexedDB's key encoding.
+4. Decode the value. Values under 1 MiB are a raw Snappy block in the `data` column; larger ones are stored in the `.files/` directory next to the database in framed Snappy. `firefox/snappy.ts` decodes both (raw block decoding ported from viaduct-app's `Snappy.swift`), and `firefox/structured-clone.ts` decodes SpiderMonkey's structured-clone format for the plain data the ring buffer holds: objects, arrays, strings in Latin-1 and UTF-16, int32, doubles, booleans, null, undefined and back-references.
 
 ## Files on disk
 
@@ -225,14 +249,6 @@ A GitHub Release triggers a workflow, copied from viaduct-cli, that publishes to
 
 For the Viaduct app, the stable contract is the `--analyze --json` schema (the same as viaduct-cli's), the phase progress lines listed under Pipeline, AMO credentials passed through environment variables, and the exit codes above.
 
-## To verify before implementation
+## Sources
 
-These rest on general knowledge of Firefox and must be checked against current Firefox and AMO behaviour before the code that depends on them is written:
-
-- The current ESR major version used as the `--min-firefox` default.
-- AMO v5 endpoint paths and payloads for upload, add-on creation, version creation and signed-file download, and the maximum JWT lifetime.
-- Which Firefox version first supports WebDriver BiDi `webExtension.install`.
-- That Firefox removes an add-on whose `.xpi` was deleted from `<profile>/extensions/` while it was closed.
-- That `node:sqlite` can read a profile's IndexedDB files while Firefox has them open in WAL mode.
-- That passing an `.xpi` path on the command line shows the install prompt in an already running Firefox on all three OSes.
-- Which Firefox builds honour `xpinstall.signatures.required = false`, and how to tell them apart from release and beta.
+The Firefox and AMO behaviour this design relies on was checked against Mozilla's documentation and Firefox, addons-server and web-ext source in October 2026. The main references are the AMO API docs (`mozilla.github.io/addons-server/topics/api/`), web-ext's `src/util/submit-addon.js`, Firefox's `remote/webdriver-bidi/modules/root/webExtension.sys.mjs`, `toolkit/components/extensions/ExtensionStorageIDB.sys.mjs`, `js/src/vm/StructuredClone.cpp`, and MDN's WebExtensions manifest pages.
