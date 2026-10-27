@@ -1,0 +1,36 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The Firefox tests run Firefox headless on throwaway profiles, and skip
+      # when no Firefox is found.
+      - uses: browser-actions/setup-firefox@v1
+        with:
+          firefox-version: latest-nightly
+
+      - run: npm ci
+      - run: npm run typecheck
+      # npm test rebuilds dist and runs the whole node --test suite.
+      - run: npm test
