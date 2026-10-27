@@ -1,7 +1,8 @@
 import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
-import type { Issue, Manifest, Platforms } from "../types.js";
-import { UNSUPPORTED_APIS, parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
+import type { Issue, Manifest } from "../types.js";
+import { parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
+import { UNSUPPORTED_APIS } from "../manifest/compat-data.js";
 import { matchBalancedParen, rootLiteralsFromGetURL, importScriptsTargets } from "../runtime/shim.js";
 
 /**
@@ -94,35 +95,38 @@ function indexOfApi(content: string, literal: string): number {
   if (b === -1) return a;
   return Math.min(a, b);
 }
+// chrome://favicon/<url> and /_favicon/?pageUrl=… — the shim serves both for
+// <img> and fetch.
 const FAVICON_RE = /chrome:\/\/favicon|[/'"]_favicon\//;
-// A hardcoded chrome-extension://<32-char-id>/ URL. Chrome's id is stable; Safari
-// assigns a different random extension origin per install, so any such literal
-// breaks (wrong origin → resource 404 / blocked). Match the 32-char a–p id form
+// A hardcoded chrome-extension://<32-char-id>/ URL. Staging rewrites the scheme to
+// moz-extension://, but Firefox gives every install its own random UUID, so the
+// Chrome id in the host part never resolves. Match the 32-char a–p id form
 // precisely to avoid flagging chrome-extension:// joined with a variable.
 const HARDCODED_EXT_URL_RE = /chrome-extension:\/\/[a-p]{32}\b/;
-// A hardcoded chrome://extensions/shortcuts (or chrome://settings) link. Extensions
-// open these to let users rebind keys / change settings, but neither page exists in
-// Safari — the navigation just errors. The shim swallows it at runtime, but the
-// author still needs to add their own "edit in Safari → Settings → Extensions" UI.
-const CHROME_SETTINGS_URL_RE = /chrome:\/\/(extensions|settings)\b/;
-const BLOCKING_WEBREQUEST_RE = /(?:chrome|browser)\.webRequest\.on\w+/;
+// A chrome://<page> URL (extensions, settings, newtab, …). Add-ons can't open
+// chrome:// pages in Firefox, and Firefox's own pages live under about:. The bare
+// "chrome://" prefix used in restricted-URL checks has no host and doesn't match;
+// favicon URLs are handled above.
+const CHROME_PAGE_URL_RE = /chrome:\/\/(?!favicon\b)[a-z][\w-]*(?:\/[\w-]+)?/;
 // Detect code that pulls a Chrome version token out of the UA string — the telltale
-// of UA version sniffing (e.g. /Chrome\/(\d+)/, /Chrom(e|ium)\/([0-9]+)\./). The
-// version capture is what breaks on Safari (no Chrome token). We match two robust
-// source signals: a `Chrome/` or `Chromium/` literal where the slash may be escaped
-// (`Chrome\/` in a regex literal), and the `Chrom(e|ium)` regex alternation in bare
-// or non-capturing form. Info-only/shimmed, so a slightly loose match is fine; the
-// prior pattern only matched one exact literal spelling and was near-dead.
+// of UA version sniffing (e.g. /Chrome\/(\d+)/, /Chrom(e|ium)\/([0-9]+)\./). We
+// match two source signals: a `Chrome/` or `Chromium/` literal where the slash may
+// be escaped (`Chrome\/` in a regex literal), and the `Chrom(e|ium)` regex
+// alternation in bare or non-capturing form.
 const UA_CHROME_SNIFF_RE = /Chrom(?:e|ium)\\?\/|Chrom\((?:\?:)?e\|ium\)/;
 const TIMER_RE = /(setTimeout|setInterval)\s*\(/;
 const BACKGROUND_FILE_RE = /(background|service[-_]?worker)/i;
-// The Safari 18 port bug is specific to iframe ↔ content-script ports, reached
-// via tabs.connect(tabId, {frameId}). Plain runtime.onConnect for popup↔background
-// works fine in Safari, so don't warn on it (it fires on most extensions). Only
-// tabs.connect — the tab/frame-targeting side — hits the bug.
-const CONNECT_RE = /tabs\.connect\s*\(/;
+// scripting.executeScript / registerContentScripts into the page's main world.
+const MAIN_WORLD_RE = /\bworld\s*:\s*["']MAIN["']|ExecutionWorld\.MAIN\b/;
+// First Firefox release that accepts world: "MAIN" in scripting and content scripts.
+const MAIN_WORLD_MIN_FIREFOX = 128;
 
-function scanJsContent(content: string, rel: string, issues: Issue[], isServiceWorker: boolean): void {
+function majorVersion(v: string): number {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function scanJsContent(content: string, rel: string, issues: Issue[], isClassicServiceWorker: boolean): void {
   const lineAt = makeLineResolver(content);
 
   const hits: Array<{ name: string; at: number; info: (typeof API_PATTERNS)[number]["info"] }> = [];
@@ -145,46 +149,18 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
     });
   }
 
-  // Chrome-version sniffing out of navigator.userAgent. Safari's UA has no Chrome
-  // token, so the match returns null/undefined and the dependent feature silently
-  // dies (e.g. download URLs built from the sniffed version). The shim appends a
-  // synthetic Chrome token ONLY in content scripts running on http(s) pages — it
-  // deliberately leaves popup/options/background UAs truthful (see safari-compat-shim
-  // §UA spoof, guarded by `!__isExtPage`). So a sniff in extension-page code is NOT
-  // resolved; flag it as a warning that still fails there.
+  // Chrome-version sniffing out of navigator.userAgent. Firefox's UA has no Chrome
+  // token, so the match comes back null and whatever depends on it quietly breaks
+  // (e.g. download URLs built from the sniffed version).
   const ua = UA_CHROME_SNIFF_RE.exec(content);
   if (ua) {
     issues.push({
       severity: "warning",
       category: "api",
-      message: "navigator.userAgent Chrome-version sniff detected; Safari's UA omits the Chrome token.",
+      message: "navigator.userAgent Chrome-version sniff detected; Firefox's user agent has no Chrome token, so the match comes back empty.",
       file: rel,
       line: lineAt(ua.index),
-      fix: "The shim spoofs a Chrome token only in content scripts on http(s) pages; popup/options/background sniffs stay truthful and still fail. Remove the UA dependency.",
-    });
-  }
-
-  const wr = BLOCKING_WEBREQUEST_RE.exec(content);
-  // Blocking mode is opted into via the literal "blocking" string in the
-  // addListener extraInfoSpec array. Match the quoted token, not the bare word
-  // (which fires on comments, CSS classes, and unrelated identifiers).
-  if (wr && /["']blocking["']/.test(content)) {
-    // Blocking webRequest can't BLOCK in Safari, but it doesn't abort the
-    // extension: the shim (and Safari's own webRequest) accept the listener
-    // registration, the blocking return value is simply ignored, and every
-    // other feature of the extension still works. Aborting conversion here
-    // killed every ad-blocker / password-manager / VPN (Bitwarden, LastPass,
-    // Honey, Urban VPN, uBlock…) — the single largest cause of "didn't convert".
-    // Downgrade to a warning: the network-blocking feature degrades, the
-    // extension still installs and runs. DNR migration is the real fix.
-    issues.push({
-      severity: "warning",
-      category: "api",
-      message: "Blocking webRequest detected; Safari ignores the blocking return (listeners still fire as observers). The network-modifying feature degrades, but the extension still loads.",
-      file: rel,
-      line: lineAt(wr.index),
-      fix: "Migrate the blocking rules to declarativeNetRequest rulesets for them to actually take effect in Safari.",
-      shimmed: true,
+      fix: "Feature-detect instead of parsing the user agent, or handle the Firefox token.",
     });
   }
 
@@ -194,7 +170,7 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
       issues.push({
         severity: "warning",
         category: "background",
-        message: "setTimeout/setInterval are unreliable in suspended Safari background contexts.",
+        message: "setTimeout/setInterval are unreliable in Firefox's background event page, which unloads when idle and drops pending timers.",
         file: rel,
         line: lineAt(m.index),
         fix: "Use chrome.alarms for scheduled work; persist state to storage.local.",
@@ -202,32 +178,27 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
     }
   }
 
-  // viaduct converts the MV3 service worker into a module background page, where
-  // importScripts() is undefined. convertServiceWorkerToBackgroundPage() handles
-  // this at staging: string-literal targets are hoisted into background.html as
-  // classic <script>s before the SW module, and every call is neutralized so the
-  // undefined global is never invoked. So static literals are auto-fixed (info);
-  // only dynamic args (a variable/expression we can't statically hoist) lose their
-  // imported code and need a manual rewrite (warning).
-  // The converter neutralizes EVERY importScripts call, so a static first call
-  // must not mask later dynamic ones (webpack/Workbox SWs commonly do a static
-  // precache import first, then a dynamic chunk-loader call).
-  // Static only when every arg is a string literal we can hoist verbatim (e.g.
-  // "a.js", 'b.js'), counting runtime.getURL("x") as the literal "/x", or a loop
-  // over a literal list of names, both of which the converter hoists the same way
-  // (importScriptsTargets). Anything else — a variable, a concat (base + "a.js") —
-  // can't be statically hoisted and silently loses its imported code, so it must
-  // warn, not reassure.
-  // Only the manifest-declared service worker is converted (importScripts hoisted
-  // and neutralized). importScripts in any OTHER file — a genuine web worker —
-  // keeps working in Safari untouched, so flagging it would be a false alarm.
+  // The converter turns a classic MV3 service worker into background.scripts, where
+  // importScripts() is undefined. String-literal targets are hoisted into the
+  // scripts array ahead of the worker and every call is neutralized, so static
+  // calls are auto-fixed (info). Only dynamic args (a variable/expression that
+  // can't be hoisted) lose their imported code and need a manual rewrite (warning).
+  // Every call is neutralized, so a static first call must not mask later dynamic
+  // ones (webpack/Workbox workers often do a static precache import first, then a
+  // dynamic chunk-loader call).
+  // Static means every arg is a string literal (runtime.getURL("x") counts as
+  // "/x"), or a loop over a literal list of names; importScriptsTargets() hoists
+  // both. Anything else — a variable, a concat (base + "a.js") — warns.
+  // Only the manifest-declared worker is converted; importScripts in any other file
+  // is a genuine web worker and keeps working. Module workers can't call
+  // importScripts at all, so they're skipped.
   // Args are extracted with the same balanced-paren scan the converter uses
   // (matchBalancedParen); a [^)]* regex truncates at the first ")" inside an
   // argument (webpack's `importScripts(o.p+o.u(t))`) and misclassifies.
   const IS_OPEN_RE = /\bimportScripts\s*\(/g;
   let isFirstAt = -1;
   let isDynamicAt = -1;
-  if (isServiceWorker) for (let m; (m = IS_OPEN_RE.exec(content)); ) {
+  if (isClassicServiceWorker) for (let m; (m = IS_OPEN_RE.exec(content)); ) {
     if (isFirstAt === -1) isFirstAt = m.index;
     const end = matchBalancedParen(content, m.index + m[0].length - 1);
     if (end < 0) break;
@@ -239,59 +210,47 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isServiceW
     }
   }
   // A dynamic call that is webpack's worker chunk loader is handled: the converter
-  // pre-registers the bundle's async chunks in background.html (matching the
+  // lists the bundle's async chunks in background.scripts (matching the
   // webpackChunk global), so r.e() finds them loaded and never calls importScripts.
-  // Only a NON-webpack dynamic call still means dead code in the converted page.
+  // Only a non-webpack dynamic call still means dead code after conversion.
   const WEBPACK_CHUNK_GLOBAL_RE = /(?:globalThis|self|window)\s*(?:\.\s*webpackChunk[$\w]*|\[\s*["']webpackChunk[^"'\\]*["']\s*\])\s*=(?!=)/;
   if (isFirstAt !== -1) {
     issues.push(isDynamicAt !== -1 ? (WEBPACK_CHUNK_GLOBAL_RE.test(content) ? {
       severity: "info",
       category: "background",
-      message: "Dynamic importScripts() is webpack's worker chunk loader; the bundle's async chunks are pre-registered in background.html so chunk loading keeps working.",
+      message: "Dynamic importScripts() is webpack's worker chunk loader; the bundle's async chunks are listed in background.scripts so chunk loading keeps working.",
       file: rel,
       line: lineAt(isDynamicAt),
     } : {
       severity: "warning",
       category: "background",
-      message: "importScripts() with a dynamic (non-literal) argument can't be hoisted; the imported code won't run in the converted background page.",
+      message: "importScripts() with a dynamic (non-literal) argument can't be hoisted; the imported code won't run in Firefox's background scripts.",
       file: rel,
       line: lineAt(isDynamicAt),
-      fix: 'Replace the dynamic importScripts(expr) with static ES imports (import "./a.js";) at the top of the worker.',
+      fix: 'Replace the dynamic importScripts(expr) with static imports (import "./a.js";) and declare the worker as a module.',
     }) : {
       severity: "info",
       category: "background",
-      message: "importScripts() targets are auto-hoisted into background.html as classic scripts; the calls are neutralized.",
+      message: "importScripts() targets are auto-hoisted into background.scripts; the calls are neutralized.",
       file: rel,
       line: lineAt(isFirstAt),
-    });
-  }
-
-  const cm = CONNECT_RE.exec(content);
-  if (cm) {
-    issues.push({
-      severity: "warning",
-      category: "safari18",
-      message: "Safari 18: tabs.connect/onConnect fail for iframe ↔ content-script ports.",
-      file: rel,
-      line: lineAt(cm.index),
-      fix: "Use contentWindow.postMessage from the page, then runtime.sendMessage from the iframe.",
     });
   }
 }
 
 /**
  * Single-pass source scan: walks the extension once, reads each file once, and
- * runs every disk-backed check (unsupported chrome.* APIs, blocking webRequest,
- * background timers, Safari 18 port gaps, favicon access, _locales consistency,
- * iOS caveats).
+ * runs every disk-backed check (missing manifest files, _locales consistency,
+ * chrome.* APIs Firefox lacks, background timers and importScripts, favicon
+ * access, hardcoded extension and chrome:// URLs, main-world scripting).
  */
-export function scanExtension(extPath: string, manifest: Manifest, platforms: Platforms): Issue[] {
+export function scanExtension(extPath: string, manifest: Manifest, opts: { minFirefox: string }): Issue[] {
   const issues: Issue[] = [];
 
-  // Declared icon paths that don't exist on disk → Safari fails to load the
-  // extension (and the App Store rejects the upload). Collect every referenced
-  // icon path from manifest.icons and each action's default_icon, then flag the
-  // missing ones. Web-accessible/CSS icons aren't checked — only manifest-declared.
+  // Declared icon paths that don't exist on disk → Firefox shows a blank icon and
+  // AMO validation rejects the package. Collect every referenced icon path from
+  // manifest.icons and each action's default_icon, then flag the missing ones.
+  // Web-accessible/CSS icons aren't checked — only manifest-declared.
   const iconPaths = new Set<string>();
   for (const p of Object.values(manifest.icons ?? {})) {
     if (typeof p === "string") iconPaths.add(p);
@@ -310,35 +269,18 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
       issues.push({
         severity: "error",
         category: "icons",
-        message: `Declared icon "${p}" is missing from the package; Safari will fail to load the extension.`,
+        message: `Declared icon "${p}" is missing from the package; Firefox shows a blank icon and AMO validation rejects it.`,
         file: "manifest.json",
         fix: "Add the icon file, or remove the reference from manifest.json.",
-      });
-      continue;
-    }
-    // Safari's extension toolbar/store pipeline only renders PNG icons; an .svg/.webp/.jpg
-    // icon loads in Chrome but shows a blank glyph in Safari (and the App Store rejects it).
-    // Sniff off the basename — a dot in a directory name ("assets.v2/icon48")
-    // must not read as a bogus file extension.
-    const base = p.slice(p.lastIndexOf("/") + 1);
-    const dot = base.lastIndexOf(".");
-    const ext = dot >= 0 ? base.slice(dot).toLowerCase() : "";
-    if (ext && ext !== ".png") {
-      issues.push({
-        severity: "warning",
-        category: "icons",
-        message: `Icon "${p}" is ${ext}; Safari only renders PNG icons (Chrome accepts more formats).`,
-        file: "manifest.json",
-        fix: "Convert the icon to PNG and update the manifest path.",
       });
     }
   }
 
-  // Manifest-referenced files that don't exist on disk → Safari silently drops the
-  // content script / fails to load the page. Collected as {path → where} so a
-  // missing file is reported once with a useful location. Only author-declared
+  // Manifest-referenced files that don't exist on disk → the content script or page
+  // never runs, and AMO validation rejects the package. Collected as {path → where}
+  // so a missing file is reported once with a useful location. Only author-declared
   // paths are checked here (analyze runs on the raw manifest, before the converter
-  // injects its own shim/polyfill/bridge scripts — so no false positives on those).
+  // injects its own shim/bridge scripts — so no false positives on those).
   const refs = new Map<string, string>();
   const addRef = (p: unknown, where: string) => {
     if (typeof p === "string" && p && !refs.has(p)) refs.set(p, where);
@@ -356,6 +298,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
   for (const a of [manifest.action, manifest.browser_action, manifest.page_action]) {
     addRef((a as { default_popup?: unknown } | undefined)?.default_popup, "action.default_popup");
   }
+  addRef(manifest.side_panel?.default_path, "side_panel.default_path");
   addRef(manifest.options_page, "options_page");
   addRef(manifest.options_ui?.page, "options_ui.page");
   addRef(manifest.devtools_page, "devtools_page");
@@ -371,17 +314,17 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
         category: "manifest",
         message: `${where} references "${p}", which is missing from the package.`,
         file: "manifest.json",
-        fix: "Safari silently drops the script/page for a missing file; add it or remove the reference.",
+        fix: "Firefox can't run a script or page that isn't in the package, and AMO validation rejects it; add the file or remove the reference.",
       });
     }
   }
 
-  // _locales dir present but no default_locale → Chrome AND Safari reject the load.
+  // _locales dir present but no default_locale → Firefox refuses to load the add-on.
   if (existsSync(join(extPath, "_locales")) && !manifest.default_locale) {
     issues.push({
       severity: "error",
       category: "i18n",
-      message: "_locales/ is present but default_locale is missing; the extension will fail to load.",
+      message: "_locales/ is present but default_locale is missing; Firefox will refuse to load the add-on.",
       file: "manifest.json",
       fix: "Add a default_locale key matching one of your _locales subfolders.",
     });
@@ -406,7 +349,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
         issues.push({
           severity: "error",
           category: "i18n",
-          message: `_locales/${manifest.default_locale}/messages.json is not valid JSON; the extension will fail to load.`,
+          message: `_locales/${manifest.default_locale}/messages.json is not valid JSON; the add-on will fail to load.`,
           file: `_locales/${manifest.default_locale}/messages.json`,
           fix: "Fix the JSON syntax.",
         });
@@ -415,11 +358,10 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
   }
 
   // __MSG_key__ placeholders in name/description must resolve to a real message in
-  // the DEFAULT locale, or Chrome AND Safari display the literal "__MSG_appName__" as
-  // the extension name (and the App Store rejects a placeholder name). Use the strict
-  // resolver: Chrome localizes manifest fields from default_locale only — a key that
-  // exists in another locale but not the default one is still rendered literally, so
-  // the lenient cross-locale resolver would hide a real failure here.
+  // the default locale, or the add-on shows a broken name. Use the strict resolver:
+  // manifest fields are localized from default_locale only, so a key that exists in
+  // another locale but not the default one still fails, and the lenient
+  // cross-locale resolver would hide that.
   for (const [field, raw] of [
     ["name", manifest.name],
     ["description", manifest.description],
@@ -430,7 +372,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
         issues.push({
           severity: "error",
           category: "i18n",
-          message: `manifest.${field} uses "${raw}" but no matching message exists in _locales; Safari shows the literal placeholder.`,
+          message: `manifest.${field} uses "${raw}" but no matching message exists in the default locale; Firefox can't resolve it.`,
           file: "manifest.json",
           fix: `Add the "${raw.slice(6, -2)}" key to _locales/<default_locale>/messages.json, or use a plain string.`,
         });
@@ -438,60 +380,23 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     }
   }
 
-  // Content blockers whose core is blocking webRequest do not block in Safari:
-  // WebKit decides each network request before extension JS runs and ignores the
-  // blocking return value. Unlike the generic per-file "blocking webRequest"
-  // warning (scanJsContent), this is a class-level ERROR — for an ad/tracker
-  // blocker, blocking IS the product, so a bundle that installs but blocks nothing
-  // is a misleading failure. Gate narrowly so a password manager (webRequestBlocking
-  // on a few auth hosts, no web-wide blocking) does not trip it, and skip extensions
-  // that already ship declarativeNetRequest (the DNR path works in Safari).
-  const cbPerms = [
-    ...(Array.isArray(manifest.permissions) ? manifest.permissions : []),
-    ...(Array.isArray(manifest.optional_permissions) ? manifest.optional_permissions : []),
-  ];
-  // A DNR permission counts as much as a static ruleset: extensions that build their
-  // rules at runtime (updateDynamicRules/updateSessionRules) ship no rule_resources at
-  // all, and the transform maps the Safari-rejected declarativeNetRequestWithHostAccess
-  // token back onto plain declarativeNetRequest, so their blocking path survives too.
-  const hasDnr =
-    (manifest.declarative_net_request?.rule_resources?.length ?? 0) > 0 ||
-    cbPerms.some((p) => typeof p === "string" && p.startsWith("declarativeNetRequest"));
-  if (cbPerms.includes("webRequestBlocking") && !hasDnr) {
-    // <all_urls> or an http(s)/any-scheme host wildcard = web-wide blocking intent.
-    const BROAD_HOST = /^(?:<all_urls>|\*:\/\/\*\/\*|https?:\/\/\*\/\*)$/;
-    const hostStrings = [
-      ...(Array.isArray(manifest.host_permissions) ? manifest.host_permissions : []),
-      ...cbPerms, // MV2 carries host patterns in permissions
-      ...arr(manifest.content_scripts).flatMap((cs: any) => arr(cs?.matches)),
-    ].filter((s): s is string => typeof s === "string");
-    if (hostStrings.some((h) => BROAD_HOST.test(h))) {
-      issues.push({
-        severity: "error",
-        category: "content-blocker",
-        message:
-          "This is a content blocker built on blocking webRequest, and network blocking will NOT work in Safari (WebKit decides each request before extension JS runs and ignores the blocking return). The extension still installs and its cosmetic/element-hiding features still run.",
-        file: "manifest.json",
-        fix: "Blocking webRequest cannot block in Safari and no shim can change that. For real ad/tracker blocking, convert the extension's declarativeNetRequest build instead, such as uBlock Origin Lite (uBOL), which Safari honors.",
-      });
-    }
-  }
-
-  // Manifest-relative SW path, used to gate the importScripts checks to the one
-  // file the converter actually rewrites.
-  const swRel = typeof manifest.background?.service_worker === "string"
+  // Manifest-relative path of a classic service worker: the one file the converter
+  // rewrites, so the importScripts checks are gated to it.
+  const swRel = typeof manifest.background?.service_worker === "string" && manifest.background.type !== "module"
     ? manifest.background.service_worker.replace(/^\.?\//, "")
     : undefined;
+  const checkMainWorld = majorVersion(opts.minFirefox) < MAIN_WORLD_MIN_FIREFOX;
 
   let faviconNoted = false;
   let extUrlNoted = false;
-  let chromeSettingsNoted = false;
+  let chromeUrlNoted = false;
+  let mainWorldNoted = !checkMainWorld;
   for (const file of walkFiles(extPath, [".js", ".mjs", ".html", ".css"])) {
     const isJs = file.endsWith(".js") || file.endsWith(".mjs");
     // html/css files are only read for the once-per-extension favicon,
-    // hardcoded-extension-URL, and chrome://settings checks; skip them once all
-    // three have been satisfied.
-    if (!isJs && faviconNoted && extUrlNoted && chromeSettingsNoted) continue;
+    // hardcoded-extension-URL and chrome:// checks; skip them once all three have
+    // been satisfied.
+    if (!isJs && faviconNoted && extUrlNoted && chromeUrlNoted) continue;
     let content: string;
     try {
       content = readFileSync(file, "utf-8");
@@ -503,24 +408,26 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     // offset table on first call, then reuses it).
     const lineAt = makeLineResolver(content);
 
-    // _favicon / chrome://favicon has no Safari equivalent. One note is enough.
+    // Firefox has no favicon service for add-ons; the shim answers chrome://favicon
+    // and _favicon URLs for <img> and fetch. One note is enough.
     if (!faviconNoted) {
       const m = FAVICON_RE.exec(content);
       if (m) {
         faviconNoted = true;
         issues.push({
-          severity: "warning",
+          severity: "info",
           category: "api",
-          message: "Favicon access via chrome://favicon / _favicon has no Safari equivalent.",
+          message: "Favicon access via chrome://favicon / _favicon; the shim serves these URLs for <img> and fetch.",
           file: rel,
           line: lineAt(m.index),
-          fix: "Fetch favicons directly (e.g. <link> from the page) or drop the favicon UI.",
+          fix: "No action needed for images and fetch; a favicon URL used from CSS isn't covered.",
+          shimmed: true,
         });
       }
     }
 
-    // A hardcoded chrome-extension://<id>/ URL breaks under Safari's per-install
-    // random origin. One note is enough to surface the whole class.
+    // A hardcoded chrome-extension://<id>/ URL breaks under Firefox's per-install
+    // UUID. One note is enough to surface the whole class.
     if (!extUrlNoted) {
       const m = HARDCODED_EXT_URL_RE.exec(content);
       if (m) {
@@ -528,7 +435,7 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
         issues.push({
           severity: "warning",
           category: "api",
-          message: "Hardcoded chrome-extension://<id> URL found; Safari uses a different per-install origin, so it will not resolve.",
+          message: "Hardcoded chrome-extension://<id> URL found; Firefox gives every install its own random moz-extension:// UUID, so it will not resolve.",
           file: rel,
           line: lineAt(m.index),
           fix: "Build extension URLs with chrome.runtime.getURL(path) instead of hardcoding the id.",
@@ -536,20 +443,35 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
       }
     }
 
-    // A link to chrome://extensions/shortcuts or chrome://settings — no such page
-    // in Safari. The shim swallows the navigation, but flag it so the author wires
-    // their own shortcut/settings affordance. One note covers the class.
-    if (!chromeSettingsNoted) {
-      const m = CHROME_SETTINGS_URL_RE.exec(content);
+    // A chrome://extensions/shortcuts, chrome://settings, … link. Firefox won't let
+    // an add-on open chrome:// pages, so the navigation fails. One note covers the
+    // class.
+    if (!chromeUrlNoted) {
+      const m = CHROME_PAGE_URL_RE.exec(content);
       if (m) {
-        chromeSettingsNoted = true;
+        chromeUrlNoted = true;
         issues.push({
           severity: "warning",
           category: "api",
-          message: `Link to "${m[0]}" has no Safari equivalent (no chrome://extensions/shortcuts or settings page).`,
+          message: `Link to "${m[0]}"; Firefox add-ons can't open chrome:// pages, so this navigation fails.`,
           file: rel,
           line: lineAt(m.index),
-          fix: "Shortcuts are edited in Safari → Settings → Extensions; show that hint instead of linking the chrome:// page (the shim swallows the dead navigation).",
+          fix: "For keyboard shortcuts call chrome.commands.openShortcutSettings() (Firefox 137+); otherwise tell users where the setting lives in Firefox instead of linking the chrome:// page.",
+        });
+      }
+    }
+
+    if (isJs && !mainWorldNoted) {
+      const m = MAIN_WORLD_RE.exec(content);
+      if (m) {
+        mainWorldNoted = true;
+        issues.push({
+          severity: "warning",
+          category: "api",
+          message: `Script injection into the page's main world (world: "MAIN") needs Firefox ${MAIN_WORLD_MIN_FIREFOX}; the minimum Firefox version is ${opts.minFirefox}, where the call fails.`,
+          file: rel,
+          line: lineAt(m.index),
+          fix: `Raise --min-firefox to ${MAIN_WORLD_MIN_FIREFOX} or later.`,
         });
       }
     }
