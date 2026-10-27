@@ -85,6 +85,15 @@ export function openXpiInFirefox(install: FirefoxInstall, profile: FirefoxProfil
       );
     }
   }
+  openProfileInFirefox(install, profile, [resolve(xpiPath)]);
+}
+
+/**
+ * Start Firefox on a profile the way the user would: by name when the
+ * install has it registered, so a running Firefox that has it open takes the
+ * request over, else by path.
+ */
+export function openProfileInFirefox(install: FirefoxInstall, profile: FirefoxProfile, args: string[] = []): void {
   const own = profilesFor(install);
   const key = pathKey(profile.path);
   const registered = own.find((p) => pathKey(p.path) === key);
@@ -92,5 +101,5 @@ export function openXpiInFirefox(install: FirefoxInstall, profile: FirefoxProfil
   // -P picks the first profile with that name.
   const byName = name !== undefined && own.find((p) => p.name === name) === registered;
   const profileArgs = byName ? ["-P", name] : ["--profile", resolve(profile.path)];
-  launchFirefox(install, [...profileArgs, resolve(xpiPath)]);
+  launchFirefox(install, [...profileArgs, ...args]);
 }
