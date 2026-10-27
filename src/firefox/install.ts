@@ -81,11 +81,22 @@ export interface InstallRecord {
 
 const INSTALLS_FILE = "installs.json";
 
+/** Recorded installs other than the one of add-on `id` in the profile at `profilePath`. */
+function otherInstalls(id: string, profilePath: string): InstallRecord[] {
+  const key = pathKey(profilePath);
+  return recordedInstalls().filter((r) => r.id !== id || pathKey(r.profilePath) !== key);
+}
+
 /** Remember an install so --list can mark the add-ons this tool put there. */
 export function recordInstall(rec: InstallRecord): void {
-  const key = pathKey(rec.profilePath);
-  const others = recordedInstalls().filter((r) => r.id !== rec.id || pathKey(r.profilePath) !== key);
-  writeState(INSTALLS_FILE, [...others, rec]);
+  writeState(INSTALLS_FILE, [...otherInstalls(rec.id, rec.profilePath), rec]);
+}
+
+/** Forget the install of add-on `id` in a profile, e.g. once it has been uninstalled there. */
+export function removeInstallRecord(id: string, profilePath: string): void {
+  const before = recordedInstalls().length;
+  const kept = otherInstalls(id, profilePath);
+  if (kept.length !== before) writeState(INSTALLS_FILE, kept);
 }
 
 /** Installs recorded so far, oldest first; one per add-on ID and profile. */

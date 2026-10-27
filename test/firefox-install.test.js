@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ENV_PREFIX } from "../dist/name.js";
@@ -8,6 +8,7 @@ import {
   allowUnsignedInProfile,
   recordInstall,
   recordedInstalls,
+  removeInstallRecord,
   waitForAddon,
 } from "../dist/firefox/install.js";
 
@@ -83,27 +84,54 @@ test("waitForAddon gives up on a disabled add-on or a different version", async 
   });
 });
 
-test("recordInstall keeps one record per add-on and profile", async () => {
-  await withDir("lavaduct-state-", (state) => {
+async function withStateDir(fn) {
+  await withDir("lavaduct-state-", async (state) => {
     const key = `${ENV_PREFIX}_STATE_DIR`;
     const saved = process.env[key];
     process.env[key] = state;
     try {
-      const base = { id: "x@lavaduct", name: "X", route: "unsigned", installedAt: "2026-10-27T10:00:00.000Z" };
-      recordInstall({ ...base, version: "1.0", profilePath: "/profiles/a" });
-      recordInstall({ ...base, version: "1.0", profilePath: "/profiles/b" });
-      recordInstall({ ...base, version: "1.1", profilePath: "/profiles/a", installedAt: "2026-10-27T11:00:00.000Z" });
-      const records = recordedInstalls();
-      assert.deepEqual(
-        records.map((r) => [r.profilePath, r.version]),
-        [
-          ["/profiles/b", "1.0"],
-          ["/profiles/a", "1.1"],
-        ],
-      );
+      return await fn(state);
     } finally {
       if (saved === undefined) delete process.env[key];
       else process.env[key] = saved;
     }
+  });
+}
+
+test("recordInstall keeps one record per add-on and profile", async () => {
+  await withStateDir(() => {
+    const base = { id: "x@lavaduct", name: "X", route: "unsigned", installedAt: "2026-10-27T10:00:00.000Z" };
+    recordInstall({ ...base, version: "1.0", profilePath: "/profiles/a" });
+    recordInstall({ ...base, version: "1.0", profilePath: "/profiles/b" });
+    recordInstall({ ...base, version: "1.1", profilePath: "/profiles/a", installedAt: "2026-10-27T11:00:00.000Z" });
+    assert.deepEqual(
+      recordedInstalls().map((r) => [r.profilePath, r.version]),
+      [
+        ["/profiles/b", "1.0"],
+        ["/profiles/a", "1.1"],
+      ],
+    );
+  });
+});
+
+test("removeInstallRecord forgets that add-on in that profile only", async () => {
+  await withStateDir((state) => {
+    // Nothing recorded yet: nothing to forget, and no file appears.
+    removeInstallRecord("x@lavaduct", "/profiles/a");
+    assert.equal(existsSync(join(state, "installs.json")), false);
+
+    const base = { name: "X", version: "1.0", route: "temporary", installedAt: "2026-10-27T10:00:00.000Z" };
+    recordInstall({ ...base, id: "x@lavaduct", profilePath: "/profiles/a" });
+    recordInstall({ ...base, id: "x@lavaduct", profilePath: "/profiles/b" });
+    recordInstall({ ...base, id: "y@lavaduct", profilePath: "/profiles/a" });
+    // The profile may be spelled differently than when the install was recorded.
+    removeInstallRecord("x@lavaduct", "/profiles/a/");
+    assert.deepEqual(
+      recordedInstalls().map((r) => [r.id, r.profilePath]),
+      [
+        ["x@lavaduct", "/profiles/b"],
+        ["y@lavaduct", "/profiles/a"],
+      ],
+    );
   });
 });
