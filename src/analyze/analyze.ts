@@ -557,29 +557,5 @@ export function scanExtension(extPath: string, manifest: Manifest, platforms: Pl
     if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel);
   }
 
-  if (platforms === "ios" || platforms === "all") {
-    issues.push({
-      severity: "info",
-      category: "ios",
-      message: "Targeting iOS/iPadOS: popup/options UI must be responsive; side-by-side layouts break on small screens.",
-      file: "manifest.json",
-      fix: "Add responsive CSS; test in Safari on iOS. Distribution is App Store only (no dev-direct for end users).",
-    });
-    const allPerms = [
-      ...(Array.isArray(manifest.permissions) ? manifest.permissions : []),
-      ...(Array.isArray(manifest.optional_permissions) ? manifest.optional_permissions : []),
-    ];
-    const platformGated = ["contextMenus", "notifications", "downloads", "cookies"].filter((p) => allPerms.includes(p));
-    if (platformGated.length) {
-      issues.push({
-        severity: "info",
-        category: "ios",
-        message: `Some APIs (${platformGated.join(", ")}) behave differently or are gated on iOS.`,
-        file: "manifest.json",
-        fix: "Feature-detect and gate per platform; don't assume macOS parity on iOS.",
-      });
-    }
-  }
-
   return issues;
 }
