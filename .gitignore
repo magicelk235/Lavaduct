@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# Conversion output
+*_Firefox/
+staged_extension/
+
+# Local real-extension corpus (large binaries)
+test extensions/
+
+# Agent and editor files
+.omp/
+.claude/
+.vscode/

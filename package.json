@@ -1,0 +1,26 @@
+{
+  "name": "@magicelk235/lavaduct",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Convert a Chrome extension into a Firefox add-on and install it.",
+  "type": "module",
+  "bin": { "lavaduct": "dist/cli.js" },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "gen-compat": "node scripts/gen-compat.mjs",
+    "test": "npm run build && node --test \"test/*.test.js\"",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "author": "magicelk235",
+  "engines": { "node": ">=22.13" },
+  "license": "PolyForm-Shield-1.0.0",
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "typescript": "^5.9.0"
+  }
+}
