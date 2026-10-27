@@ -23,11 +23,21 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   // and abort the --analyze run, matching the array guards used elsewhere.
   const permList = (m: Manifest, key: "permissions" | "optional_permissions"): string[] =>
     Array.isArray(m[key]) ? (m[key] as string[]) : [];
-  const removedPerms = permList(before, "permissions").filter((p) => !permList(after, "permissions").includes(p));
-  if (removedPerms.length) out.push(`Removed permission(s): ${removedPerms.map((p) => `\`${p}\``).join(", ")}.`);
+  const [required, optional] = [permList(before, "permissions"), permList(before, "optional_permissions")];
+  const [requiredAfter, optionalAfter] = [permList(after, "permissions"), permList(after, "optional_permissions")];
+  // Firefox reads some permissions from only one of the two lists, so the transform
+  // moves them across; that keeps the permission and must not read as a removal.
+  const toRequired = optional.filter((p) => !required.includes(p) && requiredAfter.includes(p));
+  const toOptional = required.filter((p) => !optional.includes(p) && optionalAfter.includes(p));
+  const quoted = (list: string[]) => list.map((p) => `\`${p}\``).join(", ");
+  if (toRequired.length) out.push(`Moved ${quoted(toRequired)} from \`optional_permissions\` to \`permissions\` (Firefox grants ${toRequired.length > 1 ? "them" : "it"} at install, without a prompt).`);
+  if (toOptional.length) out.push(`Moved ${quoted(toOptional)} from \`permissions\` to \`optional_permissions\` (Firefox only grants ${toOptional.length > 1 ? "them" : "it"} at runtime).`);
 
-  const removedOptPerms = permList(before, "optional_permissions").filter((p) => !permList(after, "optional_permissions").includes(p));
-  if (removedOptPerms.length) out.push(`Removed optional permission(s): ${removedOptPerms.map((p) => `\`${p}\``).join(", ")}.`);
+  const removedPerms = required.filter((p) => !requiredAfter.includes(p) && !toOptional.includes(p));
+  if (removedPerms.length) out.push(`Removed permission(s): ${quoted(removedPerms)}.`);
+
+  const removedOptPerms = optional.filter((p) => !optionalAfter.includes(p) && !toRequired.includes(p));
+  if (removedOptPerms.length) out.push(`Removed optional permission(s): ${quoted(removedOptPerms)}.`);
 
   for (const key of ["host_permissions", "optional_host_permissions"] as const) {
     const beforeHosts = Array.isArray(before[key]) ? (before[key] as unknown[]).filter((p): p is string => typeof p === "string") : [];

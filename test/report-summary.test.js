@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { countBlocking, summarizeManifestChanges, writeReportFile } from "../dist/analyze/report.js";
+import { transformManifest } from "../dist/manifest/manifest.js";
 
 const issues = [
   { severity: "error", category: "manifest", message: "missing file" },
@@ -73,4 +74,32 @@ test("an unchanged gecko block is not reported", () => {
     browser_specific_settings: { gecko: { id: "a@b", strict_min_version: "153.0" } },
   };
   assert.deepEqual(summarizeManifestChanges(m, structuredClone(m)), []);
+});
+
+test("a permission the transform moves between lists is reported as moved, not removed", () => {
+  const before = {
+    manifest_version: 3,
+    name: "Movers",
+    version: "1.0",
+    permissions: ["tabs", "userScripts"],
+    optional_permissions: ["storage", "bookmarks"],
+  };
+  const after = transformManifest(before, [], {
+    addonId: "movers@example.com",
+    minFirefoxVersion: "153.0",
+    platforms: "desktop",
+    version: "1.0",
+  });
+  const lines = summarizeManifestChanges(before, after);
+  const text = lines.join("\n");
+
+  assert.doesNotMatch(text, /Removed/, text);
+  assert.ok(lines.some((l) => /Moved `storage` from `optional_permissions` to `permissions`/.test(l)), text);
+  assert.ok(lines.some((l) => /Moved `userScripts` from `permissions` to `optional_permissions`/.test(l)), text);
+});
+
+test("a permission dropped from one list but kept in the other is still reported as removed", () => {
+  const before = { manifest_version: 3, name: "Gone", version: "1.0", permissions: ["tabs", "sidePanel"] };
+  const after = { ...before, permissions: ["tabs"] };
+  assert.deepEqual(summarizeManifestChanges(before, after), ["Removed permission(s): `sidePanel`."]);
 });
