@@ -1,21 +1,35 @@
-import { readFileSync, writeFileSync, copyFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, relative } from "node:path";
 import type { Manifest } from "../types.js";
 import { TEMPLATE_DIR } from "../paths.js";
+import { NAME } from "../name.js";
+import { SHIM_FILENAME, insertAtHeadStart } from "./shim.js";
 
-export const BRIDGE_POLYFILL = "identity-polyfill.js";
-export const BRIDGE_PAGE = "page-bridge.js";
-export const BRIDGE_PAGE_CS = "page-bridge-cs.js";
+/** Page-world script on the externally_connectable pages: provides chrome.runtime.sendMessage. */
+export const BRIDGE_PAGE = `${NAME}-page-bridge.js`;
+/** Content-script relay on the same pages, carrying page messages to the background. */
+export const BRIDGE_PAGE_CS = `${NAME}-page-bridge-cs.js`;
+/** Background receiver that hands page messages to the extension's onMessageExternal listeners. */
+export const BRIDGE_BACKGROUND = `${NAME}-page-bridge-bg.js`;
 
-/** Placeholder the bridge templates carry; replaced with the real Chrome id when derivable. */
-const EXT_ID_PLACEHOLDER = "__C2S_EXTENSION_ID__";
+/** Staged file name → bundled template. */
+const TEMPLATES: Record<string, string> = {
+  [BRIDGE_PAGE]: "page-bridge.js",
+  [BRIDGE_PAGE_CS]: "page-bridge-cs.js",
+  [BRIDGE_BACKGROUND]: "page-bridge-bg.js",
+};
+
+/** Placeholder for the extension's Chrome ID; left alone when the ID isn't known. */
+const EXT_ID_PLACEHOLDER = "__EXTENSION_ID__";
+/** Placeholder for the channel that keeps this add-on's bridge apart from others on the same page. */
+const CHANNEL_PLACEHOLDER = "__BRIDGE_CHANNEL__";
 
 /**
  * Derive an extension's Chrome id from its manifest `key` (base64 DER public key).
  * Chrome's rule: SHA-256 the decoded key, take the first 16 bytes, and map each
  * nibble 0–15 to a–p. Returns undefined for an unpacked extension (no key) or a
- * malformed key, in which case the templates fall back to the live runtime id.
+ * malformed key.
  */
 export function deriveChromeId(manifest: Manifest): string | undefined {
   const key = manifest.key;
@@ -34,169 +48,121 @@ export function deriveChromeId(manifest: Manifest): string | undefined {
   return id;
 }
 
-/** Replace the build-time extension-id placeholder in a staged template file. */
-function substituteExtId(filePath: string, chromeId: string | undefined): void {
-  if (!chromeId || !existsSync(filePath)) return;
-  const src = readFileSync(filePath, "utf-8");
-  if (!src.includes(EXT_ID_PLACEHOLDER)) return;
-  writeFileSync(filePath, src.split(EXT_ID_PLACEHOLDER).join(chromeId), "utf-8");
-}
-
-interface WarEntry {
-  resources: string[];
-  matches: string[];
-  use_dynamic_url?: boolean;
-}
-
 /**
- * Wire the Safari OAuth bridge into a staged MV3 extension.
+ * Let the pages listed in `externally_connectable.matches` keep messaging the
+ * extension. Chrome gives those pages `chrome.runtime.sendMessage(<id>, …)` and
+ * delivers to the extension's `runtime.onMessageExternal` listeners; Firefox
+ * ignores the key and gives web pages no `chrome.runtime` at all. This stages
+ * three scripts and wires them in:
+ *   - a page-world content script that provides `chrome.runtime.sendMessage`;
+ *   - an isolated-world relay that carries each message to the background;
+ *   - a background receiver, loaded ahead of the extension's own background code,
+ *     that hands the message to the captured onMessageExternal listeners with the
+ *     page as the sender.
+ * The `externally_connectable` key is removed once the bridge replaces it.
  *
- * Safari gives web pages no `chrome` namespace and routes externally_connectable
- * messages by the *Safari* extension id, but pages hardcode the *Chrome* id — so
- * the page↔extension OAuth handshake (launchWebAuthFlow + the `oauth_redirect`
- * callback message) silently dies. This emits three bridge assets and rewires the
- * manifest so the handshake completes:
- *   - identity-polyfill.js : shims chrome.identity in the SW + captures the SW's
- *     onMessageExternal handler and re-dispatches bridged page messages to it.
- *   - page-bridge.js       : MAIN-world fake `chrome.runtime` that relays over
- *     window.postMessage.
- *   - page-bridge-cs.js    : isolated-world relay page→SW (and back).
- *
- * No-op unless the extension has a background service worker. Mutates `manifest`.
+ * Works whether the background is still a service worker (the receiver is
+ * imported by it, so wireBackground puts it ahead of the worker) or has already
+ * been wired as `background.scripts` or a `page`. Mutates `manifest`; returns
+ * notes for the report.
  */
 export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?: string): string[] {
-  const notes: string[] = [];
-  // A leading-slash service_worker path ("/sw.js") is root-relative in Chrome;
-  // normalize it to manifest-relative or the relative() math in
-  // injectPolyfillImport emits a cwd-derived garbage import that kills the SW.
-  const rawSw = manifest.background?.service_worker;
-  const sw = typeof rawSw === "string" ? rawSw.replace(/^\/+/, "") : rawSw;
-  if (!sw) return notes; // only MV3 service-worker extensions have this handshake
-
-  // 1. Emit the identity polyfill — it shims chrome.identity in the SW and is
-  //    imported below regardless of whether the page bridge gets wired. Only the
-  //    polyfill is always needed; the page-bridge templates are checked later,
-  //    where they're used, so a missing page bridge doesn't kill the SW shim.
-  if (!existsSync(join(TEMPLATE_DIR, BRIDGE_POLYFILL))) {
-    notes.push(`OAuth bridge template "${BRIDGE_POLYFILL}" is missing from the install; skipping chrome.identity bridge.`);
-    return notes;
-  }
-  // The bridge templates carry a placeholder Chrome id. When the caller passes the
-  // extension's real Chrome id (derived from the source manifest `key`) we bake it
-  // in; otherwise the placeholder stays and the templates fall back to the live
-  // runtime id at execution time. Either way the bridge works for ANY extension.
-  copyFileSync(join(TEMPLATE_DIR, BRIDGE_POLYFILL), join(stageDir, BRIDGE_POLYFILL));
-  substituteExtId(join(stageDir, BRIDGE_POLYFILL), chromeId);
-
-  // launchWebAuthFlow watches the auth tab via chrome.webNavigation; Chrome
-  // extensions using identity typically don't declare it, so add it here (only for
-  // identity users — an unused permission on every extension draws review scrutiny)
-  // or the polyfill's onBeforeNavigate wiring throws (webNavigation is undefined).
-  const usesIdentity = Array.isArray(manifest.permissions) &&
-    manifest.permissions.some((p) => typeof p === "string" && (p === "identity" || p.startsWith("identity.")));
-  if (usesIdentity && Array.isArray(manifest.permissions) && !manifest.permissions.includes("webNavigation")) {
-    manifest.permissions.push("webNavigation");
+  const raw = manifest.externally_connectable?.matches;
+  const matches = Array.isArray(raw) ? raw.filter((m): m is string => typeof m === "string" && m.length > 0) : [];
+  if (matches.length === 0) return [];
+  const bg = manifest.background;
+  if (!bg || (typeof bg.service_worker !== "string" && !Array.isArray(bg.scripts) && typeof bg.page !== "string")) {
+    return ["Page bridge skipped: the extension has no background to receive messages from externally_connectable pages."];
   }
 
-  // 2. The SW (or its loader) must run the polyfill FIRST so the bridge receiver
-  //    and chrome.identity shim install before the bundle evaluates.
-  injectPolyfillImport(stageDir, sw);
-
-  // 3. (No background.type mutation here.) convertServiceWorkerToBackgroundPage
-  //    runs later in the pipeline and overwrites manifest.background entirely with
-  //    { page, persistent:false }, loading the SW via <script type="module">, so a
-  //    type:"module" set here would be discarded. The injected `import` (step 2)
-  //    is what actually persists and pulls in the polyfill.
-
-  // 4. Wire the page-side bridge on the externally_connectable origins (that is
-  //    exactly the set of pages allowed to message the extension). Without any
-  //    such origins the page↔SW handshake can never fire, so don't emit the
-  //    page-bridge files — they'd just be dead weight in the package.
-  // The raw manifest is unguarded JSON.parse output, so externally_connectable.matches
-  // may be a non-array (a bare string). Coerce to [] — a non-array can't be spread into
-  // content_scripts.matches and would crash on matches.join() below; falling into the
-  // skip branch is the correct, safe behavior.
-  const matches = Array.isArray(manifest.externally_connectable?.matches)
-    ? manifest.externally_connectable!.matches
-    : [];
-  if (matches.length === 0) {
-    notes.push("chrome.identity shim emitted; page bridge skipped (no externally_connectable.matches to wire).");
-    return notes;
+  // Derived rather than random so the packed add-on is identical between runs.
+  const channel = createHash("sha256")
+    .update(JSON.stringify([chromeId ?? "", manifest.name ?? "", matches]))
+    .digest("hex")
+    .slice(0, 16);
+  for (const [staged, template] of Object.entries(TEMPLATES)) {
+    let src = readFileSync(join(TEMPLATE_DIR, template), "utf-8").split(CHANNEL_PLACEHOLDER).join(channel);
+    if (chromeId) src = src.split(EXT_ID_PLACEHOLDER).join(chromeId);
+    writeFileSync(join(stageDir, staged), src, "utf-8");
   }
 
-  // Page bridge is actually wired → emit its two assets now. If either page-bridge
-  // template is missing from the install, the SW shim already landed above; skip
-  // only the page wiring rather than aborting the whole bridge.
-  if (!existsSync(join(TEMPLATE_DIR, BRIDGE_PAGE)) || !existsSync(join(TEMPLATE_DIR, BRIDGE_PAGE_CS))) {
-    notes.push("chrome.identity shim emitted; page bridge skipped (page-bridge template missing from install).");
-    return notes;
-  }
-  copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE), join(stageDir, BRIDGE_PAGE));
-  substituteExtId(join(stageDir, BRIDGE_PAGE), chromeId);
-  copyFileSync(join(TEMPLATE_DIR, BRIDGE_PAGE_CS), join(stageDir, BRIDGE_PAGE_CS));
+  wireReceiver(stageDir, manifest);
 
-  manifest.content_scripts = manifest.content_scripts ?? [];
-  // Idempotent: don't append a second pair of bridge entries if this manifest was
-  // already bridged (re-convert / retry / incremental build), which would inject
-  // the MAIN-world bridge twice.
-  const alreadyBridged = manifest.content_scripts.some(
-    (cs) => Array.isArray(cs.js) && cs.js.includes(BRIDGE_PAGE)
-  );
-  if (!alreadyBridged) {
-    // MAIN world: fake chrome.runtime in the page. Isolated world: relay to SW.
-    manifest.content_scripts.unshift(
+  const scripts = Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [];
+  if (!scripts.some((cs) => Array.isArray(cs.js) && cs.js.includes(BRIDGE_PAGE))) {
+    scripts.unshift(
       { js: [BRIDGE_PAGE], matches, run_at: "document_start", all_frames: false, world: "MAIN" },
-      { js: [BRIDGE_PAGE_CS], matches, run_at: "document_start", all_frames: false }
+      { js: [BRIDGE_PAGE_CS], matches, run_at: "document_start", all_frames: false },
     );
   }
-
-  // 5. page-bridge.js must be web-accessible so a getURL/script-tag fallback works
-  //    on Safari versions that ignore world:"MAIN" content scripts.
-  addWebAccessible(manifest, BRIDGE_PAGE, matches);
-
-  notes.push(`OAuth bridge wired (page↔SW) for: ${matches.join(", ")}`);
-  return notes;
+  manifest.content_scripts = scripts;
+  delete manifest.externally_connectable;
+  return [`Page bridge wired for externally_connectable pages: ${matches.join(", ")}`];
 }
+
+/** Load the receiver before the extension's own background code. */
+function wireReceiver(stageDir: string, manifest: Manifest): void {
+  const bg = manifest.background;
+  if (!bg) return;
+  if (Array.isArray(bg.scripts)) {
+    if (!bg.scripts.includes(BRIDGE_BACKGROUND)) bg.scripts.splice(bg.scripts[0] === SHIM_FILENAME ? 1 : 0, 0, BRIDGE_BACKGROUND);
+    return;
+  }
+  if (typeof bg.service_worker === "string") {
+    const sw = bg.service_worker.replace(/^(?:\.?\/)+/, "");
+    const swPath = join(stageDir, sw);
+    if (!existsSync(swPath)) return;
+    const src = readFileSync(swPath, "utf-8");
+    if (bg.type === "module") {
+      // A module's imports run before its body.
+      let rel = relative(dirname(sw), BRIDGE_BACKGROUND).split("\\").join("/");
+      if (!rel.startsWith(".")) rel = "./" + rel;
+      const line = `import "${rel}";\n`;
+      if (!src.startsWith(line)) writeFileSync(swPath, line + src, "utf-8");
+    } else {
+      // wireBackground hoists this like any other importScripts target.
+      const call = `importScripts("/${BRIDGE_BACKGROUND}");\n`;
+      if (src.includes(call)) return;
+      const at = directivePrologueEnd(src);
+      writeFileSync(swPath, at > 0 ? src.slice(0, at) + "\n" + call + src.slice(at) : call + src, "utf-8");
+    }
+    return;
+  }
+  if (typeof bg.page === "string") {
+    const pagePath = join(stageDir, bg.page.replace(/^\/+/, ""));
+    if (!existsSync(pagePath)) return;
+    const tag = `<script src="/${BRIDGE_BACKGROUND}"></script>`;
+    const html = readFileSync(pagePath, "utf-8");
+    if (!html.includes(tag)) writeFileSync(pagePath, insertAtHeadStart(html, tag), "utf-8");
+  }
+}
+
+const TRIVIA_RE = /(?:\uFEFF|\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*/y;
+const DIRECTIVE_RE = /(["'])(?:(?!\1)[^\\\r\n]|\\.)*\1[ \t]*(;)?(?=[ \t]*(?:\r?\n|$)|(?<=;))/y;
 
 /**
- * Prepend `import "<rel>/identity-polyfill.js";` to the SW entry if absent.
- * The polyfill is copied to the stage ROOT, but the SW may live in a subdir
- * (e.g. service-worker/index.js). A bare "./identity-polyfill.js" then resolves
- * to service-worker/identity-polyfill.js → 404 → the whole SW module fails to
- * load and never registers its onConnect/onMessage listeners. So compute the
- * path FROM the SW's own directory back to the root where the polyfill sits.
+ * End of a script's directive prologue ("use strict"; and friends), so code can be
+ * inserted after it: anything placed ahead of "use strict" turns the directive into
+ * a plain expression and the script silently loses strict mode. Returns 0 when the
+ * script has no prologue.
  */
-function injectPolyfillImport(stageDir: string, swRel: string): void {
-  const swPath = join(stageDir, swRel);
-  if (!existsSync(swPath)) return;
-  const src = readFileSync(swPath, "utf-8");
-  // Relative path from the SW's dir to the root polyfill. For a root SW this is
-  // "./identity-polyfill.js"; for service-worker/index.js it's "../identity-polyfill.js".
-  let rel = relative(dirname(swRel), BRIDGE_POLYFILL).split("\\").join("/");
-  if (!rel.startsWith(".")) rel = "./" + rel;
-  // Match the actual import, not a bare filename mention (a comment or URL referencing
-  // identity-polyfill.js would otherwise suppress the required import).
-  if (src.includes(`"${rel}"`)) return;
-  writeFileSync(swPath, `import "${rel}";\n` + src, "utf-8");
-}
-
-/** Ensure `resource` is exposed to `matches` in web_accessible_resources (MV3 form). */
-function addWebAccessible(manifest: Manifest, resource: string, matches: string[]): void {
-  // Normalize whatever's there into MV3 object form, preserving existing entries.
-  // A bare MV2 string[] (or a stray loose string in a mixed array) gets wrapped
-  // rather than dropped; only a wholly-malformed non-array value resets to empty.
-  const existing = manifest.web_accessible_resources;
-  const raw: unknown[] = Array.isArray(existing) ? existing : [];
-  const looseStrings = raw.filter((e): e is string => typeof e === "string");
-  const war = raw.filter(
-    (e): e is WarEntry => typeof e === "object" && e !== null
-  );
-  if (looseStrings.length > 0) {
-    war.push({ resources: looseStrings, matches: ["<all_urls>"] });
+function directivePrologueEnd(src: string): number {
+  let at = 0;
+  let end = 0;
+  for (;;) {
+    TRIVIA_RE.lastIndex = at;
+    TRIVIA_RE.exec(src);
+    at = TRIVIA_RE.lastIndex;
+    DIRECTIVE_RE.lastIndex = at;
+    const m = DIRECTIVE_RE.exec(src);
+    if (!m) return end;
+    if (!m[2]) {
+      // Without a semicolon the string only ends the statement if the next line
+      // can't continue the expression.
+      const next = /\S/.exec(src.slice(DIRECTIVE_RE.lastIndex));
+      if (next && /[.([`+\-*/%,?=<>&|]/.test(next[0])) return end;
+    }
+    at = DIRECTIVE_RE.lastIndex;
+    end = at;
   }
-  const already = war.some(
-    (e) => Array.isArray(e.resources) && e.resources.includes(resource)
-  );
-  if (!already) war.push({ resources: [resource], matches, use_dynamic_url: false });
-  manifest.web_accessible_resources = war;
 }

@@ -1,0 +1,831 @@
+// Firefox compatibility shim for converted Chrome extensions.
+//
+// Loaded first in the background scripts, in every content script and in every
+// extension page. Firefox implements most of chrome.* itself, so this only fills
+// the gaps:
+//   - chrome.sidePanel, on top of the manifest's sidebar_action;
+//   - chrome.offscreen, as a hidden iframe in the event page (background only);
+//   - identity.getAuthToken and friends, on top of launchWebAuthFlow;
+//   - chrome://favicon/ and /_favicon/ URLs, for fetch() and <img>.
+// A member is only defined where Firefox has none. Nothing Firefox provides is
+// replaced.
+//
+// The shim shares its script evaluation with the extension's own background
+// code, so nothing may throw out of it.
+(function () {
+  "use strict";
+
+  var CONFIG = {};
+  try { CONFIG = __SHIM_CONFIG_JSON__ || {}; } catch (e) {}
+
+  // Content scripts evaluate the shim once per matching content_scripts entry,
+  // all in the same sandbox, so install once.
+  var G = typeof globalThis !== "undefined" ? globalThis : self;
+  try {
+    if (G.__firefoxCompatShim) return;
+    Object.defineProperty(G, "__firefoxCompatShim", { value: true, configurable: true });
+  } catch (e) { return; }
+
+  var __SHIM_DEBUG__ = false;
+  // __SHIM_DEBUG_RING__
+  function dbg() {
+    if (!__SHIM_DEBUG__) return;
+    var args = ["[compat-shim]"].concat(Array.prototype.slice.call(arguments));
+    try { console.log.apply(console, args); } catch (e) {}
+    try { if (typeof __SHIM_DEBUG_WRITE__ === "function") __SHIM_DEBUG_WRITE__(args); } catch (e) {}
+  }
+
+  // In MV2 extension pages `chrome` and `browser` are separate objects; anywhere
+  // else they are the same one.
+  var namespaces = [];
+  try { if (typeof browser === "object" && browser) namespaces.push(browser); } catch (e) {}
+  try { if (typeof chrome === "object" && chrome && namespaces.indexOf(chrome) < 0) namespaces.push(chrome); } catch (e) {}
+  if (!namespaces.length) return;
+  // Our own calls go through the promise-returning namespace.
+  var api = namespaces[0];
+
+  var nativeFetch = null;
+  try { if (typeof fetch === "function") nativeFetch = fetch; } catch (e) {}
+
+  var loc = null;
+  try { loc = location; } catch (e) {}
+  var isExtensionPage = !!loc && loc.protocol === "moz-extension:";
+  var hasDocument = false;
+  try { hasDocument = typeof document !== "undefined" && !!document; } catch (e) {}
+  var isTopFrame = true;
+  try { isTopFrame = typeof window === "undefined" || window.top === window; } catch (e) { isTopFrame = false; }
+  var isBackground = isExtensionPage && isTopFrame && detectBackground();
+
+  var ORIGIN = "";
+  try { ORIGIN = String(api.runtime.getURL("/")).replace(/\/+$/, ""); } catch (e) {}
+
+  var localStore = null;
+  try { localStore = typeof localStorage !== "undefined" ? localStorage : null; } catch (e) {}
+
+  function detectBackground() {
+    var path = loc.pathname;
+    // background.scripts run in a page Firefox generates under this name.
+    if (path === "/_generated_background_page.html") return true;
+    try {
+      var bg = api.runtime.getManifest().background;
+      if (bg && typeof bg.page === "string" && path === "/" + bg.page.replace(/^\/+/, "")) return true;
+    } catch (e) {}
+    try {
+      return !!(api.extension && typeof api.extension.getBackgroundPage === "function" &&
+        api.extension.getBackgroundPage() === window);
+    } catch (e) {}
+    return false;
+  }
+
+  function noop() {}
+
+  function errorMessage(err) {
+    return String((err && err.message) || err || "Unknown error");
+  }
+
+  // A thrown callback should surface like it would from a native callback, not
+  // disappear into a promise chain.
+  function invoke(fn, args) {
+    try { fn.apply(null, args); } catch (e) { setTimeout(function () { throw e; }, 0); }
+  }
+
+  // Chrome's runtime.lastError, set only while the callback runs. Firefox's own
+  // lastError is a getter with no setter, so it is shadowed for the duration of
+  // the callback and the original descriptor goes straight back afterwards.
+  function withLastError(ns, err, fn) {
+    var rt = ns && ns.runtime;
+    var saved;
+    var shadowed = false;
+    try {
+      saved = Object.getOwnPropertyDescriptor(rt, "lastError");
+      Object.defineProperty(rt, "lastError", {
+        value: { message: errorMessage(err) }, configurable: true, enumerable: true, writable: true,
+      });
+      shadowed = true;
+    } catch (e) {}
+    try {
+      fn();
+    } finally {
+      if (shadowed) {
+        try {
+          if (saved) Object.defineProperty(rt, "lastError", saved);
+          else delete rt.lastError;
+        } catch (e) {}
+      }
+    }
+  }
+
+  // Chrome's async calls take an optional trailing callback and return a promise
+  // when there is none. `spread` passes an array result as separate arguments.
+  function respond(ns, promise, cb, spread) {
+    if (typeof cb !== "function") return promise;
+    promise.then(function (value) {
+      invoke(cb, spread ? value : [value]);
+    }, function (err) {
+      withLastError(ns, err, function () { invoke(cb, []); });
+    });
+    return undefined;
+  }
+
+  function makeEvent() {
+    var listeners = [];
+    return {
+      event: {
+        addListener: function (fn) { if (typeof fn === "function" && listeners.indexOf(fn) < 0) listeners.push(fn); },
+        removeListener: function (fn) { var i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); },
+        hasListener: function (fn) { return listeners.indexOf(fn) >= 0; },
+        hasListeners: function () { return listeners.length > 0; },
+      },
+      dispatch: function () {
+        var args = arguments;
+        listeners.slice().forEach(function (fn) { invoke(fn, args); });
+      },
+    };
+  }
+
+  // Define obj[name] only when Firefox has nothing there.
+  function defineMissing(obj, name, value) {
+    if (!obj) return false;
+    try { if (obj[name] != null) return false; } catch (e) { return false; }
+    try {
+      Object.defineProperty(obj, name, { value: value, writable: true, configurable: true, enumerable: true });
+      return true;
+    } catch (e) {}
+    try { obj[name] = value; } catch (e) {}
+    return obj[name] === value;
+  }
+
+  function readLocal(key) {
+    try {
+      var v = localStore && localStore.getItem(key);
+      return v ? JSON.parse(v) : null;
+    } catch (e) { return null; }
+  }
+
+  function writeLocal(key, value) {
+    try { if (localStore) localStore.setItem(key, JSON.stringify(value)); } catch (e) {}
+  }
+
+  function stripSlashes(p) {
+    return String(p || "").replace(/^\/+/, "");
+  }
+
+  // URLs of the add-on's own files, built from strings rather than URL.origin:
+  // moz-extension: isn't a special scheme, so URL objects aren't reliable about it.
+  function extensionUrl(p) {
+    var s = String(p || "");
+    if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return s;
+    return ORIGIN + "/" + stripSlashes(s);
+  }
+
+  function relativePath(url) {
+    var s = String(url || "");
+    if (ORIGIN && s.indexOf(ORIGIN + "/") === 0) return s.slice(ORIGIN.length + 1);
+    return s;
+  }
+
+  function originOf(u) {
+    return u.protocol + "//" + u.host;
+  }
+
+  // ── chrome.sidePanel ────────────────────────────────────────────────────────
+  // The manifest's side_panel became a sidebar_action. Firefox's sidebar is per
+  // window, opens only from a user action, and has no enable/disable switch, so
+  // `enabled` is tracked here. Without a sidebar_action (an extension that only
+  // sets its panel through setOptions) the panel opens as a popup window.
+  var PANEL_STATE_KEY = "__sidePanelShim";
+  var PANEL_EVENT_KEY = "__sidePanelShim:event";
+
+  function installSidePanel() {
+    if (!isExtensionPage) return;
+    var sidebar = api.sidebarAction || null;
+    if (!sidebar && !api.windows) return;
+
+    // Kept in localStorage: it is shared by all the extension's pages, and it is
+    // synchronous, which matters because the action-click handler has to call
+    // sidebarAction before it returns.
+    var memory = { behavior: false, enabled: true, path: "" };
+    function panelState() {
+      var s = readLocal(PANEL_STATE_KEY);
+      return s && typeof s === "object" ? s : memory;
+    }
+    function updatePanelState(change) {
+      var s = panelState();
+      var next = { behavior: !!s.behavior, enabled: s.enabled !== false, path: s.path || "" };
+      change(next);
+      memory = next;
+      writeLocal(PANEL_STATE_KEY, next);
+    }
+    var tabOptions = {};
+    var panelWindowId = null;
+
+    var manifestPanel = "";
+    try {
+      var sa = api.runtime.getManifest().sidebar_action;
+      manifestPanel = (sa && typeof sa.default_panel === "string") ? stripSlashes(sa.default_panel) : "";
+    } catch (e) {}
+    var defaultPath = stripSlashes(CONFIG.sidePanelPath || manifestPanel.split(/[?#]/)[0]);
+
+    // The default page keeps the query the converter put on default_panel.
+    function panelUrl(path) {
+      var p = stripSlashes(path);
+      if (manifestPanel && p === defaultPath) return extensionUrl(manifestPanel);
+      return extensionUrl(p);
+    }
+    function reportedPath(url) {
+      var rel = relativePath(url);
+      if (!rel || (manifestPanel && rel === manifestPanel)) return defaultPath;
+      return rel;
+    }
+    function enabledFor(tabId) {
+      var t = tabId != null ? tabOptions[tabId] : null;
+      if (t && typeof t.enabled === "boolean") return t.enabled;
+      return panelState().enabled !== false;
+    }
+    function pathFor(tabId) {
+      var t = tabId != null ? tabOptions[tabId] : null;
+      return (t && t.path) || panelState().path || defaultPath;
+    }
+    function openWindow(path) {
+      if (!path) return Promise.reject(new Error("No side panel page is set; call sidePanel.setOptions({ path }) first."));
+      return Promise.resolve(api.windows.create({ url: extensionUrl(path), type: "popup", width: 420, height: 720 }))
+        .then(function (w) { panelWindowId = w && w.id != null ? w.id : null; });
+    }
+    function showPanel(tabId) {
+      // sidebarAction.open() only works inside a user action, so it must be
+      // called before this returns; nothing may be awaited first.
+      return sidebar ? sidebar.open() : openWindow(pathFor(tabId));
+    }
+
+    var actionListening = false;
+    function listenForActionClicks() {
+      if (!isBackground || actionListening) return;
+      var action = api.action || api.browserAction;
+      if (!action || !action.onClicked || typeof action.onClicked.addListener !== "function") return;
+      actionListening = true;
+      action.onClicked.addListener(function () {
+        if (!panelState().behavior) return;
+        try {
+          var p = sidebar ? (typeof sidebar.toggle === "function" ? sidebar.toggle() : sidebar.open()) : openWindow(pathFor(null));
+          if (p && typeof p.catch === "function") p.catch(noop);
+        } catch (e) {}
+      });
+    }
+    // An event page woken by an action click doesn't run setPanelBehavior again,
+    // so the listener goes in at startup whenever the behaviour was turned on.
+    if (panelState().behavior) listenForActionClicks();
+
+    var opened = makeEvent();
+    var closed = makeEvent();
+
+    function build(ns) {
+      return {
+        open: function (options, cb) {
+          var tabId = options && options.tabId;
+          var p;
+          try {
+            if (!enabledFor(tabId)) {
+              throw new Error("No active side panel for " + (tabId != null ? "tabId: " + tabId : "windowId: " + (options && options.windowId)));
+            }
+            p = showPanel(tabId);
+          } catch (e) { p = Promise.reject(e); }
+          return respond(ns, Promise.resolve(p).then(noop), cb);
+        },
+        close: function (options, cb) {
+          var p;
+          try {
+            if (sidebar) p = sidebar.close();
+            else if (panelWindowId != null) p = api.windows.remove(panelWindowId);
+          } catch (e) { p = Promise.reject(e); }
+          return respond(ns, Promise.resolve(p).then(noop), cb);
+        },
+        setOptions: function (options, cb) {
+          var p;
+          try {
+            var o = options || {};
+            var hasPath = typeof o.path === "string";
+            if (o.tabId != null) {
+              var t = tabOptions[o.tabId] || {};
+              if (typeof o.enabled === "boolean") t.enabled = o.enabled;
+              if (hasPath) t.path = stripSlashes(o.path);
+              tabOptions[o.tabId] = t;
+              if (sidebar && hasPath) p = sidebar.setPanel({ tabId: o.tabId, panel: panelUrl(o.path) });
+            } else {
+              updatePanelState(function (s) {
+                if (typeof o.enabled === "boolean") s.enabled = o.enabled;
+                if (hasPath) s.path = stripSlashes(o.path);
+              });
+              if (sidebar && hasPath) p = sidebar.setPanel({ panel: panelUrl(o.path) });
+            }
+            dbg("sidePanel.setOptions", JSON.stringify(o));
+          } catch (e) { p = Promise.reject(e); }
+          return respond(ns, Promise.resolve(p).then(noop), cb);
+        },
+        getOptions: function (options, cb) {
+          if (typeof options === "function") { cb = options; options = {}; }
+          var tabId = options && options.tabId;
+          var enabled = enabledFor(tabId);
+          var p;
+          if (sidebar) {
+            p = Promise.resolve(sidebar.getPanel(tabId != null ? { tabId: tabId } : {})).then(function (url) {
+              var out = { enabled: enabled };
+              var path = reportedPath(url);
+              if (path) out.path = path;
+              return out;
+            });
+          } else {
+            var out = { enabled: enabled };
+            var path = pathFor(tabId);
+            if (path) out.path = path;
+            p = Promise.resolve(out);
+          }
+          return respond(ns, p, cb);
+        },
+        setPanelBehavior: function (behavior, cb) {
+          var on = !!(behavior && behavior.openPanelOnActionClick);
+          updatePanelState(function (s) { s.behavior = on; });
+          if (on) listenForActionClicks();
+          return respond(ns, Promise.resolve(), cb);
+        },
+        getPanelBehavior: function (cb) {
+          return respond(ns, Promise.resolve({ openPanelOnActionClick: !!panelState().behavior }), cb);
+        },
+        getLayout: function (cb) {
+          // Extensions can't read which side Firefox puts the sidebar on; it
+          // starts out on the left.
+          return respond(ns, Promise.resolve({ side: "left" }), cb);
+        },
+        onOpened: opened.event,
+        onClosed: closed.event,
+      };
+    }
+    namespaces.forEach(function (ns) { defineMissing(ns, "sidePanel", build(ns)); });
+
+    // onOpened/onClosed: the sidebar's own document announces itself through a
+    // localStorage write, which every other running page of the extension sees
+    // as a "storage" event. A suspended background page misses it.
+    try {
+      if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+        window.addEventListener("storage", function (e) {
+          if (!e || e.key !== PANEL_EVENT_KEY || !e.newValue) return;
+          var d = null;
+          try { d = JSON.parse(e.newValue); } catch (err) { return; }
+          if (!d) return;
+          (d.type === "opened" ? opened : closed).dispatch({ path: d.path, windowId: d.windowId });
+        });
+      }
+      if (sidebar && hasDocument && typeof document.addEventListener === "function") {
+        document.addEventListener("DOMContentLoaded", function () {
+          var views = [];
+          try { views = api.extension.getViews({ type: "sidebar" }) || []; } catch (e) {}
+          if (Array.prototype.indexOf.call(views, window) < 0) return;
+          var info = { path: reportedPath(loc.href), windowId: -1 };
+          var announce = function (type) {
+            writeLocal(PANEL_EVENT_KEY, { type: type, path: info.path, windowId: info.windowId, t: Date.now() });
+          };
+          Promise.resolve(api.windows && api.windows.getCurrent ? api.windows.getCurrent() : null).then(function (w) {
+            if (w && w.id != null) info.windowId = w.id;
+          }, noop).then(function () { announce("opened"); });
+          window.addEventListener("pagehide", function () { announce("closed"); });
+        });
+      }
+    } catch (e) {}
+  }
+
+  // ── chrome.offscreen ────────────────────────────────────────────────────────
+  // Firefox's event page is a real document, so the offscreen document is a
+  // hidden iframe in it. The iframe is an extension page of its own: it has the
+  // extension API and receives the background's runtime messages natively.
+  var OFFSCREEN_REASONS = [
+    "TESTING", "AUDIO_PLAYBACK", "IFRAME_SCRIPTING", "DOM_SCRAPING", "BLOBS", "DOM_PARSER", "USER_MEDIA",
+    "DISPLAY_MEDIA", "WEB_RTC", "CLIPBOARD", "LOCAL_STORAGE", "WORKERS", "BATTERY_STATUS", "MATCH_MEDIA",
+    "GEOLOCATION",
+  ];
+
+  function installOffscreen() {
+    if (!CONFIG.offscreen || !isBackground || !hasDocument || typeof document.createElement !== "function") return;
+    var frame = null;
+    var frameUrl = "";
+    var keepAlive = null;
+    var Reason = {};
+    OFFSCREEN_REASONS.forEach(function (r) { Reason[r] = r; });
+
+    function removeFrame() {
+      var f = frame;
+      frame = null;
+      frameUrl = "";
+      if (keepAlive !== null) { clearInterval(keepAlive); keepAlive = null; }
+      try { if (f && f.parentNode) f.parentNode.removeChild(f); } catch (e) {}
+    }
+
+    function create(params) {
+      return new Promise(function (resolve) {
+        if (frame) throw new Error("Only a single offscreen document may be created.");
+        var url = params && params.url;
+        if (typeof url !== "string" || !url) throw new Error("offscreen.createDocument needs a url.");
+        var abs = extensionUrl(url);
+        var f = document.createElement("iframe");
+        try { f.setAttribute("aria-hidden", "true"); } catch (e) {}
+        try { f.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden;left:-9999px;top:-9999px;"; } catch (e) {}
+        var settled = false;
+        // Chrome resolves once the document has finished its initial load; a page
+        // that never fires load must not hang the caller forever.
+        var timer = setTimeout(done, 10000);
+        function done() {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        }
+        f.addEventListener("load", done);
+        f.src = abs;
+        (document.body || document.documentElement).appendChild(f);
+        frame = f;
+        frameUrl = abs;
+        // Chrome keeps an offscreen document until it is closed, but Firefox
+        // suspends an idle event page after 30 s, iframe included (cutting off
+        // audio it is playing, say). An extension API call from the background
+        // resets that idle timer.
+        keepAlive = setInterval(function () {
+          try {
+            var r = api.runtime.getPlatformInfo();
+            if (r && typeof r.catch === "function") r.catch(noop);
+          } catch (e) {}
+        }, 20000);
+        dbg("offscreen document created:", abs);
+      });
+    }
+
+    namespaces.forEach(function (ns) {
+      defineMissing(ns, "offscreen", {
+        Reason: Reason,
+        createDocument: function (params, cb) { return respond(ns, create(params), cb); },
+        closeDocument: function (cb) {
+          var p = frame ? Promise.resolve(removeFrame()) : Promise.reject(new Error("No current offscreen document."));
+          return respond(ns, p, cb);
+        },
+        hasDocument: function (cb) { return respond(ns, Promise.resolve(!!frame), cb); },
+      });
+    });
+
+    // A service worker finds its offscreen document with clients.matchAll(). An
+    // event page has no `clients`, so this one knows about the iframe.
+    function offscreenClient() {
+      if (!frame) return null;
+      var f = frame;
+      return {
+        id: "offscreen-document", type: "window", frameType: "nested", url: frameUrl,
+        focused: false, visibilityState: "hidden",
+        postMessage: function (data) {
+          // A document reads its service worker's messages from
+          // navigator.serviceWorker.
+          try {
+            var w = f.contentWindow;
+            w.navigator.serviceWorker.dispatchEvent(new w.MessageEvent("message", { data: data }));
+          } catch (e) {}
+        },
+      };
+    }
+    defineMissing(G, "clients", {
+      matchAll: function () {
+        var c = offscreenClient();
+        return Promise.resolve(c ? [c] : []);
+      },
+      get: function (id) {
+        var c = offscreenClient();
+        return Promise.resolve(c && c.id === id ? c : undefined);
+      },
+      claim: function () { return Promise.resolve(); },
+    });
+  }
+
+  // ── chrome.identity ─────────────────────────────────────────────────────────
+  // Firefox implements getRedirectURL and launchWebAuthFlow only. getAuthToken
+  // runs Google's OAuth flow through launchWebAuthFlow with Firefox's loopback
+  // redirect (http://127.0.0.1/mozoauth2/<id>), which Google accepts without a
+  // verified domain. The add-on's OAuth client has to allow that redirect.
+  var TOKEN_STORE_KEY = "__identityShimTokens";
+  var PROFILE_SCOPE_RE = /^(?:email|openid|profile)$|userinfo\.(?:email|profile)$/;
+
+  function installIdentity() {
+    var targets = namespaces.filter(function (ns) {
+      try { return !!ns.identity && typeof ns.identity.launchWebAuthFlow === "function"; } catch (e) { return false; }
+    });
+    if (!targets.length) return;
+    var identity = (api.identity && typeof api.identity.launchWebAuthFlow === "function") ? api.identity : targets[0].identity;
+
+    // Token cache in storage.session, so it outlives the event page the way
+    // Chrome's cache outlives the service worker, and so the background and the
+    // extension's pages share it. Read fresh on every call; updates go through a
+    // queue so two flows finishing together don't drop each other's token.
+    var memoryTokens = {};
+    var inflight = {};
+    var session = null;
+    try { session = api.storage && api.storage.session; } catch (e) {}
+
+    function loadTokens() {
+      if (!session) return Promise.resolve(memoryTokens);
+      return Promise.resolve(session.get(TOKEN_STORE_KEY)).then(function (r) {
+        var stored = r && r[TOKEN_STORE_KEY];
+        return stored && typeof stored === "object" ? stored : {};
+      }, function () { return {}; });
+    }
+    var updates = Promise.resolve();
+    function updateTokens(change) {
+      var run = updates.then(loadTokens).then(function (tokens) {
+        change(tokens);
+        if (!session) return undefined;
+        var o = {};
+        o[TOKEN_STORE_KEY] = tokens;
+        return session.set(o);
+      });
+      updates = run.catch(noop);
+      return run;
+    }
+
+    // Firefox's getManifest() leaves out keys it doesn't know, oauth2 among them,
+    // so read the packaged manifest.json.
+    function oauthConfig() {
+      var fromRuntime = null;
+      try { fromRuntime = api.runtime.getManifest().oauth2; } catch (e) {}
+      if (fromRuntime && fromRuntime.client_id) return Promise.resolve(fromRuntime);
+      if (!nativeFetch) return Promise.reject(new Error("Invalid OAuth2 Client ID."));
+      return nativeFetch(api.runtime.getURL("manifest.json")).then(function (r) { return r.json(); }).then(function (m) {
+        if (!m || !m.oauth2 || !m.oauth2.client_id) throw new Error("Invalid OAuth2 Client ID.");
+        return m.oauth2;
+      });
+    }
+
+    function loopbackRedirect() {
+      var host = new URL(identity.getRedirectURL()).hostname;
+      return "http://127.0.0.1/mozoauth2/" + host.split(".")[0];
+    }
+
+    function redirectParams(redirect) {
+      var u = new URL(String(redirect));
+      var params = new URLSearchParams((u.hash || "").replace(/^#/, ""));
+      if (!params.get("access_token") && !params.get("error")) params = new URLSearchParams((u.search || "").replace(/^\?/, ""));
+      var out = {};
+      params.forEach(function (v, k) { out[k] = v; });
+      return out;
+    }
+
+    function requestToken(details) {
+      var d = details || {};
+      return Promise.all([oauthConfig(), loadTokens()]).then(function (res) {
+        var cfg = res[0];
+        var tokens = res[1];
+        var scopes = (Array.isArray(d.scopes) && d.scopes.length ? d.scopes : (cfg.scopes || [])).map(String);
+        var key = scopes.slice().sort().join(" ");
+        var cached = tokens[key];
+        if (cached && cached.expires - 60000 > Date.now()) return { token: cached.token, grantedScopes: cached.scopes };
+        if (inflight[key]) return inflight[key];
+        var interactive = d.interactive === true;
+        var query = [
+          "client_id=" + encodeURIComponent(cfg.client_id),
+          "response_type=token",
+          "redirect_uri=" + encodeURIComponent(loopbackRedirect()),
+          "scope=" + encodeURIComponent(scopes.join(" ")),
+          "include_granted_scopes=true",
+        ];
+        if (!interactive) query.push("prompt=none");
+        if (d.account && d.account.id) query.push("login_hint=" + encodeURIComponent(d.account.id));
+        var url = "https://accounts.google.com/o/oauth2/v2/auth?" + query.join("&");
+        var flow = Promise.resolve(identity.launchWebAuthFlow({ url: url, interactive: interactive })).then(function (redirect) {
+          var p = redirectParams(redirect);
+          if (p.error) throw new Error("OAuth2 request failed: " + p.error + (p.error_description ? " (" + p.error_description + ")" : ""));
+          if (!p.access_token) throw new Error("OAuth2 request failed: no access token in the redirect.");
+          var granted = p.scope ? p.scope.split(/\s+/).filter(Boolean) : scopes;
+          var entry = { token: p.access_token, scopes: granted, expires: Date.now() + (Number(p.expires_in) || 3600) * 1000 };
+          dbg("identity: token issued for", key);
+          return updateTokens(function (all) { all[key] = entry; }).then(null, noop).then(function () {
+            return { token: p.access_token, grantedScopes: granted };
+          });
+        });
+        inflight[key] = flow;
+        var clear = function () { delete inflight[key]; };
+        flow.then(clear, clear);
+        return flow;
+      });
+    }
+
+    function profileInfo() {
+      return loadTokens().then(function (tokens) {
+        var now = Date.now();
+        var hit = null;
+        Object.keys(tokens).forEach(function (k) {
+          var t = tokens[k];
+          if (!hit && t && t.expires > now && Array.isArray(t.scopes) && t.scopes.some(function (s) { return PROFILE_SCOPE_RE.test(s); })) hit = t;
+        });
+        var none = { email: "", id: "" };
+        if (!hit || !nativeFetch) return none;
+        return nativeFetch("https://www.googleapis.com/oauth2/v3/userinfo", { headers: { Authorization: "Bearer " + hit.token } })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (info) {
+            return info ? { email: String(info.email || ""), id: String(info.sub || "") } : none;
+          }, function () { return none; });
+      });
+    }
+
+    var signInChanged = makeEvent();
+    targets.forEach(function (ns) {
+      var id = ns.identity;
+      defineMissing(id, "getAuthToken", function (details, cb) {
+        if (typeof details === "function") { cb = details; details = {}; }
+        var p = requestToken(details);
+        if (typeof cb === "function") {
+          // Chrome hands a callback the token and the granted scopes separately.
+          respond(ns, p.then(function (r) { return [r.token, r.grantedScopes]; }), cb, true);
+          return undefined;
+        }
+        return p;
+      });
+      defineMissing(id, "removeCachedAuthToken", function (details, cb) {
+        var token = details && details.token;
+        return respond(ns, updateTokens(function (all) {
+          Object.keys(all).forEach(function (k) { if (all[k] && all[k].token === token) delete all[k]; });
+        }), cb);
+      });
+      defineMissing(id, "clearAllCachedAuthTokens", function (cb) {
+        return respond(ns, updateTokens(function (all) {
+          Object.keys(all).forEach(function (k) { delete all[k]; });
+        }), cb);
+      });
+      defineMissing(id, "getProfileUserInfo", function (details, cb) {
+        if (typeof details === "function") { cb = details; }
+        return respond(ns, profileInfo(), cb);
+      });
+      // Firefox has no signed-in browser account to report on; the event exists
+      // so registering a listener doesn't throw.
+      defineMissing(id, "onSignInChanged", signInChanged.event);
+    });
+  }
+
+  // ── favicons ────────────────────────────────────────────────────────────────
+  // chrome://favicon/[size/16@2x/]<url> (MV2) and <extension>/_favicon/?pageUrl=<url>
+  // (MV3) don't exist in Firefox. Served from the open tab's icon when the
+  // context can see tabs, then the site's /favicon.ico, then a generic globe.
+  // Only emitted for an add-on that references these URLs.
+  var GLOBE_PNG_BASE64 =
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAABGklEQVR42t2XwQ2DMAxFGSEjeQRGYISM4FMvPTBCRsgIjMAIjMAI" +
+    "bSoFyXLtEGhR3B6+BCa2H+QDSYe3e9dS3S8CuCRI8kmY5XPMXQkwJMWkx45iHvs1gNedzRWNueac+xEAkoJL1l5jPg7PAgShyEpi" +
+    "g3K8CvDhKACSYn2O9QLQds4b0py19CS0Od8KjfkcmAF7Ng4YYCR5Ixu3C3DGcEeMWQQYiJGAic43CE8AmBd4/kLyVYAoDWLNaLwU" +
+    "A+XmogbgSLJTAKYKgEkBEOvXNKEODxUAoeD6Nzh60RPnawBYAYAFgO2N8BIAXuh+LjQJ0HwKmpuw+WvY/ENk4lPc/Gdk4nfcfEFi" +
+    "YklmYlFqYlluYmNiZmv2n7vjJ6glw8q4mX+0AAAAAElFTkSuQmCC";
+  var GLOBE = "data:image/png;base64," + GLOBE_PNG_BASE64;
+
+  function installFavicon() {
+    if (!CONFIG.favicon) return;
+    var chromeOrigin = CONFIG.extensionId ? "chrome-extension://" + String(CONFIG.extensionId).toLowerCase() : "";
+
+    // The page URL a favicon URL asks about: null when `raw` isn't a favicon
+    // URL, "" when it is one without a page.
+    function faviconPage(raw) {
+      if (typeof raw !== "string" || !raw) return null;
+      var m = /^chrome:\/\/favicon2?\/(.*)$/i.exec(raw);
+      if (m) {
+        var rest = m[1];
+        if (rest.charAt(0) === "?") {
+          try { return new URLSearchParams(rest.slice(1)).get("pageUrl") || ""; } catch (e) { return ""; }
+        }
+        return rest.replace(/^(?:size\/[^/]+\/|iconurl\/|origin\/)+/i, "");
+      }
+      var u;
+      try { u = new URL(raw, loc.href); } catch (e) { return null; }
+      var origin = originOf(u).toLowerCase();
+      if (origin !== ORIGIN.toLowerCase() && !(chromeOrigin && origin === chromeOrigin)) return null;
+      if (!/^\/_favicon\/?$/.test(u.pathname)) return null;
+      return u.searchParams.get("pageUrl") || "";
+    }
+
+    function siteIcon(page) {
+      try {
+        var u = new URL(page);
+        return u.protocol === "http:" || u.protocol === "https:" ? originOf(u) + "/favicon.ico" : null;
+      } catch (e) { return null; }
+    }
+
+    function tabIcon(page) {
+      if (!page || !api.tabs || typeof api.tabs.query !== "function") return Promise.resolve(null);
+      var target;
+      try { target = new URL(page); } catch (e) { return Promise.resolve(null); }
+      return Promise.resolve(api.tabs.query({})).then(function (tabs) {
+        var exact = null;
+        var sameSite = null;
+        (tabs || []).forEach(function (t) {
+          if (!t || !t.url || !/^(?:data|https?):/i.test(t.favIconUrl || "")) return;
+          var tu;
+          try { tu = new URL(t.url); } catch (e) { return; }
+          if (tu.href === target.href) exact = exact || t.favIconUrl;
+          else if (originOf(tu) === originOf(target)) sameSite = sameSite || t.favIconUrl;
+        });
+        return exact || sameSite;
+      }, function () { return null; });
+    }
+
+    if (nativeFetch) {
+      var globeResponse = function () {
+        var bin = atob(GLOBE_PNG_BASE64);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new Response(bytes, { status: 200, headers: { "Content-Type": "image/png" } });
+      };
+      var fetchIcon = function (page) {
+        return tabIcon(page).then(function (icon) {
+          var candidates = [icon, siteIcon(page)].filter(Boolean);
+          var attempt = function (i) {
+            if (i >= candidates.length) return globeResponse();
+            return Promise.resolve().then(function () { return nativeFetch(candidates[i]); }).then(function (r) {
+              return r && r.ok ? r : attempt(i + 1);
+            }, function () { return attempt(i + 1); });
+          };
+          return attempt(0);
+        });
+      };
+      var wrapped = function fetch(input) {
+        var raw = typeof input === "string" ? input : (input && typeof input.url === "string" ? input.url : String(input));
+        var page = faviconPage(raw);
+        if (page === null) return nativeFetch.apply(G, arguments);
+        return fetchIcon(page);
+      };
+      try { G.fetch = wrapped; } catch (e) {}
+    }
+
+    // Test-load a URL off-document. The <img> itself can't be watched for this:
+    // the error from its original, unloadable favicon URL can still arrive after
+    // its src was changed, and would read as the replacement failing.
+    function probeImage(url) {
+      return new Promise(function (resolve) {
+        if (typeof Image !== "function") { resolve(true); return; }
+        var probe = new Image();
+        probe.onload = function () { resolve(true); };
+        probe.onerror = function () { resolve(false); };
+        probe.src = url;
+      });
+    }
+
+    // The generic icon goes in right away; the first real icon that loads
+    // replaces it, unless the page has re-pointed the image in the meantime.
+    function fixImage(img) {
+      var raw;
+      try { raw = img.getAttribute("src"); } catch (e) { return; }
+      var page = faviconPage(raw);
+      if (page === null) return;
+      img.src = GLOBE;
+      tabIcon(page).then(function (icon) {
+        var candidates = [icon, siteIcon(page)].filter(Boolean);
+        var attempt = function (i) {
+          if (i >= candidates.length) return;
+          probeImage(candidates[i]).then(function (ok) {
+            if (img.src !== GLOBE) return;
+            if (ok) img.src = candidates[i];
+            else attempt(i + 1);
+          });
+        };
+        attempt(0);
+      });
+    }
+
+    if (!hasDocument) return;
+    function scan(node) {
+      if (!node || node.nodeType !== 1) return;
+      if (String(node.tagName).toUpperCase() === "IMG") fixImage(node);
+      if (typeof node.getElementsByTagName === "function") {
+        var list = node.getElementsByTagName("img");
+        for (var i = 0; i < list.length; i++) fixImage(list[i]);
+      }
+    }
+    // In the extension's own pages, catch favicon <img>s as they are added or
+    // re-pointed, before they load. Web pages, where content scripts run, aren't
+    // observed; the error listener below covers images a content script adds.
+    try {
+      if (isExtensionPage && typeof MutationObserver === "function") {
+        new MutationObserver(function (records) {
+          for (var i = 0; i < records.length; i++) {
+            var r = records[i];
+            if (r.type === "attributes") {
+              if (r.target && String(r.target.tagName).toUpperCase() === "IMG") fixImage(r.target);
+            } else if (r.addedNodes) {
+              for (var j = 0; j < r.addedNodes.length; j++) scan(r.addedNodes[j]);
+            }
+          }
+        }).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ["src"] });
+      }
+    } catch (e) {}
+    // Images that slipped past fail to load. Load errors don't bubble, so listen
+    // in the capture phase.
+    try {
+      if (typeof document.addEventListener === "function") {
+        document.addEventListener("error", function (e) {
+          var t = e && e.target;
+          if (t && String(t.tagName).toUpperCase() === "IMG") fixImage(t);
+        }, true);
+      }
+    } catch (e) {}
+  }
+
+  try { installSidePanel(); } catch (e) { dbg("sidePanel shim failed:", errorMessage(e)); }
+  try { installOffscreen(); } catch (e) { dbg("offscreen shim failed:", errorMessage(e)); }
+  try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
+  try { installFavicon(); } catch (e) { dbg("favicon shim failed:", errorMessage(e)); }
+})();

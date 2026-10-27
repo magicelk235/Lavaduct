@@ -1,16 +1,13 @@
-// Persistent debug ring buffer. This file is NOT staged on its own: shimSource()
-// splices it into safari-compat-shim.js (over the marker line under the
-// __C2S_DEBUG__ gate) only for a --debug conversion, so a release shim carries
-// no trace of it. It runs at the shim's top level, ABOVE the outer try — the
-// cardinal rule applies in full: nothing here may ever throw.
+// Persistent debug ring buffer. This file is not staged on its own: writeShim()
+// splices it into the compat shim, over the marker line inside the shim's
+// function, only for a --debug conversion, so a release shim carries no trace of
+// it. It runs before any of the shim's own blocks, and nothing here may throw.
 //
-// Every gated trace in the shim tees into __C2S_DEBUG_WRITE__. Entries are
-// { t: epoch-ms, ctx: "background"|"content"|"page", msg } — batched behind one
-// timer per flush window so logging can never hammer storage, and persisted to
-// storage.local under __viaduct_debug_log__ capped to the last 2000 entries.
-// Read them back with `viaduct --logs <name>` (Safari keeps storage.local as
-// SQLite on disk) or the console one-liner in wiki/Testing-and-Debugging.md.
-var __C2S_DEBUG_WRITE__ = (function () {
+// Every traced line becomes { t: epoch-ms, ctx: "background"|"content"|"page", msg },
+// batched behind one timer per flush window so logging can never hammer storage,
+// and persisted to storage.local under __viaduct_debug_log__, capped to the last
+// 2000 entries. `--logs <add-on>` reads them back out of the Firefox profile.
+var __SHIM_DEBUG_WRITE__ = (function () {
   try {
     var KEY = "__viaduct_debug_log__";
     var CAP = 2000;
@@ -20,24 +17,26 @@ var __C2S_DEBUG_WRITE__ = (function () {
       api = (typeof browser !== "undefined" && browser && browser.storage && browser.storage.local) ? browser
         : ((typeof chrome !== "undefined" && chrome && chrome.storage && chrome.storage.local) ? chrome : null);
     } catch (e) {}
-    // The OAuth-bridge templates (identity-polyfill, page-bridge-cs) read the
-    // __C2S_DEBUG global at CALL time; light them up wherever the shim runs so a
-    // --debug build gets their named diagnostics without a console visit.
-    try { if (typeof self !== "undefined") self.__C2S_DEBUG = true; } catch (e) {}
-    try { if (typeof window !== "undefined") window.__C2S_DEBUG = true; } catch (e) {}
-    var ctx = "page";
+    // The page-bridge scripts check this flag when they log; light them up
+    // wherever the shim runs so a --debug build gets their diagnostics too.
+    try { if (typeof globalThis !== "undefined") globalThis.__pageBridgeDebug = true; } catch (e) {}
+    // Content scripts see the web page's location; extension pages are
+    // moz-extension: documents, and the background is the page Firefox generates
+    // for background.scripts or the manifest's background.page.
+    var ctx = "content";
     try {
-      if (api) {
-        var proto = (typeof location !== "undefined" && location.protocol) || "";
-        if (proto === "safari-web-extension:" || proto === "chrome-extension:" || proto === "moz-extension:") {
-          ctx = "background";
-          // Extension pages that are not THE background page (popup, options) log as "page".
+      var where = typeof location !== "undefined" ? location : null;
+      if (where && where.protocol === "moz-extension:") {
+        ctx = "page";
+        var top = true;
+        try { top = typeof window === "undefined" || window.top === window; } catch (e) { top = false; }
+        if (top) {
+          var bgPage = "";
           try {
-            if (api.extension && api.extension.getBackgroundPage && typeof window !== "undefined"
-                && api.extension.getBackgroundPage() !== window) ctx = "page";
+            var bg = api && api.runtime && api.runtime.getManifest().background;
+            if (bg && typeof bg.page === "string") bgPage = "/" + bg.page.replace(/^\/+/, "");
           } catch (e) {}
-        } else {
-          ctx = "content";
+          if (where.pathname === "/_generated_background_page.html" || (bgPage && where.pathname === bgPage)) ctx = "background";
         }
       }
     } catch (e) {}
@@ -52,8 +51,8 @@ var __C2S_DEBUG_WRITE__ = (function () {
     }
     function persist(batch) {
       if (!api) return;
-      // Some backends call the trailing callback, some resolve a Promise, and the
-      // polyfill browser.* does only the latter — guard against both firing.
+      // A storage area may call the trailing callback, resolve a promise, or both;
+      // merge exactly once.
       var done = false;
       var merge = function (res) {
         if (done) return;
@@ -78,7 +77,7 @@ var __C2S_DEBUG_WRITE__ = (function () {
         });
         if (r && typeof r.then === "function") r.then(merge, function () {});
       } catch (e) {
-        // Promise-only backend that rejects a trailing callback argument.
+        // A promise-only storage area that rejects a trailing callback argument.
         try { api.storage.local.get(KEY).then(merge, function () {}); } catch (e2) {}
       }
     }
@@ -98,14 +97,13 @@ var __C2S_DEBUG_WRITE__ = (function () {
         if (timer == null) timer = setTimeout(flush, FLUSH_MS);
       } catch (e) {}
     };
-    // An uncaught error in the HOST script is the single most useful thing to see
-    // and the hardest to reach: it aborts the rest of that script (a background
-    // page stops registering its listeners, a content script never runs) and the
-    // only record is a Web Inspector console nobody has open. Tee both failure
+    // An uncaught error in the host script is the most useful thing to see and the
+    // hardest to reach: it aborts the rest of that script (a background stops
+    // registering its listeners, a content script never runs). Tee both failure
     // channels into the ring so `--logs` shows them.
     try {
-      var target = (typeof self !== "undefined" && self.addEventListener) ? self
-        : ((typeof window !== "undefined" && window.addEventListener) ? window : null);
+      var target = (typeof self !== "undefined" && self && self.addEventListener) ? self
+        : ((typeof window !== "undefined" && window && window.addEventListener) ? window : null);
       if (target) {
         target.addEventListener("error", function (e) {
           try {
@@ -122,19 +120,18 @@ var __C2S_DEBUG_WRITE__ = (function () {
         });
       }
     } catch (e) {}
-    // The extension's own caught failures usually end in console.error/warn, and
-    // those are just as unreachable in a popover or a suspended background. Tee
-    // them too (the shim's own dbg() goes to console.log, which stays untouched).
+    // The extension's own caught failures usually end in console.error/warn; tee
+    // those too. The shim's own traces go to console.log, which stays untouched.
     try {
       if (typeof console !== "undefined") {
         ["error", "warn"].forEach(function (level) {
           var orig = console[level];
-          if (typeof orig !== "function" || orig.__c2sRingTee) return;
+          if (typeof orig !== "function" || orig.__debugRingTee) return;
           var teed = function () {
             try { write(["[console." + level + "]"].concat(Array.prototype.slice.call(arguments))); } catch (e) {}
             return orig.apply(console, arguments);
           };
-          teed.__c2sRingTee = true;
+          teed.__debugRingTee = true;
           console[level] = teed;
         });
       }
