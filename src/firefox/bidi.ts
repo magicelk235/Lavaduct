@@ -53,9 +53,10 @@ function connect(port: number): Promise<WebSocket> {
 }
 
 /**
- * A WebDriver BiDi session with a Firefox started for it. Firefox only starts
- * its remote agent when launched with --remote-debugging-port, so the session
- * always comes with its own Firefox process.
+ * A WebDriver BiDi session with a Firefox that runs its remote agent. Firefox
+ * only starts the agent when launched with --remote-debugging-port, so a
+ * session either comes with a Firefox started for it, or attaches to one an
+ * earlier session started and left running.
  */
 export class BidiSession {
   private nextId = 1;
@@ -65,7 +66,8 @@ export class BidiSession {
 
   private constructor(
     private readonly ws: WebSocket,
-    private readonly child: ChildProcess,
+    /** The Firefox started for this session; unset for an attached one. */
+    private readonly child: ChildProcess | undefined,
     private readonly profilePath: string,
   ) {
     ws.addEventListener("message", (event) => this.onMessage(event.data));
@@ -127,16 +129,41 @@ export class BidiSession {
 
     const session = new BidiSession(ws, child, profile);
     try {
-      const result = await session.command("session.new", { capabilities: {} });
-      const caps = result && typeof result === "object" && "capabilities" in result ? result.capabilities : undefined;
-      const version = caps && typeof caps === "object" && "browserVersion" in caps ? caps.browserVersion : undefined;
-      session.browserVersion = typeof version === "string" ? version : install.version;
+      await session.open(install);
     } catch (err) {
       ws.close();
       if (headless) child.kill();
       throw err;
     }
     return session;
+  }
+
+  /**
+   * Open a session with the Firefox that has the profile open with its remote
+   * agent running, such as one a session ended with end() left behind. Undefined
+   * when there's no such Firefox, or its agent already serves another session.
+   */
+  static async attach(install: FirefoxInstall, profilePath: string): Promise<BidiSession | undefined> {
+    const profile = resolve(profilePath);
+    if (!profileInUse(profile)) return undefined;
+    const port = readServerPort(join(profile, SERVER_FILE));
+    const ws = port ? await connect(port).catch(() => undefined) : undefined;
+    if (!ws) return undefined;
+    const session = new BidiSession(ws, undefined, profile);
+    try {
+      await session.open(install);
+    } catch {
+      ws.close();
+      return undefined;
+    }
+    return session;
+  }
+
+  private async open(install: FirefoxInstall): Promise<void> {
+    const result = await this.command("session.new", { capabilities: {} });
+    const caps = result && typeof result === "object" && "capabilities" in result ? result.capabilities : undefined;
+    const version = caps && typeof caps === "object" && "browserVersion" in caps ? caps.browserVersion : undefined;
+    this.browserVersion = typeof version === "string" ? version : install.version;
   }
 
   /**
@@ -185,7 +212,7 @@ export class BidiSession {
       if (!this.closed) await this.command("session.end", {});
     } finally {
       this.ws.close();
-      this.child.unref();
+      this.child?.unref();
     }
   }
 
@@ -200,8 +227,10 @@ export class BidiSession {
       }
     }
     const deadline = Date.now() + QUIT_TIMEOUT_MS;
+    // An attached session has no process of its own to watch; the profile lock tells.
     const running = (): boolean =>
-      (this.child.exitCode === null && this.child.signalCode === null) || profileInUse(this.profilePath);
+      (this.child !== undefined && this.child.exitCode === null && this.child.signalCode === null) ||
+      profileInUse(this.profilePath);
     while (running()) {
       if (Date.now() > deadline) throw new Error(`Firefox didn't quit within ${QUIT_TIMEOUT_MS / 1000} s.`);
       await sleep(100);

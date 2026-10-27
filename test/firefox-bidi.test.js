@@ -52,6 +52,34 @@ test("a headless session installs and uninstalls an unpacked add-on", { skip: no
   });
 });
 
+test("a later session attaches to the Firefox an earlier one left running", { skip: noFirefox, timeout: 180_000 }, async () => {
+  await withTempDirs(async (profile, ext) => {
+    for (const name of ["a", "b"]) {
+      mkdirSync(join(ext, name));
+      const id = `${name}@example.invalid`;
+      const manifest = { manifest_version: 2, name: id, version: "1.0", browser_specific_settings: { gecko: { id } } };
+      writeFileSync(join(ext, name, "manifest.json"), JSON.stringify(manifest));
+    }
+
+    assert.equal(await BidiSession.attach(firefox, profile), undefined, "nothing runs on the profile yet");
+    const first = await BidiSession.start(firefox, profile, { headless: true });
+    let second;
+    try {
+      assert.equal(await first.installExtension(join(ext, "a")), "a@example.invalid");
+      // Firefox keeps running with its remote agent, and the add-on loaded.
+      await first.end();
+      second = await BidiSession.attach(firefox, profile);
+      assert.ok(second, "no session with the running Firefox");
+      assert.equal(await second.installExtension(join(ext, "b")), "b@example.invalid");
+      // The first add-on survived: it can still be uninstalled in the same Firefox.
+      await second.uninstallExtension("a@example.invalid");
+    } finally {
+      await (second ?? first).closeBrowser().catch(() => {});
+    }
+    assert.equal(profileInUse(profile), false);
+  });
+});
+
 test(
   "quitting the Firefox that holds a profile frees it",
   {
