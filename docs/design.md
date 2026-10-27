@@ -1,6 +1,8 @@
-# lavaduct design
+# Chrome-to-Firefox converter design
 
-lavaduct is a command-line tool that converts a Chrome extension into a Firefox add-on and installs it. It is the Firefox counterpart of viaduct-cli, which does the same for Safari, and it aims for feature parity with that CLI. The Viaduct Mac app may bundle it later, so it keeps viaduct-cli's process contract.
+This is a command-line tool that converts a Chrome extension into a Firefox add-on and installs it. It is the Firefox counterpart of viaduct-cli, which does the same for Safari, and it aims for feature parity with that CLI. The Viaduct Mac app may bundle it later, so it keeps viaduct-cli's process contract.
+
+The tool is called lavaduct. Every identifier that carries the name comes from `src/name.ts`; see Naming below.
 
 ## Goals
 
@@ -156,7 +158,7 @@ The channel comes from `defaults/pref/channel-prefs.js` and the version from `ap
 
 ## Commands
 
-| viaduct-cli | lavaduct |
+| viaduct-cli | this CLI |
 |---|---|
 | `<input>`, batch `<in1> <in2> …` | same |
 | `-o, --output <dir>` | same, default `./<Name>_Firefox` |
@@ -192,6 +194,12 @@ The channel comes from `defaults/pref/channel-prefs.js` and the version from `ap
 - State (ID salt, install records, pending AMO uploads): `~/Library/Application Support/lavaduct` on macOS, `%APPDATA%\lavaduct` on Windows, `$XDG_CONFIG_HOME/lavaduct` on Linux.
 - Signed `.xpi` cache: the state directory on macOS and Windows, `$XDG_CACHE_HOME/lavaduct` on Linux.
 - The AMO secret is only read from a flag, the environment or the config file. The CLI never writes it to disk.
+
+## Naming
+
+Every identifier that carries the name comes from one module, `src/name.ts`: the binary and package name, the environment variable prefix, the config file name, the state and cache directories, the dedicated temporary profile, and the add-on ID suffix. Renaming the tool means changing that file plus `package.json`.
+
+The add-on ID suffix is the one identifier that cannot change after release. Signed add-ons are tied to their ID on AMO and in each user's profile, so a later rename of the suffix would make every converted add-on install as a new, separate add-on with empty storage.
 
 ## Errors and exit codes
 
