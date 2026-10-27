@@ -1,316 +1,351 @@
 import type { Issue } from "../types.js";
+import { FIREFOX_API_SUPPORT, FIREFOX_PERMISSION_SUPPORT } from "./compat-generated.js";
 
-// Compatibility data tables — pure data, no logic. Which Chrome permissions/APIs
-// Safari lacks, which the shim emulates, and the per-API remediation notes the
-// analyzer surfaces. Split out of manifest.ts to keep that file focused on
-// parsing + transform logic.
+// What the converter does about each Chrome permission and API Firefox lacks.
+// compat-generated.ts records which ones Firefox supports and from which release; this
+// file adds the decisions made by hand: what the runtime shim emulates, what gets
+// stripped, and the advice the analyzer prints. The analyzer and the manifest transform
+// both read these tables, so the report and the output agree.
 
-/** Permissions Safari does not implement. Value = remediation note. */
-export const UNSUPPORTED_PERMISSIONS: Record<string, string> = {
-  identity: "Safari lacks chrome.identity; use a hosted web OAuth2 flow + window.postMessage.",
-  debugger: "chrome.debugger (Chrome DevTools Protocol) is emulated by the viaduct CDP shim (attach/detach/sendCommand/getTargets plus a Page/Target/Input/DOM/Runtime/Accessibility subset over Safari tabs + scripting). Network/Fetch domains and OS-trusted input are not available.",
-  sidePanel: "Safari has no native sidePanel API; the shim emulates it (open via the action popover on Safari 17.4+, tab fallback on older; setOptions/getOptions/setPanelBehavior).",
-  tabGroups: "Safari has no native tabGroups API; the shim emulates it in memory (no tab-bar coloring).",
-  offscreen: "Safari has no offscreen documents API; the shim emulates it via an extension-origin iframe (createDocument/close/hasDocument/getContexts) so SW→offscreen messaging keeps working. The offscreen doc still has no DOM in a true SW context.",
-  webRequestBlocking: "Blocking webRequest is unsupported; use declarativeNetRequest.",
-  webRequestAuthProvider: "Safari can't provide credentials for onAuthRequired (proxy/HTTP auth) via webRequest; the listener still fires read-only, but handle auth in-page or natively.",
-  declarativeNetRequestWithHostAccess: "Safari doesn't recognize this DNR variant token; declare plain declarativeNetRequest (rules still apply on hosts the extension already has access to).",
-  gcm: "chrome.gcm is Chrome-only; relay via APNs in the host app or poll with chrome.alarms.",
-  tts: "Permission dropped, but the shim routes chrome.tts to the Web Speech API (speechSynthesis), so speak/stop/pause keep working.",
-  ttsEngine: "TTS engine API unavailable.",
-  platformKeys: "platformKeys unavailable.",
-  "enterprise.platformKeys": "enterprise.platformKeys unavailable.",
-  // OS-capability APIs — route through the native container app or drop.
-  tabCapture: "tabCapture is unsupported; use getDisplayMedia() or a native bridge.",
-  desktopCapture: "desktopCapture is unsupported; use getDisplayMedia() or a native bridge.",
-  pageCapture: "pageCapture is unsupported; drop or reimplement via a native bridge.",
-  proxy: "chrome.proxy has no Safari equivalent; drop or configure proxy natively.",
-  privacy: "chrome.privacy has no Safari equivalent; drop.",
-  contentSettings: "chrome.contentSettings has no Safari equivalent; drop.",
-  browsingData: "chrome.browsingData has no Safari equivalent; drop.",
-  management: "chrome.management has no Safari equivalent; drop or move to the native host app.",
-  power: "Permission dropped, but the shim backs chrome.power.requestKeepAwake with the Screen Wake Lock API (navigator.wakeLock).",
-  "system.cpu": "chrome.system.cpu has no Safari equivalent; native bridge or drop.",
-  "system.memory": "chrome.system.memory has no Safari equivalent; native bridge or drop.",
-  "system.storage": "chrome.system.storage has no Safari equivalent; native bridge or drop.",
-  "system.display": "chrome.system.display has no Safari equivalent; native bridge or drop.",
-  // Chrome-UI APIs — no Safari surface; reshape to popup/page or drop.
-  omnibox: "Safari has no address-bar keyword API; drop the omnibox feature.",
-  sessions: "chrome.sessions is unsupported; shim returns empty results.",
-  topSites: "chrome.topSites is unsupported; shim returns an empty list.",
-  search: "chrome.search is unsupported; shim opens queries in a search-engine tab.",
-  declarativeContent: "declarativeContent rules never fire in Safari; use content scripts + chrome.action.",
-  userScripts: "The shim fully emulates chrome.userScripts: registered scripts are published to storage and injected on every matching page by a generated content script running in the isolated world. Remaining gaps: injection cannot honor document_start timing, and Chrome's USER_SCRIPT-world CSP exemption does not apply.",
-  idle: "chrome.idle is unsupported; shim derives state from page visibility.",
-  instanceID: "instanceID push plumbing is Chrome-only; use APNs natively or poll.",
-  // ChromeOS-only APIs — always drop on Safari.
-  fileBrowserHandler: "fileBrowserHandler is ChromeOS-only; drop.",
-  fileSystemProvider: "fileSystemProvider is ChromeOS-only; drop.",
-  documentScan: "documentScan is ChromeOS-only; drop.",
-  printerProvider: "printerProvider is ChromeOS/print-only; drop or move to a native bridge.",
-  printing: "chrome.printing is ChromeOS-only; drop.",
-  printingMetrics: "chrome.printingMetrics is ChromeOS-only; drop.",
-  certificateProvider: "certificateProvider is ChromeOS-enterprise-only; drop.",
-  vpnProvider: "vpnProvider is ChromeOS-only; use a Network Extension natively or drop.",
-  wallpaper: "chrome.wallpaper is ChromeOS-only; drop.",
-  loginScreenStorage: "loginScreenStorage is ChromeOS-kiosk-only; drop.",
-  webAuthenticationProxy: "webAuthenticationProxy is enterprise-only; drop.",
-  accessibilityFeatures: "accessibilityFeatures has no Safari equivalent; drop.",
-  fontSettings: "fontSettings has no Safari equivalent; drop.",
+/** Compare dotted version strings numerically: `compareFirefoxVersions("128.0", "139") < 0`. */
+export function compareFirefoxVersions(a: string, b: string): number {
+  const pa = String(a).split(".");
+  const pb = String(b).split(".");
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (Number.parseInt(pa[i] ?? "0", 10) || 0) - (Number.parseInt(pb[i] ?? "0", 10) || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/**
+ * Permissions Firefox grants at install without a prompt and ignores in
+ * optional_permissions (PermissionNoPrompt in Firefox's manifest schema). The transform
+ * moves them from optional_permissions to permissions; there is no prompt either way.
+ * browser-compat-data still lists contextMenus as optional, which current Firefox drops.
+ */
+export const INSTALL_TIME_PERMISSIONS: Record<string, true> = {
+  alarms: true,
+  contextMenus: true,
+  declarativeNetRequestWithHostAccess: true,
+  dns: true,
+  identity: true,
+  storage: true,
+  unlimitedStorage: true,
 };
 
 /**
- * Permissions that are removed from the manifest (Safari rejects them) but whose
- * API the runtime shim still emulates with real, usable behavior — so the feature
- * keeps working at runtime. These get a "shimmed" tag instead of a bare "removed"
- * warning, so the author isn't misled into thinking the capability is gone.
- * Only list permissions the shim functionally backs; APIs that merely reject
- * gracefully (debugger, tabCapture, …) do NOT belong here.
+ * Permissions Firefox only grants at runtime (OptionalOnlyPermission) and ignores in
+ * permissions. The transform moves them to optional_permissions.
  */
-export const SHIMMED_PERMISSIONS = new Set([
-  "tabGroups",
-  "userScripts",
-  "idle",
-  "sessions",
-  "topSites",
-  "search",
-  // sidePanel → action popover (Safari 17.4+) / tab fallback; offscreen → extension-
-  // origin iframe. Both emulated in safari-compat-shim.js, so flag them shimmed, not
-  // bare-removed.
-  "sidePanel",
-  "offscreen",
-  // Real shim implementations (not graceful no-ops): tts → Web Speech
-  // (speechSynthesis), power → Screen Wake Lock (navigator.wakeLock). See
-  // safari-compat-shim.js §chrome.tts / §chrome.power. (`notifications` is shimmed
-  // too via Notification(), but it isn't a stripped permission — Safari keeps the
-  // permission — so it never reaches this set.)
-  "tts",
-  "power",
-  // chrome.debugger → CDP subset (Page/Target/Input/DOM/Runtime/Accessibility)
-  // emulated over Safari tabs + scripting in safari-compat-shim.js. Network/Fetch
-  // and OS-trusted input remain unavailable, but the core capability is backed.
-  "debugger",
-]);
+export const OPTIONAL_ONLY_PERMISSIONS: Record<string, true> = { userScripts: true };
 
-/** chrome.* API call patterns flagged during JS scans. */
-export const UNSUPPORTED_APIS: Record<
-  string,
-  { severity: Issue["severity"]; message: string; fix: string; shimmed?: boolean }
-> = {
-  "chrome.identity.launchWebAuthFlow": {
-    severity: "warning",
-    message: "launchWebAuthFlow is unsupported and safari-web-extension:// redirects are blocked.",
-    fix: "Open hosted auth in a tab, redirect to your own HTTPS callback, postMessage the code back.",
+/**
+ * Permissions that are removed (Firefox doesn't know them) while the runtime shim keeps
+ * the feature working, so the report tags them shimmed instead of lost.
+ */
+export const SHIMMED_PERMISSIONS = new Set(["favicon", "identity.email", "offscreen", "sidePanel"]);
+
+const CHROMEOS_ONLY = "ChromeOS-only; Firefox has no equivalent.";
+
+const PERMISSION_NOTES: Record<string, string> = {
+  favicon: "The shim answers chrome://favicon/ and /_favicon/ URLs with the site's icon.",
+  "identity.email": "The shim's identity.getProfileUserInfo reads the email from Google when the cached token's scopes include it.",
+  offscreen: "The shim runs offscreen documents as hidden iframes in the background page, which has a DOM in Firefox.",
+  sidePanel: "side_panel becomes Firefox's sidebar (sidebar_action) and the shim maps chrome.sidePanel onto sidebarAction.",
+  background: "Firefox can't start add-ons before the browser or keep them running after it quits; the background script itself is unaffected.",
+  contentSettings: "Firefox has no per-site content settings for add-ons; privacy and browserSettings cover a few of the same switches.",
+  debugger: "Firefox gives add-ons no Chrome DevTools Protocol access; rework the feature with scripting, webRequest or the devtools APIs.",
+  declarativeContent: "Show the toolbar button per tab with action.enable()/disable() from tabs.onUpdated instead.",
+  desktopCapture: "Capture the screen with navigator.mediaDevices.getDisplayMedia() from an extension page.",
+  "downloads.ui": "Firefox doesn't let add-ons hide its downloads panel.",
+  fontSettings: "Firefox exposes no font settings to add-ons.",
+  gcm: "Firefox has no Google Cloud Messaging; use the web Push API from a page you host, or poll with chrome.alarms.",
+  pageCapture: "Firefox can't save pages as MHTML for add-ons; serialize the page from a content script instead.",
+  power: "Keep the screen on with the Screen Wake Lock API (navigator.wakeLock) from a visible extension page.",
+  printerProvider: "Firefox add-ons can't provide printers.",
+  processes: "Firefox has no processes API.",
+  readingList: "Firefox has no reading list API.",
+  runtime: "Firefox grants connectNative and sendNativeMessage through nativeMessaging; add that permission if the add-on talks to a native app.",
+  tabCapture: "For a still image use tabs.captureVisibleTab(); for video, navigator.mediaDevices.getDisplayMedia() from an extension page.",
+  tts: "Speak with the Web Speech API (speechSynthesis) from an extension page.",
+  ttsEngine: "Firefox add-ons can't provide speech engines.",
+  webAuthenticationProxy: "Firefox has no WebAuthn proxy API for add-ons.",
+  ...Object.fromEntries(
+    [
+      "accessibilityFeatures.modify",
+      "accessibilityFeatures.read",
+      "system.cpu",
+      "system.display",
+      "system.memory",
+      "system.storage",
+    ].map((p) => [p, "Firefox exposes no system or accessibility settings to add-ons."]),
+  ),
+  ...Object.fromEntries(
+    [
+      "audio",
+      "certificateProvider",
+      "documentScan",
+      "enterprise.deviceAttributes",
+      "enterprise.hardwarePlatform",
+      "enterprise.networkingAttributes",
+      "enterprise.platformKeys",
+      "fileBrowserHandler",
+      "fileSystemProvider",
+      "loginState",
+      "platformKeys",
+      "printing",
+      "printingMetrics",
+      "vpnProvider",
+      "wallpaper",
+    ].map((p) => [p, CHROMEOS_ONLY]),
+  ),
+};
+
+/** Permissions Firefox doesn't know, which the transform removes. Value = remediation note. */
+export const UNSUPPORTED_PERMISSIONS: Record<string, string> = Object.fromEntries(
+  Object.entries(FIREFOX_PERMISSION_SUPPORT)
+    .filter(([, since]) => since === null)
+    .map(([perm]) => [perm, PERMISSION_NOTES[perm] ?? `Firefox has no "${perm}" permission, so the API it unlocks isn't available.`]),
+);
+
+type ApiNote = {
+  severity: Issue["severity"];
+  message: string;
+  fix: string;
+  shimmed?: boolean;
+  /** First Firefox release with the API; the analyzer skips the entry when --min-firefox is at least this. */
+  since?: string;
+};
+
+const SHIMMED_NAMESPACES: Record<string, true> = { offscreen: true, sidePanel: true };
+
+// Everything the runtime shim defines, keyed like FIREFOX_API_SUPPORT.
+const SHIMMED_APIS: Record<string, { message: string; fix: string }> = {
+  sidePanel: {
+    message: "chrome.sidePanel is emulated on Firefox's sidebar (sidebarAction); the manifest's side_panel becomes sidebar_action.",
+    fix: "Firefox opens the sidebar only in response to a user action, so sidePanel.open() from a timer or a message handler is refused.",
   },
-  "chrome.identity": {
-    severity: "warning",
-    message: "chrome.identity is unsupported in Safari (all platforms).",
-    fix: "Replace with a hosted OAuth2 redirect flow; shim stubs it so calls reject instead of throwing.",
-    shimmed: true,
+  offscreen: {
+    message: "chrome.offscreen is emulated with a hidden iframe in the background page (createDocument, closeDocument, hasDocument, Reason).",
+    fix: "No action needed; runtime.getContexts() doesn't list the document, so check it with offscreen.hasDocument().",
   },
-  "chrome.debugger": {
-    severity: "info",
-    shimmed: true,
-    message: "chrome.debugger (Chrome DevTools Protocol) is emulated by the viaduct CDP shim.",
-    fix: "A CDP subset (Page/Target/Input/DOM/Runtime/Accessibility) is backed by Safari tabs + scripting; Network/Fetch and trusted-input gaps remain.",
+  "identity.getAuthToken": {
+    message: "identity.getAuthToken is emulated with identity.launchWebAuthFlow and the manifest's oauth2 client.",
+    fix: "Allow Firefox's redirect URL for that OAuth client (for Google, http://127.0.0.1/mozoauth2/…); users sign in through a Firefox window instead of Chrome's account picker.",
   },
-  "chrome.gcm": {
-    severity: "warning",
-    message: "chrome.gcm push messaging is Chrome-only.",
-    fix: "Use APNs in the native host app, or poll via chrome.alarms + fetch.",
+  "identity.removeCachedAuthToken": {
+    message: "identity.removeCachedAuthToken is emulated over the shim's token cache.",
+    fix: "No action needed.",
   },
-  "chrome.notifications": {
-    severity: "info",
-    message: "chrome.notifications is backed by the Web Notification API (create + clear/update/getAll/getPermissionLevel and all events).",
-    fix: "No action needed; banners fire once notification permission is granted. Call Notification.requestPermission() if you haven't.",
-    shimmed: true,
+  "identity.clearAllCachedAuthTokens": {
+    message: "identity.clearAllCachedAuthTokens is emulated over the shim's token cache.",
+    fix: "No action needed.",
   },
-  "chrome.contextMenus": {
-    severity: "info",
-    message: "chrome.contextMenus works natively on macOS Safari but is absent on iOS (no right-click surface).",
-    fix: "Fine for macOS-only targets. For iOS, register a 'contextmenu' listener in a content script and relay via runtime.sendMessage.",
+  "identity.getProfileUserInfo": {
+    message: "identity.getProfileUserInfo is emulated from Google's userinfo endpoint, using a cached getAuthToken token.",
+    fix: "It returns an empty email and id unless that token's scopes include email or profile.",
   },
-  "cookies.onChanged": {
-    severity: "warning",
-    message: "cookies.onChanged is unsupported.",
-    fix: "Poll cookies, or monitor session state from a content script.",
-  },
-  "runtime.setUninstallURL": {
-    severity: "info",
-    message: "runtime.setUninstallURL has no Safari surface; the shim no-ops the call (the uninstall page just won't open).",
-    fix: "No action needed; remove the call if you want to drop the dead code.",
-    shimmed: true,
-  },
-  "runtime.connectNative": {
-    severity: "info",
-    message: "connectNative is bridged: the (unsandboxed) container app runs a loopback broker that launches the Chrome native-messaging host from its on-disk manifest and pipes stdio framing; the sandboxed appex relays to it.",
-    fix: "Install the companion app that registered the native host. The extension starts the container app (it hosts the broker) when it needs it.",
-    shimmed: true,
-  },
-  "runtime.sendNativeMessage": {
-    severity: "info",
-    message: "sendNativeMessage is bridged: the container app's broker launches the manifest-declared native host for one exchange and returns its reply; the sandboxed appex relays over loopback.",
-    fix: "Install the companion app that registered the native host. The extension starts the container app when it needs it.",
-    shimmed: true,
-  },
-  "tabs.move": { severity: "warning", message: "tabs.move is unsupported.", fix: "Remove or rework UX." },
-  "tabs.highlighted": {
-    severity: "warning",
-    message: "tabs.highlighted query is unsupported.",
-    fix: "Use tabs.query({ active: true }).",
-  },
-  "webNavigation.onCreatedNavigationTarget": {
-    severity: "warning",
-    message: "webNavigation.onCreatedNavigationTarget is unsupported.",
-    fix: "Use webNavigation.onCommitted.",
-  },
-  "webNavigation.onHistoryStateUpdated": {
-    // Safari has no implementation; the shim feeds the event from the content script,
-    // which is exactly what the old advice here told the developer to write themselves.
-    severity: "info",
-    message: "webNavigation.onHistoryStateUpdated has no Safari surface; the shim emulates it (and onReferenceFragmentUpdated) from the content script, which reports the top frame's URL.",
-    fix: "No action needed on a granted site. A frame the user hasn't granted access to reports nothing, and a hidden tab is only caught when it is shown again.",
-    shimmed: true,
-  },
-  "chrome.tts\\b": {
-    // Keep in sync with SHIMMED_PERMISSIONS/UNSUPPORTED_PERMISSIONS.tts: the shim
-    // routes chrome.tts to the Web Speech API, so this is informational.
-    severity: "info",
-    message: "chrome.tts is routed to the Web Speech API (speechSynthesis) by the shim; speak/stop/pause keep working.",
-    fix: "No action needed for basic speech; voices map to the platform's speechSynthesis voices.",
-    shimmed: true,
-  },
-  "chrome.ttsEngine": {
-    severity: "warning",
-    message: "chrome.ttsEngine is unsupported in Safari.",
-    fix: "Provide TTS via the native host (AVSpeechSynthesizer); there is no Safari TTS-engine API.",
-  },
-  "chrome.tabCapture": {
-    severity: "warning",
-    message: "chrome.tabCapture is unsupported in Safari.",
-    fix: "Use navigator.mediaDevices.getDisplayMedia(), or a native bridge.",
-  },
-  "chrome.desktopCapture": {
-    severity: "warning",
-    message: "chrome.desktopCapture is unsupported in Safari.",
-    fix: "Use navigator.mediaDevices.getDisplayMedia(), or a native bridge.",
-  },
-  "chrome.pageCapture": {
-    severity: "warning",
-    message: "chrome.pageCapture is unsupported in Safari.",
-    fix: "Reconstruct via content-script DOM serialization, or drop.",
-  },
-  "chrome.proxy": {
-    severity: "warning",
-    message: "chrome.proxy has no Safari equivalent.",
-    fix: "Configure proxying natively (Network Extension) or drop the feature.",
-  },
-  "chrome.privacy": {
-    severity: "warning",
-    message: "chrome.privacy has no Safari equivalent.",
-    fix: "Remove or guard behind feature detection.",
-  },
-  "chrome.contentSettings": {
-    severity: "warning",
-    message: "chrome.contentSettings has no Safari equivalent.",
-    fix: "Remove or guard behind feature detection.",
-  },
-  "chrome.browsingData": {
-    severity: "warning",
-    message: "chrome.browsingData has no Safari equivalent.",
-    fix: "Remove or guard behind feature detection.",
-  },
-  "chrome.management": {
-    severity: "info",
-    message: "chrome.management: the shim provides getSelf() (from the manifest); other methods reject/resolve empty.",
-    fix: "Self-introspection works; if you rely on managing other extensions, move that to the native host app.",
-  },
-  "chrome.power": {
-    // Keep in sync with SHIMMED_PERMISSIONS/UNSUPPORTED_PERMISSIONS.power: the
-    // shim backs requestKeepAwake with the Screen Wake Lock API.
-    severity: "info",
-    message: "chrome.power is backed by the Screen Wake Lock API (navigator.wakeLock) by the shim.",
-    fix: "No action needed; the 'system' (display-off) level has no web equivalent and behaves like 'display'.",
-    shimmed: true,
-  },
-  "chrome.system": {
-    severity: "warning",
-    message: "chrome.system.* (cpu/memory/storage/display) has no Safari equivalent.",
-    fix: "Route through a native bridge, or drop.",
-  },
-  "chrome.omnibox": {
-    severity: "warning",
-    message: "chrome.omnibox has no Safari equivalent (no address-bar keyword).",
-    fix: "Drop the omnibox feature; expose the action via the popup instead.",
-  },
-  "chrome.fontSettings": {
-    severity: "warning",
-    message: "chrome.fontSettings has no Safari equivalent.",
-    fix: "Remove or guard behind feature detection.",
-  },
-  "chrome.accessibilityFeatures": {
-    severity: "warning",
-    message: "chrome.accessibilityFeatures has no Safari equivalent.",
-    fix: "Remove or guard behind feature detection.",
-  },
-  "chrome.readingList": {
-    severity: "info",
-    message: "chrome.readingList is emulated (add/remove/update/query + events) over an extension-private store, NOT the user's native Safari Reading List (no API exists).",
-    fix: "No action needed if you manage your own list; you cannot read/write Safari's native Reading List.",
-  },
-  "chrome.sessions": {
-    severity: "info",
-    message: "chrome.sessions has no Safari equivalent; shim returns empty results.",
-    fix: "Feature-detect; hide recently-closed UI on Safari.",
-  },
-  "chrome.topSites": {
-    severity: "info",
-    message: "chrome.topSites has no Safari equivalent; shim returns an empty list.",
-    fix: "Feature-detect; hide top-sites UI on Safari.",
-  },
-  "chrome.declarativeContent": {
-    severity: "warning",
-    message: "chrome.declarativeContent rules never fire in Safari (shim stubs the constructors).",
-    fix: "Use content scripts + chrome.action instead of declarative page rules.",
-  },
-  "chrome.search\\b": {
-    severity: "info",
-    message: "chrome.search has no Safari equivalent; shim opens the query in a search-engine tab.",
-    fix: "Acceptable fallback for most flows; otherwise open a search URL yourself.",
-  },
-  "chrome.userScripts": {
-    severity: "warning",
-    message: "chrome.userScripts: the management surface is emulated (register/getScripts/update/unregister round-trip) and registered scripts ARE injected — the registry is published to storage and a generated content script evaluates matching scripts in the isolated world on each page.",
-    fix: "Remaining fidelity gaps: document_start timing is not honored, and Chrome's USER_SCRIPT-world CSP exemption does not apply; use static content scripts or chrome.scripting if either matters.",
-  },
-  "chrome.idle": {
-    severity: "info",
-    message: "chrome.idle is unsupported; shim derives state from page visibility.",
-    fix: "Don't rely on machine-level idle detection on Safari.",
-  },
-  "chrome.instanceID": {
-    severity: "info",
-    message: "chrome.instanceID: getID/getCreationTime/deleteID work (stable persisted ID); getToken/deleteToken (FCM push) still reject, since there is no Safari surface for them.",
-    fix: "For push, use APNs via the native host or poll with chrome.alarms.",
-  },
-  "chrome.bookmarks": {
-    severity: "info",
-    message: "chrome.bookmarks is fully emulated (CRUD/search/events) over an extension-private store in storage.local, NOT the user's Safari bookmarks (no API exists for those).",
-    fix: "No action needed if you manage your own bookmark data; you cannot read/write the user's real Safari bookmarks.",
-  },
-  "chrome.history": {
-    severity: "info",
-    message: "chrome.history is limited in Safari.",
-    fix: "Verify availability; feature-detect and degrade.",
-  },
-  "chrome.downloads": {
-    severity: "info",
-    message: "chrome.downloads: download() triggers a real download and items are tracked in a registry (search/onCreated/onChanged work); WebKit gives no progress, so items go in_progress→complete with unknown byte counts.",
-    fix: "Works for start-then-track flows; don't rely on byte-level progress.",
-  },
-  "chrome.i18n.detectLanguage": {
-    severity: "info",
-    message: "chrome.i18n.detectLanguage has no Safari engine; the shim returns 'und' (undetermined).",
-    fix: "Don't branch on detected language in Safari; detect server-side or skip the feature.",
+  "identity.onSignInChanged": {
+    message: "identity.onSignInChanged exists but never fires, because Firefox has no browser sign-in.",
+    fix: "Don't rely on it to detect sign-out.",
   },
 };
+
+// Advice for APIs Firefox lacks, keyed like FIREFOX_API_SUPPORT. Members of a missing
+// namespace are covered by the namespace's entry.
+const API_FIXES: Record<string, string> = {
+  contentSettings: PERMISSION_NOTES.contentSettings,
+  debugger: PERMISSION_NOTES.debugger,
+  declarativeContent: PERMISSION_NOTES.declarativeContent,
+  desktopCapture: PERMISSION_NOTES.desktopCapture,
+  "devtools.performance": "Firefox's devtools has no hooks into its Performance panel.",
+  "devtools.recorder": "Firefox's devtools has no Recorder panel.",
+  dom: "In content scripts Firefox offers element.openOrClosedShadowRoot() directly.",
+  fontSettings: PERMISSION_NOTES.fontSettings,
+  gcm: PERMISSION_NOTES.gcm,
+  instanceID: PERMISSION_NOTES.gcm,
+  mimeHandler: "Firefox can't hand a MIME type to an add-on; webRequest.filterResponseData() can rewrite responses instead.",
+  pageCapture: PERMISSION_NOTES.pageCapture,
+  power: PERMISSION_NOTES.power,
+  printerProvider: PERMISSION_NOTES.printerProvider,
+  processes: PERMISSION_NOTES.processes,
+  readingList: PERMISSION_NOTES.readingList,
+  tabCapture: PERMISSION_NOTES.tabCapture,
+  tts: PERMISSION_NOTES.tts,
+  ttsEngine: PERMISSION_NOTES.ttsEngine,
+  webAuthenticationProxy: PERMISSION_NOTES.webAuthenticationProxy,
+  "browsingData.removeAppcache": "Call browsingData.remove() with the data types Firefox supports.",
+  "browsingData.removeCacheStorage": "Call browsingData.remove() with the data types Firefox supports.",
+  "browsingData.removeFileSystems": "Call browsingData.remove() with the data types Firefox supports.",
+  "browsingData.removeIndexedDB": "Call browsingData.remove() with the data types Firefox supports.",
+  "browsingData.removeServiceWorkers": "Call browsingData.remove() with the data types Firefox supports.",
+  "browsingData.removeWebSQL": "Call browsingData.remove() with the data types Firefox supports.",
+  "declarativeNetRequest.getMatchedRules": "Firefox doesn't report matched rules; declarativeNetRequest.testMatchOutcome() helps while developing.",
+  "declarativeNetRequest.onRuleMatchedDebug": "Firefox doesn't report matched rules; declarativeNetRequest.testMatchOutcome() helps while developing.",
+  "declarativeNetRequest.setExtensionActionOptions": "Firefox can't show matched-rule counts on the toolbar button.",
+  "downloads.onDeterminingFilename": "Pass the filename to downloads.download() instead.",
+  "downloads.setShelfEnabled": PERMISSION_NOTES["downloads.ui"],
+  "downloads.setUiOptions": PERMISSION_NOTES["downloads.ui"],
+  "extension.getExtensionTabs": 'Use extension.getViews({ type: "tab" }).',
+  "extension.onRequest": "Use runtime.onMessage.",
+  "extension.onRequestExternal": "Use runtime.onMessageExternal.",
+  "extension.sendRequest": "Use runtime.sendMessage.",
+  "identity.getAccounts": "Firefox has no list of signed-in browser accounts.",
+  "management.uninstall": "Firefox only lets an add-on uninstall itself (management.uninstallSelf()).",
+  "notifications.onButtonClicked": "Firefox notifications have no buttons; handle notifications.onClicked instead.",
+  "notifications.update": "Clear the notification and create it again.",
+  "proxy.onProxyError": "Listen to proxy.onError instead.",
+  "runtime.onBrowserUpdateAvailable": "Firefox updates itself and its add-ons; there is nothing to watch for.",
+  "runtime.requestUpdateCheck": "Firefox updates add-ons on its own schedule; there is nothing to check.",
+  "runtime.onRestartRequired": "ChromeOS kiosk only.",
+  "runtime.restart": "ChromeOS kiosk only.",
+  "runtime.restartAfterDelay": "ChromeOS kiosk only.",
+  "sessions.getDevices": "Firefox doesn't expose synced devices to add-ons.",
+  "tabs.getAllInWindow": "Use tabs.query({ windowId }).",
+  "tabs.getSelected": "Use tabs.query({ active: true, currentWindow: true }).",
+  "tabs.onActiveChanged": "Listen to tabs.onActivated.",
+  "tabs.onHighlightChanged": "Listen to tabs.onHighlighted.",
+  "tabs.onReplaced": "Firefox doesn't replace tabs, so there is nothing to listen for.",
+  "tabs.onSelectionChanged": "Listen to tabs.onActivated.",
+  "tabs.sendRequest": "Use tabs.sendMessage.",
+  "tabs.setZoomSettings": "Firefox doesn't let add-ons change zoom settings; tabs.setZoom() still works.",
+  "windows.onBoundsChanged": "Listen for resize events in the window's pages, or poll windows.get().",
+  ...Object.fromEntries(
+    [
+      "accessibilityFeatures",
+      "system.cpu",
+      "system.display",
+      "system.memory",
+      "system.storage",
+    ].map((ns) => [ns, PERMISSION_NOTES["system.cpu"]]),
+  ),
+  ...Object.fromEntries(
+    [
+      "audio",
+      "certificateProvider",
+      "documentScan",
+      "enterprise.deviceAttributes",
+      "enterprise.hardwarePlatform",
+      "enterprise.login",
+      "enterprise.networkingAttributes",
+      "enterprise.platformKeys",
+      "fileBrowserHandler",
+      "fileSystemProvider",
+      "input.ime",
+      "loginState",
+      "platformKeys",
+      "printing",
+      "printingMetrics",
+      "systemLog",
+      "vpnProvider",
+      "wallpaper",
+      "management.createAppShortcut",
+      "management.generateAppForLink",
+      "management.installReplacementWebApp",
+      "management.launchApp",
+      "management.setLaunchType",
+    ].map((name) => [name, name.startsWith("management.") ? "Chrome Apps only; Firefox has no equivalent." : CHROMEOS_ONLY]),
+  ),
+};
+
+// Gaps that browser-compat-data can't express: APIs Firefox has with different
+// semantics, and an argument value Firefox rejects.
+const HAND_NOTES: Record<string, ApiNote> = {
+  "chrome.identity.launchWebAuthFlow": {
+    severity: "info",
+    message: "identity.launchWebAuthFlow works in Firefox, but its redirect URL isn't Chrome's https://<id>.chromiumapp.org/.",
+    fix: "Register the value of identity.getRedirectURL() in Firefox with the OAuth provider.",
+  },
+  "chrome.proxy.settings": {
+    severity: "warning",
+    message: "Firefox's proxy.settings takes a different config than Chrome's (proxyType/http/ssl/autoConfigUrl instead of mode/rules/pacScript), so Chrome-style configs are rejected.",
+    fix: "Translate the config, or route requests with proxy.onRequest. Firefox also only allows proxy.settings when the user lets the add-on run in private windows.",
+  },
+  OFFSCREEN_DOCUMENT: {
+    severity: "warning",
+    message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT" throws in Firefox, whose context types have no offscreen documents.',
+    fix: "Ask chrome.offscreen.hasDocument() instead; the shim answers it.",
+  },
+};
+
+// browser-compat-data marks these unsupported, but Firefox's API schemas define them,
+// so using them doesn't throw. Value: what does differ, or null when nothing worth
+// reporting does.
+const DEFINED_BUT_LIMITED: Record<string, string | null> = {
+  "devtools.panels.sources": null,
+  "tabs.onReplaced": null,
+  "notifications.onButtonClicked": "chrome.notifications.onButtonClicked exists in Firefox but never fires, because Firefox notifications have no buttons.",
+  "tabs.setZoomSettings": "chrome.tabs.setZoomSettings exists in Firefox but throws unless the settings match the tab's current ones.",
+};
+
+// Firefox 109 is the first release with Manifest V3; minimum versions below it aren't
+// tracked, which keeps gates on long-standing APIs out of the table.
+const OLDEST_TRACKED_FIREFOX = "109";
+
+// Nearest enclosing namespace that has its own entry: "devtools.panels" for
+// "devtools.panels.create", none for "devtools.panels" or "system.cpu".
+function parentApi(name: string): string | undefined {
+  for (let i = name.lastIndexOf("."); i > 0; i = name.lastIndexOf(".", i - 1)) {
+    const prefix = name.slice(0, i);
+    if (Object.hasOwn(FIREFOX_API_SUPPORT, prefix)) return prefix;
+  }
+  return undefined;
+}
+
+// The analyzer matches keys as plain substrings, so "chrome.management.uninstall" would
+// also fire on management.uninstallSelf. Keys that prefix another API name get a word
+// boundary, which turns them into a regex.
+const API_NAMES = Object.keys(FIREFOX_API_SUPPORT);
+function apiKey(name: string): string {
+  const prefixesAnother = API_NAMES.some((other) => other.length > name.length && other.startsWith(name) && /[\w$]/.test(other[name.length]));
+  return `chrome.${name}${prefixesAnother ? "\\b" : ""}`;
+}
+
+function missingMessage(name: string, isNamespace: boolean): string {
+  const leaf = name.slice(name.lastIndexOf(".") + 1);
+  if (isNamespace) return `chrome.${name} doesn't exist in Firefox, so code that uses it throws.`;
+  if (/^on[A-Z]/.test(leaf)) return `chrome.${name} doesn't exist in Firefox; adding a listener throws a TypeError.`;
+  if (/^[A-Z][A-Z0-9_]*$/.test(leaf)) return `chrome.${name} is undefined in Firefox.`;
+  return `chrome.${name} doesn't exist in Firefox; calling it throws a TypeError.`;
+}
+
+function buildApiTable(): Record<string, ApiNote> {
+  const table: Record<string, ApiNote> = {};
+  for (const [name, since] of Object.entries(FIREFOX_API_SUPPORT)) {
+    const parent = parentApi(name);
+    if (Object.hasOwn(SHIMMED_APIS, name) || (parent !== undefined && SHIMMED_NAMESPACES[parent] === true)) continue;
+    if (since === null) {
+      if (parent !== undefined && FIREFOX_API_SUPPORT[parent] === null) continue;
+      const limited = Object.hasOwn(DEFINED_BUT_LIMITED, name) ? DEFINED_BUT_LIMITED[name] : undefined;
+      if (limited === null) continue;
+      table[apiKey(name)] = {
+        severity: "warning",
+        message: limited ?? missingMessage(name, parent === undefined),
+        fix: API_FIXES[name] ?? `Feature-detect it (if (chrome.${name})) or drop the feature from the Firefox build.`,
+      };
+      continue;
+    }
+    if (compareFirefoxVersions(since, OLDEST_TRACKED_FIREFOX) <= 0) continue;
+    const parentSince = parent === undefined ? null : FIREFOX_API_SUPPORT[parent];
+    if (parentSince && compareFirefoxVersions(since, parentSince) <= 0) continue;
+    table[apiKey(name)] = {
+      severity: "warning",
+      message: `chrome.${name} needs Firefox ${since}; older releases don't have it.`,
+      fix: `Raise --min-firefox to ${since}, or feature-detect the API.`,
+      since,
+    };
+  }
+  for (const [name, note] of Object.entries(SHIMMED_APIS)) {
+    table[apiKey(name)] = { severity: "info", ...note, shimmed: true };
+  }
+  return { ...table, ...HAND_NOTES };
+}
+
+/**
+ * What the analyzer looks for in scripts. Keys are dotted chrome.* names (a `chrome.`
+ * prefix also matches `browser.`) or a plain literal such as "OFFSCREEN_DOCUMENT"; a
+ * key with `\b` is matched as a regex. `since` marks APIs Firefox gained after its
+ * first Manifest V3 release; the entry doesn't apply when --min-firefox is at least that.
+ */
+export const UNSUPPORTED_APIS: Record<string, ApiNote> = buildApiTable();
