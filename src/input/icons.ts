@@ -91,8 +91,8 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
 }
 
 /**
- * When the extension ships no icons, Safari shows a blank toolbar glyph and the
- * App Store rejects the upload. Synthesize a solid-color placeholder set so the
+ * When the extension ships no icons, Firefox shows a generic puzzle-piece glyph
+ * in the toolbar and the add-ons manager. Synthesize a solid-color placeholder set so the
  * build is usable; the color is derived from the app name so it's at least
  * distinguishable. Mutates `manifest.icons` (and the action's default_icon).
  * No-op when the manifest already declares any icon. Returns the sizes written.
