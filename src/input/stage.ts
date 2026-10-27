@@ -1,6 +1,5 @@
 import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, statSync, realpathSync, copyFileSync } from "node:fs";
-import { basename, join, dirname, resolve, relative, sep } from "node:path";
-import { cleanExtendedAttributes } from "./extract.js";
+import { join, dirname, resolve, relative, sep } from "node:path";
 import type { Manifest } from "../types.js";
 
 /** Names/globs excluded from the clean staged extension. */
@@ -46,11 +45,12 @@ function shouldExclude(name: string): boolean {
  * `keep` is a set of manifest-relative paths (forward-slash) that the manifest
  * declares as runtime assets; these are copied even if their name matches an
  * exclusion rule — otherwise a web-accessible LICENSE.txt or a .map served to a
- * page would be dropped and 404 in Safari.
+ * page would be dropped and 404 at runtime.
+ *
+ * Returns the manifest-referenced asset paths that could NOT be staged (a kept
+ * symlink whose target escaped the tree, vanished, or failed to copy). The caller
+ * warns on these — otherwise they 404 in Firefox with no build-time signal.
  */
-// Returns the manifest-referenced asset paths that could NOT be staged (a kept symlink
-// whose target escaped the tree, vanished, or failed to copy). The caller warns on
-// these — otherwise they 404 in Safari with no build-time signal.
 export function stageExtension(sourceDir: string, stageDir: string, keep: Set<string> = new Set()): string[] {
   if (existsSync(stageDir)) rmSync(stageDir, { recursive: true, force: true });
   mkdirSync(stageDir, { recursive: true });
@@ -69,7 +69,7 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
       if (rel === "") return true; // the stage root itself
       // Never copy symlinks into the package. cpSync reproduces them verbatim, so a
       // link in the source (evil.txt -> /etc/hosts) would ship a dangling/absolute
-      // link that leaks the build host's layout and 404s in Safari. Drop them.
+      // link that leaks the build host's layout and 404s at runtime. Drop them.
       // lstat can throw on a broken/racing entry; an unguarded throw here escapes the
       // filter and aborts the whole copy with an opaque ENOENT — exclude on error.
       let st;
@@ -92,7 +92,7 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
     },
   });
 
-  // The filter above drops ALL symlinks (verbatim-copied links 404 in Safari and
+  // The filter above drops ALL symlinks (verbatim-copied links 404 at runtime and
   // leak the build host's layout). But a manifest-referenced asset that happens to
   // be a symlink in the source (common with pnpm/monorepo asset linking) is a real
   // runtime dependency — dropping it 404s the page that needs it. For kept paths
@@ -121,63 +121,10 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
     catch { dropped.push(rel); }
   }
 
-  cleanExtendedAttributes(stageDir);
   return dropped;
 }
 
 const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
-
-// Safari drops the LAST entry of _locales/<locale>/messages.json. Live on
-// Tampermonkey: `v0version0` ("v$version$") is the final message and getMessage
-// returned "" for it in every form — no substitution, string substitution, array
-// substitution — while `top_level_await`, the entry immediately before it, resolved
-// fine. Nothing about the entry is special (its neighbours past the same byte offset
-// work, and other placeholder messages work); it is dropped for being last. The
-// extension then falls back to displaying the raw message key, which is how the
-// Tampermonkey dashboard came to render a literal "v0version0" as its version.
-//
-// Append a sacrificial message so the extension's own last string is no longer last.
-// The insert is textual, before the closing brace, so every existing byte (formatting,
-// escapes, unicode) survives exactly as shipped. Returns files modified.
-const LOCALE_TAIL_GUARD = "viaduct_locale_tail_guard";
-
-export function guardLocaleTailMessage(stageDir: string): number {
-  const localesDir = join(stageDir, "_locales");
-  if (!existsSync(localesDir)) return 0;
-  let modified = 0;
-  for (const entry of readdirSync(localesDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const file = join(localesDir, entry.name, "messages.json");
-    if (!existsSync(file)) continue;
-    let raw: string;
-    try {
-      raw = readFileSync(file, "utf-8");
-    } catch {
-      continue;
-    }
-    // Only touch a catalog we can confirm is a non-empty JSON object — a broken or
-    // empty one has no last message to lose, and rewriting it could only make things
-    // worse.
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
-    const keys = Object.keys(parsed as Record<string, unknown>);
-    if (keys.length === 0 || keys[keys.length - 1] === LOCALE_TAIL_GUARD) continue;
-    const close = raw.lastIndexOf("}");
-    if (close < 0) continue;
-    const next =
-      raw.slice(0, close) +
-      `,"${LOCALE_TAIL_GUARD}":{"message":"viaduct"}` +
-      raw.slice(close);
-    writeFileSync(file, next, "utf-8");
-    modified++;
-  }
-  return modified;
-}
 
 export function walkScripts(dir: string, acc: string[] = [], exts: string[] = [".js", ".mjs"]): string[] {
   let entries;
@@ -198,8 +145,8 @@ export function walkScripts(dir: string, acc: string[] = [], exts: string[] = ["
 /**
  * Strip `//# sourceMappingURL=…` comments that point at a .map file no longer
  * present in the staged extension (stageExtension excludes *.map as dev cruft).
- * A dangling reference makes Safari's Web Inspector emit a 404 for the missing
- * map on every load. Only strips refs whose target is gone and is a local path —
+ * A dangling reference makes the Firefox devtools report a missing source map
+ * on every load. Only strips refs whose target is gone and is a local path —
  * data: URIs (inline maps) and existing maps are left untouched. Returns the
  * number of files modified.
  */
@@ -229,69 +176,20 @@ export function stripDanglingSourcemaps(stageDir: string): number {
   return modified;
 }
 
-// Safari's `chrome.scripting` (and `chrome.runtime` etc.) are EXOTIC, IMMUTABLE host
-// slots: the shim cannot install the `ExecutionWorld`/`RegistrationWorld` enum objects
-// onto them (assign/defineProperty are silent no-ops, delete re-materializes the empty
-// native slot — proven live). Bundles read e.g. `chrome.scripting.ExecutionWorld.ISOLATED`
-// at runtime and get `undefined.ISOLATED` → TypeError that aborts the call (Bitwarden:
-// "undefined is not an object (evaluating 'chrome.scripting.ExecutionWorld.ISOLATED')").
-// Since the enum members are fixed string constants, rewrite the reads to their literal
-// values directly in the staged source. Covers chrome|browser, dot or ["bracket"] access
-// for the namespace step, and the two enums Safari omits. Returns files modified.
-//
-// Literal-substitution, not a JS parser. These enums are only ever read as
-// `.ExecutionWorld.<MEMBER>` member chains in real bundles (verified across the corpus);
-// a regex is enough and can't mangle unrelated code. If a bundle ever aliased the enum
-// object itself (`const W = chrome.scripting.ExecutionWorld`) we'd need AST work — add
-// then.
-// ExecutionWorld and RegistrationWorld are identical enums whose value === member
-// name, so this is just an allowlist of valid members (any unknown member is left
-// untouched). If a future enum ever has value !== name, switch back to a name→value map.
-const ENUM_MEMBERS = new Set(["ISOLATED", "MAIN"]);
-// e.g.  chrome.scripting.ExecutionWorld.ISOLATED  |  browser["scripting"].RegistrationWorld.MAIN
-// (?<![\w$.]) plus the optional global prefix: `self.chrome.scripting...` must be
-// consumed WHOLE (matching from `chrome` would leave `self."ISOLATED"` — a
-// SyntaxError), while `myObj.chrome.scripting...` must not match at all.
-const ENUM_RE =
-  /(?<![\w$.])(?:(?:self|globalThis|window)\s*\.\s*)?(?:chrome|browser)\s*(?:\.\s*scripting|\[\s*["']scripting["']\s*\])\s*\.\s*(ExecutionWorld|RegistrationWorld)\s*\.\s*([A-Z_]+)\b/g;
-
-export function inlineImmutableEnums(stageDir: string): number {
-  let modified = 0;
-  for (const file of walkScripts(stageDir)) {
-    let content: string;
-    try {
-      content = readFileSync(file, "utf-8");
-    } catch {
-      continue;
-    }
-    let changed = false;
-    const next = content.replace(ENUM_RE, (whole, _enumName: string, member: string) => {
-      if (!ENUM_MEMBERS.has(member)) return whole; // unknown member — leave it untouched
-      changed = true;
-      return JSON.stringify(member); // "ISOLATED"
-    });
-    if (changed) {
-      writeFileSync(file, next, "utf-8");
-      modified++;
-    }
-  }
-  return modified;
-}
-
 // Chrome bundles bake the literal scheme of their own pages into compiled
 // platform tables and URL checks:
 //   INTERNAL_PAGE_PROTOCOLS: ["chrome-extension:"]        (Tampermonkey)
 //   sender.url.startsWith("chrome-extension://")           (common idiom)
-// On Safari every extension page is safari-web-extension://…, so each of these
+// In Firefox every extension page is moz-extension://…, so each of these
 // checks is false at runtime. The damage is silent and structural: message
 // dispatchers that gate privileged methods on "is the sender one of my own
 // pages?" refuse every popup/options RPC, and the page waiting on the reply
 // renders nothing (Tampermonkey's action popup: loadTree refused → blank).
-// A chrome-extension:// URL can never legitimately occur inside Safari, so the
-// literal is dead code unless rewritten. Swap the scheme token to Safari's in
+// A chrome-extension:// URL can never legitimately occur inside Firefox, so the
+// literal is dead code unless rewritten. Swap the scheme token to Firefox's in
 // the staged sources; host/path parts of any such URL are left untouched.
-// Must run BEFORE the shim/polyfill are written — those templates carry
-// chrome-extension:// strings on purpose (origin spoofing) and must keep them.
+// Must run BEFORE the shim is written — it carries chrome-extension:// strings
+// on purpose and must keep them.
 //
 // Token substitution, not a JS parser. Matches the scheme token
 // wherever it appears (comments too — harmless). A dual-browser bundle that
@@ -299,7 +197,7 @@ export function inlineImmutableEnums(stageDir: string): number {
 // wins, same outcome either way.
 //
 // EXCEPT concrete-host URLs: "chrome-extension://<id>/…" (id literal or ${…}
-// interpolation) is never a local check the swap can fix — Safari's page host
+// interpolation) is never a local check the swap can fix — Firefox's page host
 // is a per-install UUID, so the host part can't match regardless of scheme.
 // Such literals are server-bound tokens instead, above all OAuth redirect_uris
 // registered verbatim with the provider (Claude in Chrome:
@@ -309,7 +207,7 @@ export function inlineImmutableEnums(stageDir: string): number {
 // there the scheme is the only thing that can mismatch.
 const CHROME_SCHEME_RE = /(?<![-\w])chrome-extension:(?!\/\/[\w$])/g;
 
-export function rewriteChromeSchemeLiterals(stageDir: string): number {
+function rewriteChromeSchemeLiterals(stageDir: string): number {
   let modified = 0;
   for (const file of walkScripts(stageDir)) {
     let content: string;
@@ -320,35 +218,7 @@ export function rewriteChromeSchemeLiterals(stageDir: string): number {
     }
     if (!CHROME_SCHEME_RE.test(content)) continue;
     CHROME_SCHEME_RE.lastIndex = 0;
-    writeFileSync(file, content.replace(CHROME_SCHEME_RE, "safari-web-extension:"), "utf-8");
-    modified++;
-  }
-  return modified;
-}
-
-// Safari's runtime.sendNativeMessage/connectNative cannot be overridden in JS:
-// they are custom-value slots (assignment, defineProperty and delete all report
-// success and the native reads back), runtime itself is the same kind of slot on
-// the root, and the one binding that IS reassignable, the global chrome/browser,
-// must stay native or WebKit skips the frame at message dispatch (Safari Quirks
-// E15). So the shim publishes its native-messaging bridge under two NEW members
-// the extensible native runtime accepts, and the bundle's call sites are pointed
-// at them here. Token substitution on the `.method(` form; a destructured or
-// bracket-accessed call is left alone and reaches Safari's native slot.
-const NATIVE_MESSAGING_CALL_RE = /\.(connectNative|sendNativeMessage)\s*\(/g;
-
-export function rewriteNativeMessagingCalls(stageDir: string): number {
-  let modified = 0;
-  for (const file of walkScripts(stageDir)) {
-    let content: string;
-    try {
-      content = readFileSync(file, "utf-8");
-    } catch {
-      continue;
-    }
-    if (!NATIVE_MESSAGING_CALL_RE.test(content)) continue;
-    NATIVE_MESSAGING_CALL_RE.lastIndex = 0;
-    writeFileSync(file, content.replace(NATIVE_MESSAGING_CALL_RE, (_m, name: string) => `.__viaduct${name[0].toUpperCase()}${name.slice(1)}(`), "utf-8");
+    writeFileSync(file, content.replace(CHROME_SCHEME_RE, "moz-extension:"), "utf-8");
     modified++;
   }
   return modified;
@@ -356,12 +226,10 @@ export function rewriteNativeMessagingCalls(stageDir: string): number {
 
 // `chrome-extension://__MSG_@@extension_id__/…` is how a bundle points at its own
 // files from CSS (and from markup), because the browser resolves @@extension_id at
-// load time. Safari DOES substitute the placeholder — with the per-install UUID —
-// but leaves the scheme alone, so the request goes out as
-// chrome-extension://<uuid>/… from an https page and WebKit blocks every one:
-// "requested insecure content … must be served over HTTPS". Live: Cloaked's
-// content.css, 18 blocked webfonts on each injection into my.cloaked.com, which is
-// also what buried its console.
+// load time. Firefox substitutes the placeholder with the per-install UUID but
+// leaves the scheme alone, so the request goes out as chrome-extension://<uuid>/…,
+// a scheme Firefox can't load: every webfont and image behind such a URL fails
+// (Cloaked's content.css loses 18 webfonts on each page it injects into).
 //
 // CHROME_SCHEME_RE skips this (its host guard can't tell a placeholder from a real
 // id), and it has to: a concrete-host URL may be an OAuth redirect_uri registered
@@ -370,7 +238,7 @@ export function rewriteNativeMessagingCalls(stageDir: string): number {
 // rewrites never see.
 const EXT_ID_PLACEHOLDER_RE = /chrome-extension:(?=\/\/__MSG_@@extension_id__\b)/g;
 
-export function rewriteExtensionIdPlaceholderUrls(stageDir: string): number {
+function rewriteExtensionIdPlaceholderUrls(stageDir: string): number {
   let modified = 0;
   for (const file of walkScripts(stageDir, [], [".js", ".mjs", ".css", ".html", ".htm"])) {
     let content: string;
@@ -380,7 +248,7 @@ export function rewriteExtensionIdPlaceholderUrls(stageDir: string): number {
       continue;
     }
     if (!content.includes("chrome-extension://__MSG_@@extension_id__")) continue;
-    writeFileSync(file, content.replace(EXT_ID_PLACEHOLDER_RE, "safari-web-extension:"), "utf-8");
+    writeFileSync(file, content.replace(EXT_ID_PLACEHOLDER_RE, "moz-extension:"), "utf-8");
     modified++;
   }
   return modified;
@@ -389,20 +257,19 @@ export function rewriteExtensionIdPlaceholderUrls(stageDir: string): number {
 // Bundles route extension-page ports (popup / side panel / devtools) by testing the
 // sender's URL against a RegExp built from chrome.runtime.id:
 //   new RegExp(chrome.runtime.id + "/src/popup.html").test(port.sender.url)
-// On Chrome that works because runtime.id IS the host of every extension URL. On Safari
-// it CANNOT: runtime.id is the App-Extension BUNDLE id ("com.x.Extension (TEAM)"), while
-// sender.url's host is the per-install UUID — two different strings, and the bundle id even
-// contains regex metacharacters. Safari exposes chrome.runtime.id as a frozen/exotic slot
-// (assignment AND defineProperty silently no-op, and chrome.runtime itself can't be replaced
-// — all proven live), so the shim cannot fix runtime.id at runtime. The port is never
-// routed → the bg posts no reply → the popup's init RPC never resolves (e.g. Grammarly hangs
-// on "starting…").
+// On Chrome that works because runtime.id IS the host of every extension URL. In
+// Firefox it can't: runtime.id is the add-on ID from browser_specific_settings.gecko.id
+// ("…@example"), while sender.url's host is the per-install UUID — two different strings,
+// and the add-on ID even contains regex metacharacters. The port is never routed → the
+// bg posts no reply → the popup's init RPC never resolves (e.g. Grammarly hangs on
+// "starting…").
 //
 // Fix at conversion time: drop the `runtime.id +` prefix so the matcher becomes
 //   new RegExp("/src/popup.html").test(sender.url)
-// which is host-agnostic and matches the real Safari URL (any UUID host, and tolerant of
-// Safari's "?tabId=N" query — the path substring still matches). It stays path-specific, so
-// popup/sidePanel/devtools matchers remain distinct and content-script URLs don't match.
+// which is host-agnostic and matches the real moz-extension URL (any UUID host, and
+// tolerant of a query string — the path substring still matches). It stays
+// path-specific, so popup/sidePanel/devtools matchers remain distinct and
+// content-script URLs don't match.
 //
 // Literal substitution, not a JS parser. Targets the exact, common shape
 // `new RegExp(<chrome|browser>[.|["..."]]runtime.id + "<path>")`. A bundle that built the
@@ -410,7 +277,7 @@ export function rewriteExtensionIdPlaceholderUrls(stageDir: string): number {
 const RUNTIME_ID_URL_RE =
   /new\s+RegExp\s*\(\s*(?:chrome|browser|self|globalThis|window)?\s*(?:\.\s*chrome|\.\s*browser)?\s*\.\s*runtime\s*\.\s*id\s*\+\s*(["'])((?:\\.|(?!\1).)*)\1\s*\)/g;
 
-export function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
+function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
   let modified = 0;
   for (const file of walkScripts(stageDir)) {
     let content: string;
@@ -437,11 +304,11 @@ export function rewriteRuntimeIdUrlMatchers(stageDir: string): number {
 
 // Chrome extension pages sit in a nested browsing context, so bundles read
 // `location.ancestorOrigins[0]` to learn who framed them (e.g. "am I the top-level
-// extension page?"). In Safari the extension popup/options page is TOP-LEVEL, so
-// ancestorOrigins is an EMPTY DOMStringList — present (the `?.` guard passes) but
-// [0] is undefined, and the trailing `.includes(...)` throws at module top level.
-// A module that throws before it renders leaves a blank white popup (Salesforce
-// Inspector Reloaded: popup.js line 1 → empty popover).
+// extension page?"). Firefox's popup and options pages are top-level, so
+// ancestorOrigins (Firefox 148+) is an EMPTY DOMStringList — present (the `?.`
+// guard passes) but [0] is undefined, and the trailing `.includes(...)` throws at
+// module top level. A module that throws before it renders leaves a blank popup
+// (Salesforce Inspector Reloaded: popup.js line 1 → empty popup).
 //
 // Guard the index read so the method call sees an empty string instead of undefined:
 //   location.ancestorOrigins?.[0].includes(x)  ->  (location.ancestorOrigins?.[0] || "").includes(x)
@@ -481,7 +348,7 @@ function receiverChainStart(src: string, end: number): number {
   return i;
 }
 
-export function guardAncestorOriginsAccess(stageDir: string): number {
+function guardAncestorOriginsAccess(stageDir: string): number {
   let modified = 0;
   for (const file of walkScripts(stageDir)) {
     let content: string;
@@ -509,73 +376,21 @@ export function guardAncestorOriginsAccess(stageDir: string): number {
   return modified;
 }
 
-// A cross-browser bundle reads its FIREFOX settings block to decide whether it
-// self-hosts its own updates, and the idiom guards the container but not the block:
-//   manifest.browser_specific_settings && manifest.browser_specific_settings.gecko.update_url
-// On Chrome `browser_specific_settings` is absent, so the `&&` short-circuits and the
-// `.gecko` read never happens. viaduct ADDS `browser_specific_settings.safari` (that is
-// the only place `strict_min_version` can live), so after conversion the container
-// exists with no `gecko` in it and the read throws.
-//
-// Where that lands decides how bad it is. At the top level of a background script it
-// kills every statement after it: Bypass Paywalls Clean (background.js:260) registered
-// none of its 802 DNR rules and injected no content scripts at all. Inside a promise it
-// is "only" an unhandled rejection that silently drops that feature (the same bundle's
-// update check, background.js:1843).
-//
-// Optional-chain the block so the read yields undefined instead of throwing:
-//   bss.gecko.update_url  ->  bss.gecko?.update_url
-// undefined is falsy, which is the honest answer on Safari ("no Firefox settings"), and
-// it keeps a `bss.gecko` presence test false — injecting an empty `gecko: {}` into the
-// manifest instead would flip such a test to true and send the bundle down its Firefox
-// path. Safari 13.1+ parses optional chaining, well under viaduct's 15.4 floor.
-//
-// Literal substitution, not a JS parser: the property name is distinctive enough that a
-// textual match cannot hit anything else, and `(?!\?)` keeps it idempotent.
-const GECKO_SETTINGS_RE = /(\bbrowser_specific_settings(?:\?)?\.gecko)\.(?!\?)/g;
-
-export function guardGeckoSettingsAccess(stageDir: string): number {
-  let modified = 0;
-  for (const file of walkScripts(stageDir)) {
-    let content: string;
-    try {
-      content = readFileSync(file, "utf-8");
-    } catch {
-      continue;
-    }
-    if (!content.includes("browser_specific_settings")) continue;
-    const next = content.replace(GECKO_SETTINGS_RE, "$1?.");
-    if (next !== content) {
-      writeFileSync(file, next, "utf-8");
-      modified++;
-    }
-  }
-  return modified;
-}
-
 // A bundle recognizes its OWN pages by rebuilding their origin out of runtime.id and
 // comparing it to a port's sender:
 //   new URL(port.sender.url).origin === `chrome-extension://${chrome.runtime.id}`
-// On Chrome that holds, because runtime.id is the host of every extension URL. On
-// Safari it cannot: runtime.id is the App-Extension BUNDLE id
-// ("com.viaduct.MetaMask.Extension (V8K8L3ZSD5)") while the page's host is the
-// per-install UUID, and runtime.id is a frozen slot the shim can't rewrite (see
-// rewriteRuntimeIdUrlMatchers for the RegExp form of the same idiom).
+// On Chrome that holds, because runtime.id is the host of every extension URL. In
+// Firefox it can't: runtime.id is the add-on ID while the page's host is the
+// per-install UUID (see rewriteRuntimeIdUrlMatchers for the RegExp form of the same
+// idiom). MetaMask is the case where this decides everything: its background answers
+// a port's liveness ping unconditionally but only sends BACKGROUND_INITIALIZED to a
+// port it believes is its own UI, so with the comparison false the popup gets the
+// ping, waits 16 s for the init message that never comes, and shows "MetaMask had
+// trouble starting — Background initialization timeout".
 //
-// Measured live on MetaMask (Safari 26), where this decided everything:
-//   sender.url                  safari-web-extension://297CD490-…/home.html
-//   new URL(sender.url).origin  safari-web-extension://297cd490-…      (lowercased)
-//   getURL("/")                 safari-web-extension://297CD490-…/
-//   new URL(getURL("/")).origin safari-web-extension://297cd490-…      (equal)
-//   runtime.id                  com.viaduct.MetaMask.Extension (V8K8L3ZSD5)
-// Its background answers a port's liveness ping unconditionally but only sends
-// BACKGROUND_INITIALIZED to a port it believes is its own UI, so with the comparison
-// false the popup got the ping, waited 16 s for the init message that was never sent,
-// and showed "MetaMask had trouble starting — Background initialization timeout".
-//
-// So derive the origin from getURL instead of from runtime.id. `new URL()` lowercases
-// the host on both sides, which also settles the UUID-case mismatch (see Safari Quirks
-// B4), and the rewritten expression means exactly the same thing on Chrome.
+// So derive the origin from getURL instead of from runtime.id. `new URL()` normalizes
+// the host on both sides, and the rewritten expression means exactly the same thing
+// on Chrome.
 //
 // Only an origin-ONLY literal is rewritten: nothing may follow the interpolation
 // inside the template. A concrete-host URL WITH a path is usually a server-bound
@@ -599,7 +414,7 @@ const EXT_ORIGIN_CONCAT_RE = new RegExp(
   "g",
 );
 
-export function rewriteExtensionOriginFromRuntimeId(stageDir: string): number {
+function rewriteExtensionOriginFromRuntimeId(stageDir: string): number {
   let modified = 0;
   for (const file of walkScripts(stageDir)) {
     let content: string;
@@ -625,136 +440,19 @@ export function rewriteExtensionOriginFromRuntimeId(stageDir: string): number {
   return modified;
 }
 
-// Safari re-evaluates a content-script group a SECOND time into a world that already
-// ran it. It happens for the document_end / document_idle groups on all_frames pages:
-// an about:blank / about:srcdoc subframe (and some same-origin navigations) shares the
-// parent frame's isolated world, and Safari fires the injection for it again — so every
-// file in the group is evaluated twice in one world. Chrome gives each such frame its own
-// world and never does this.
-//
-// The second evaluation is fatal only where a file has a top-level `const`/`let`/`class`:
-// re-declaring a lexical binding throws "Can't create duplicate variable" and aborts the
-// rest of the group, so the extension's content side dies (TWP: `const twpI18n` in i18n.js
-// then `const startMark` in pageTranslator.js — the exact two errors reported). Viaduct's
-// own shim/polyfill survive the same double-eval purely because they declare with `var`,
-// whose re-declaration is a silent no-op.
-//
-// Do the same for the extension: demote each COLUMN-0 (top-level) `const`/`let` to `var`.
-// These are module-scoped singletons assigned once; `var` keeps them global — which they
-// MUST stay, since TWP's files share `twpI18n` / `startMark` across the group — and makes
-// the redeclaration harmless. Nothing changes on the normal single-eval path. Scoped to
-// files referenced by an isolated-world content_scripts entry (the only realm that
-// double-injects); background/popup/library files and world:"MAIN" scripts are untouched.
-//
-// Literal, line-anchored substitution, not a JS parser: only column-0 declarations match,
-// so block-scoped `const`/`let` inside functions/loops are left alone, and minified
-// bundles (everything on one line, already IIFE-wrapped) are naturally skipped. Top-level
-// `class` is left as-is — no real content-script bundle declares one bare at top level; if
-// one ever does, `var C = class {…}` needs AST work, add then.
-const TOPLEVEL_LEXICAL_RE = /^(const|let)([ \t]+[$A-Za-z_])/gm;
-
-export function idempotentContentScriptGlobals(
-  stageDir: string,
-  manifest: { content_scripts?: Array<{ js?: unknown; world?: string }> }
-): number {
-  const files = new Set<string>();
-  for (const cs of manifest.content_scripts ?? []) {
-    if (cs.world === "MAIN") continue; // page world; not re-injected into a shared isolated world
-    if (!Array.isArray(cs.js)) continue;
-    for (const j of cs.js) {
-      // Normalize like collectReferencedPaths so we hit the same on-disk file the
-      // stager wrote: "/lib/x.js", "./lib/x.js", and backslash paths all resolve.
-      if (typeof j === "string" && j) files.add(j.replace(/^\.?\//, "").replace(/\\/g, "/"));
-    }
-  }
-  let modified = 0;
-  for (const rel of files) {
-    const file = join(stageDir, rel);
-    let content: string;
-    try {
-      content = readFileSync(file, "utf-8");
-    } catch {
-      continue;
-    }
-    if (!TOPLEVEL_LEXICAL_RE.test(content)) continue;
-    TOPLEVEL_LEXICAL_RE.lastIndex = 0;
-    writeFileSync(file, content.replace(TOPLEVEL_LEXICAL_RE, "var$2"), "utf-8");
-    modified++;
-  }
-  return modified;
-}
-
-// Safari also evaluates a content-script group once per GRANTED origin pattern whose host
-// covers the page, not once per page. An extension that never asks for <all_urls> gets
-// each of its requested patterns granted individually (Safari's site-access grant writes
-// the whole requested list, host_permissions plus every content_scripts `matches`), so a
-// bundle with many path-specific matches on one host runs that many times into the same
-// world and document. Measured on Augmented Steam: 49 of its 196 patterns are on
-// *.steampowered.com, and every store page got 49 copies of each widget; granting two of
-// them gave exactly two runs. A grant of *.youtube.com plus www.youtube.com (Return
-// YouTube Dislike's) would double up the same way.
-//
-// So each content-script file records on `document` that it ran and throws at its top on
-// a repeat, which stops that one file. The repeats all land in one task (measured: 49
-// evaluations over ~420 ms, none of their zero-delay timers fired before the last), so
-// the mark clears on the next macrotask: a later, deliberate run of the same file
-// (scripting.executeScript re-injecting it, a second content_scripts entry at another
-// run_at) still runs, as in Chrome. DOM expandos are per world, so the isolated and page
-// worlds keep separate marks. Inserted after a "use strict" prologue so strictness is
-// kept, and on the first line so source-map line numbers don't move.
-const RERUN_GUARD_KEY = "__c2sRanContentScripts";
-const PROLOGUE_RE = /^(?:\s+|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(["'])use strict\1[ \t]*;?/;
-
-export function guardContentScriptReruns(
-  stageDir: string,
-  manifest: { content_scripts?: Array<{ js?: unknown }> }
-): number {
-  const files = new Set<string>();
-  for (const cs of manifest.content_scripts ?? []) {
-    if (!Array.isArray(cs.js)) continue;
-    for (const j of cs.js) {
-      if (typeof j === "string" && j) files.add(j.replace(/^\.?\//, "").replace(/\\/g, "/"));
-    }
-  }
-  let modified = 0;
-  for (const rel of files) {
-    const file = join(stageDir, rel);
-    let content: string;
-    try {
-      content = readFileSync(file, "utf-8");
-    } catch {
-      continue;
-    }
-    if (content.includes(RERUN_GUARD_KEY)) continue;
-    const k = JSON.stringify(rel);
-    const mark = `document.${RERUN_GUARD_KEY}`;
-    const guard =
-      `if(typeof document!=="undefined"){if((${mark}=${mark}||{})[${k}])` +
-      `throw new Error("Safari evaluated this content script again in the same document; the repeat is skipped");` +
-      `${mark}[${k}]=1;setTimeout(function(){try{delete ${mark}[${k}]}catch(e){}},0);}`;
-    const bom = content.startsWith("\uFEFF") ? "\uFEFF" : "";
-    const body = bom ? content.slice(1) : content;
-    const m = PROLOGUE_RE.exec(body);
-    const out = m ? body.slice(0, m[0].length) + ";" + guard + body.slice(m[0].length) : guard + body;
-    writeFileSync(file, bom + out, "utf-8");
-    modified++;
-  }
-  return modified;
-}
-
 // A template literal whose ENTIRE value is `chrome-extension://${<ext-id>}/<path>` is a
 // self-page navigation (fed to tabs.create / window.open / location=), NOT an OAuth
 // redirect_uri. rewriteChromeSchemeLiterals deliberately skips `chrome-extension://${…}`
 // to preserve redirect_uris registered with the provider — but that also skips these real
-// navigations, which then point at a scheme+host that don't exist in Safari (the scheme is
-// safari-web-extension:// and the host is a per-install UUID, not @@extension_id). Result:
+// navigations, which then point at a scheme+host that don't exist in Firefox (the scheme is
+// moz-extension:// and the host is a per-install UUID, not the add-on ID). Result:
 // Salesforce Inspector's keyboard-command page opens (data-export, options, …) land on a
-// dead chrome-extension://<bundle-id>/foo.html tab.
+// dead chrome-extension://<id>/foo.html tab.
 //
-// Rewrite them to chrome.runtime.getURL(`<path>`), which resolves to the correct Safari
-// scheme + UUID host at runtime. Safe because we ONLY match when the backtick immediately
-// precedes `chrome-extension://` (the literal IS the whole URL) and the host is an
-// extension-id expression — so an embedded redirect_uri like `…redirect_uri=${browser}-
+// Rewrite them to chrome.runtime.getURL(`<path>`), which resolves to the correct
+// moz-extension scheme + UUID host at runtime. Safe because we ONLY match when the backtick
+// immediately precedes `chrome-extension://` (the literal IS the whole URL) and the host is
+// an extension-id expression — so an embedded redirect_uri like `…redirect_uri=${browser}-
 // extension://…` inside a larger authorize URL never matches (its scheme is interpolated,
 // and it isn't at the start of the literal).
 //
@@ -762,7 +460,7 @@ export function guardContentScriptReruns(
 const SELF_PAGE_URL_RE =
   /`chrome-extension:\/\/\$\{\s*(?:(?:chrome|browser)\s*\.\s*i18n\s*\.\s*getMessage\s*\(\s*(["'])@@extension_id\1\s*\)|(?:chrome|browser)\s*\.\s*runtime\s*\.\s*id)\s*\}\/([^`]*)`/g;
 
-export function rewriteSelfPageExtensionUrls(stageDir: string): number {
+function rewriteSelfPageExtensionUrls(stageDir: string): number {
   let modified = 0;
   for (const file of walkScripts(stageDir)) {
     let content: string;
@@ -785,14 +483,14 @@ export function rewriteSelfPageExtensionUrls(stageDir: string): number {
 }
 
 // MV3 bundles decide "am I the background?" by the absence of `window`, because in Chrome
-// the background is a service worker. Safari has no offscreen documents and an unreliable
-// SW background, so the conversion turns the worker into a background PAGE — which HAS a
-// window, so the check says no and the bundle concludes it is a content script. Anything
-// keyed off that identity then misroutes silently: no error, no log, just a promise that
-// never settles. Live: Cloaked's crx-kit dispatcher opens with
-// `if (msg.to !== this.myEndpoint) return false`, and its background page reported
-// FOREGROUND — so clicking "Log in" delivered {to:"BACKGROUND", name:"openAuthUrl"} to a
-// listener that dropped it on the floor, and the popup spun forever.
+// the background is a service worker. Firefox runs the converted worker as background
+// scripts in an event page — which HAS a window, so the check says no and the bundle
+// concludes it is a content script. Anything keyed off that identity then misroutes
+// silently: no error, no log, just a promise that never settles. Cloaked's crx-kit
+// dispatcher opens with `if (msg.to !== this.myEndpoint) return false`, and with its
+// background reporting FOREGROUND, clicking "Log in" delivered
+// {to:"BACKGROUND", name:"openAuthUrl"} to a listener that dropped it on the floor, and
+// the popup spun forever.
 //
 // Only rewritten inside the files the background itself loads, and only where the check
 // directly produces a background-ish value — so a bundled library using the same idiom to
@@ -834,7 +532,7 @@ function backgroundScriptPaths(stageDir: string, manifest: Manifest): string[] {
     .filter((p) => existsSync(p));
 }
 
-export function rewriteBackgroundContextChecks(stageDir: string, manifest: Manifest): number {
+function rewriteBackgroundContextChecks(stageDir: string, manifest: Manifest): number {
   let modified = 0;
   for (const file of backgroundScriptPaths(stageDir, manifest)) {
     let content: string;
@@ -854,4 +552,23 @@ export function rewriteBackgroundContextChecks(stageDir: string, manifest: Manif
     }
   }
   return modified;
+}
+
+/**
+ * Run every source rewrite over the staged scripts, in dependency order: the
+ * runtime.id rewrites and the self-page rewrite need to see `chrome-extension://`
+ * before or around the scheme swap exactly as they do here. Returns one entry
+ * per rewrite, phrased to read as "<name> in <count> file(s)"; entries with a
+ * zero count did nothing.
+ */
+export function applySourceRewrites(stageDir: string, manifest: Manifest): Array<{ name: string; count: number }> {
+  return [
+    { name: "Rewrote runtime.id-based port matchers", count: rewriteRuntimeIdUrlMatchers(stageDir) },
+    { name: "Rewrote runtime.id-based extension-origin checks", count: rewriteExtensionOriginFromRuntimeId(stageDir) },
+    { name: "Rewrote chrome-extension: scheme literals", count: rewriteChromeSchemeLiterals(stageDir) },
+    { name: "Rewrote self-page chrome-extension: URLs to runtime.getURL", count: rewriteSelfPageExtensionUrls(stageDir) },
+    { name: "Rewrote @@extension_id placeholder URLs", count: rewriteExtensionIdPlaceholderUrls(stageDir) },
+    { name: "Corrected the background-context check", count: rewriteBackgroundContextChecks(stageDir, manifest) },
+    { name: "Guarded location.ancestorOrigins[0] reads", count: guardAncestorOriginsAccess(stageDir) },
+  ];
 }

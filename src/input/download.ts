@@ -2,6 +2,7 @@ import { get as httpsGet } from "node:https";
 import { get as httpGetPlain } from "node:http";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { ENV_PREFIX } from "../name.js";
 
 const MAX_BYTES = 100 * 1024 * 1024; // 100 MB
 const TIMEOUT_MS = 60_000; // socket IDLE timeout: no data at all for this long
@@ -43,8 +44,8 @@ export function extractStoreId(url: string): string | undefined {
 // minimum_chrome_version is newer than the version we claim gets declined with a
 // 204 and an empty body, not an error. Chrome majors move every few weeks, so any
 // value here goes stale. Ask as current-ish stable first, then retry as a version
-// nothing can gate past. Override the first claim with VIADUCT_CRX_PRODVERSION.
-const CRX_PRODVERSION = process.env.VIADUCT_CRX_PRODVERSION || "138.0";
+// nothing can gate past. Override the first claim with <ENV_PREFIX>_CRX_PRODVERSION.
+const CRX_PRODVERSION = process.env[`${ENV_PREFIX}_CRX_PRODVERSION`] || "138.0";
 const CRX_PRODVERSION_MAX = "9999.0";
 
 /** Build the clients2 CRX download endpoint (302-redirects to the real CRX). */

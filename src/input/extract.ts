@@ -1,63 +1,8 @@
-import { existsSync, readFileSync, readdirSync, statSync, lstatSync, writeFileSync, mkdirSync, openSync, readSync, closeSync, realpathSync, rmSync } from "node:fs";
-import { join, extname, resolve, sep } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync, openSync, readSync, closeSync } from "node:fs";
+import { join, extname } from "node:path";
 import { createHash } from "node:crypto";
-import { run } from "../util.js";
 import { parseJsonc } from "../manifest/manifest.js";
-
-/** Strip macOS extended attributes that break code signing. */
-export function cleanExtendedAttributes(path: string): void {
-  run("xattr", ["-cr", path]);
-}
-
-function unzipTo(zipPath: string, destDir: string): void {
-  mkdirSync(destDir, { recursive: true });
-  // ditto preserves structure and is the macOS-native extractor; fall back to unzip.
-  const r = run("ditto", ["-x", "-k", "--sequesterRsrc", zipPath, destDir]);
-  if (r.code !== 0) {
-    const u = run("unzip", ["-q", "-o", zipPath, "-d", destDir]);
-    if (u.code !== 0) {
-      throw new Error(`Failed to unzip ${zipPath}: ${r.stderr || u.stderr}`);
-    }
-  }
-  assertNoPathEscape(destDir);
-}
-
-/**
- * Guard against zip-slip. Both extractors (`ditto -x -k` and `unzip`) already
- * sanitize `../` path entries — verified: a crafted archive's `../../escape`
- * entry lands inside destDir, not the parent. So this walk's real job is the
- * SYMLINK vector: an in-tree symlink whose realpath stays inside passes a naive
- * location check yet still lets later cpSync staging follow it out of the package.
- * It also backstops any future extractor that's less strict about path entries.
- */
-function assertNoPathEscape(destDir: string): void {
-  const root = realpathSync(resolve(destDir));
-  const prefix = root.endsWith(sep) ? root : root + sep;
-  const walk = (dir: string): void => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const full = join(dir, entry.name);
-      // Reject symlinks outright. realpathSync below resolves them, so a symlink
-      // whose target is INSIDE the tree would pass the location check yet still
-      // let later cpSync staging follow the link out of the package.
-      if (entry.isSymbolicLink() || lstatSync(full).isSymbolicLink()) {
-        rmSync(destDir, { recursive: true, force: true });
-        throw new Error(`Refusing archive: contains a symlink (zip-slip risk): ${entry.name}`);
-      }
-      let real: string;
-      try {
-        real = realpathSync(full);
-      } catch {
-        continue;
-      }
-      if (real !== root && !real.startsWith(prefix)) {
-        rmSync(destDir, { recursive: true, force: true });
-        throw new Error(`Refusing archive: entry escapes extraction directory (zip-slip): ${entry.name}`);
-      }
-      if (entry.isDirectory()) walk(full);
-    }
-  };
-  walk(root);
-}
+import { extractZip } from "../zip/read.js";
 
 /** Parse a .crx (Chrome) container, returning the embedded ZIP bytes. */
 function crxToZip(crxPath: string): Buffer {
@@ -200,16 +145,10 @@ function sniffArchiveKind(path: string): "crx" | "zip" | null {
  * Returns the path to the extension root (the folder holding manifest.json).
  */
 export function extractExtension(inputPath: string, scratchDir: string): string {
-  const stat = statSync(inputPath);
-  if (stat.isDirectory()) {
-    // Don't run `xattr -cr` on the user's own source tree — it's irreversible and
-    // this path is also hit by read-only --analyze. The staged copy gets cleaned
-    // in stageExtension() instead.
-    return resolveExtensionRoot(inputPath);
-  }
+  // A directory is used in place: it's the user's own tree and is only read.
+  if (statSync(inputPath).isDirectory()) return resolveExtensionRoot(inputPath);
 
   const destDir = join(scratchDir, "extension");
-  mkdirSync(destDir, { recursive: true });
 
   // Prefer magic bytes (authoritative) over the extension (a renamed CRX/.xpi is
   // common); fall back to the suffix only when the bytes are inconclusive.
@@ -217,12 +156,9 @@ export function extractExtension(inputPath: string, scratchDir: string): string 
   const kind = sniffArchiveKind(inputPath) ?? (suffix === ".crx" ? "crx" : suffix === ".zip" || suffix === ".xpi" ? "zip" : null);
 
   if (kind === "crx") {
-    const zipBytes = crxToZip(inputPath);
-    const tmpZip = join(scratchDir, "payload.zip");
-    writeFileSync(tmpZip, zipBytes);
-    unzipTo(tmpZip, destDir);
+    extractZip(crxToZip(inputPath), destDir);
   } else if (kind === "zip") {
-    unzipTo(inputPath, destDir);
+    extractZip(readFileSync(inputPath), destDir);
   } else {
     throw new Error(`Unsupported input "${inputPath}": not a CRX or ZIP archive (or a directory).`);
   }
@@ -230,7 +166,7 @@ export function extractExtension(inputPath: string, scratchDir: string): string 
   const root = resolveExtensionRoot(destDir);
   // CWS manifests ship without `key`, so the Chrome id can't be derived from the
   // staged manifest alone. Recover it from the CRX header and inject it, so the
-  // rest of the pipeline (chrome-extension origin, runtime.id spoof) has a real id.
+  // rest of the pipeline (add-on ID, chrome-extension origin) has a real id.
   if (kind === "crx") {
     const key = crxPublicKeyBase64(inputPath);
     if (key) {
@@ -245,6 +181,6 @@ export function extractExtension(inputPath: string, scratchDir: string): string 
       } catch { /* leave manifest as-is if unreadable */ }
     }
   }
-  cleanExtendedAttributes(root);
+
   return root;
 }
