@@ -16,7 +16,7 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     if (before[key] !== undefined && after[key] === undefined) out.push(`Dropped \`${key}\` (Chrome-only).`);
   }
 
-  if (before.version !== after.version) out.push(`Version \`${before.version}\` → \`${after.version}\` (Apple format).`);
+  if (before.version !== after.version) out.push(`Version \`${before.version}\` → \`${after.version}\` (Firefox format).`);
 
   // A malformed manifest can set permissions to a non-array (a bare string,
   // an object); guard with Array.isArray so .filter()/.includes() never throw
@@ -33,49 +33,50 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     const beforeHosts = Array.isArray(before[key]) ? (before[key] as unknown[]).filter((p): p is string => typeof p === "string") : [];
     const afterHosts = new Set(Array.isArray(after[key]) ? (after[key] as string[]) : []);
     const removed = beforeHosts.filter((p) => !afterHosts.has(p));
-    if (removed.length) out.push(`Removed invalid \`${key}\` pattern(s): ${removed.map((p) => `\`${p}\``).join(", ")}.`);
+    if (removed.length) out.push(`Removed \`${key}\` pattern(s): ${removed.map((p) => `\`${p}\``).join(", ")}.`);
   }
 
-  if (before.background?.persistent !== false && after.background?.persistent === false)
-    out.push("Background made non-persistent (MV2 → Safari).");
-  if (before.background?.type === "module" && after.background?.type === undefined)
-    out.push("Stripped `background.type:\"module\"` (Safari service-worker compat).");
+  const gecko = after.browser_specific_settings?.gecko;
+  if (gecko && JSON.stringify(gecko) !== JSON.stringify(before.browser_specific_settings?.gecko)) {
+    const parts: string[] = [];
+    if (gecko.id) parts.push(`id \`${gecko.id}\``);
+    if (gecko.strict_min_version) parts.push(`strict_min_version \`${gecko.strict_min_version}\``);
+    const required = gecko.data_collection_permissions?.required;
+    if (Array.isArray(required)) parts.push(`data_collection_permissions.required \`${required.join(", ")}\``);
+    out.push(`Set \`browser_specific_settings.gecko\`${parts.length ? `: ${parts.join(", ")}` : ""}.`);
+  } else if (!gecko && before.browser_specific_settings?.gecko) {
+    out.push("Removed `browser_specific_settings.gecko` (Android-only build).");
+  }
+  if (after.browser_specific_settings?.gecko_android && !before.browser_specific_settings?.gecko_android)
+    out.push("Added `browser_specific_settings.gecko_android` (enables Firefox for Android).");
 
-  // page_action folds into the toolbar-button key valid for the manifest version:
-  // `action` on MV3, `browser_action` on MV2 (Safari rejects MV2 `action`). Report
-  // whichever one the transform actually produced.
-  if (before.page_action && !after.page_action) {
-    const foldedInto = after.action ? "action" : after.browser_action ? "browser_action" : null;
-    if (foldedInto) out.push(`Folded \`page_action\` into \`${foldedInto}\` (Safari has no page_action).`);
+  if (before.background?.service_worker && !after.background?.service_worker && Array.isArray(after.background?.scripts))
+    out.push(`Converted \`background.service_worker\` into \`background.scripts\` (Firefox event page).`);
+
+  if (before.side_panel && !after.side_panel && after.sidebar_action) {
+    const panel = after.sidebar_action.default_panel;
+    out.push(`Mapped \`side_panel\` to \`sidebar_action\`${panel ? ` → \`${panel}\`` : ""} (not opened on install).`);
   }
 
-  if (typeof before.content_security_policy === "string" && typeof after.content_security_policy === "object")
-    out.push("Wrapped string CSP into MV3 `{ extension_pages }` object.");
+  if (before.incognito === "split" && after.incognito === undefined)
+    out.push('Removed `incognito: "split"` (Firefox would fall back to not_allowed; the default is spanning).');
 
   if (Array.isArray(before.web_accessible_resources) && Array.isArray(after.web_accessible_resources)) {
-    const beforeHadStrings = (before.web_accessible_resources as unknown[]).some((e) => typeof e === "string");
-    // The transform only wraps on MV3; an untouched MV2 string list is not a change.
-    const afterHasStrings = (after.web_accessible_resources as unknown[]).some((e) => typeof e === "string");
-    if (beforeHadStrings && !afterHasStrings) out.push("Wrapped MV2 `web_accessible_resources` strings into MV3 objects.");
+    const hasDynamicUrl = (list: unknown[]) =>
+      list.some((e) => !!e && typeof e === "object" && "use_dynamic_url" in (e as Record<string, unknown>));
+    if (hasDynamicUrl(before.web_accessible_resources) && !hasDynamicUrl(after.web_accessible_resources))
+      out.push("Dropped `use_dynamic_url` from `web_accessible_resources` (unsupported in Firefox).");
   }
 
-  if (!hasSafariSettings(before) && hasSafariSettings(after))
-    out.push("Added `browser_specific_settings.safari.strict_min_version`.");
-
-  const beforePopup = actionPopup(before);
-  const afterPopup = actionPopup(after);
-  if (!beforePopup && afterPopup) out.push(`Wired toolbar popup → \`${afterPopup}\`.`);
+  // Scripts the converter put in front of the author's content scripts (the shim,
+  // the page bridge), reported once rather than per content_scripts entry.
+  const csJs = (m: Manifest): string[] =>
+    (Array.isArray(m.content_scripts) ? m.content_scripts : []).flatMap((cs) => (Array.isArray(cs?.js) ? cs.js : []));
+  const beforeJs = new Set(csJs(before));
+  const addedJs = [...new Set(csJs(after).filter((j) => !beforeJs.has(j)))];
+  if (addedJs.length) out.push(`Added ${addedJs.map((j) => `\`${j}\``).join(", ")} ahead of the content scripts.`);
 
   return out;
-}
-
-function hasSafariSettings(m: Manifest): boolean {
-  const bss = m.browser_specific_settings as { safari?: unknown } | undefined;
-  return !!bss?.safari;
-}
-
-function actionPopup(m: Manifest): string | undefined {
-  return (m.action ?? m.browser_action ?? m.page_action)?.default_popup;
 }
 
 const ORDER: Severity[] = ["error", "warning", "info"];
