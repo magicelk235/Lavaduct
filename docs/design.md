@@ -186,7 +186,7 @@ Each install's default profile comes from its `[Install<hash>] Default=` entry, 
 | `--min-safari <ver>` | `--min-firefox <ver>` |
 | `--platforms all\|macos\|ios` | `--platforms all\|desktop\|android`, default `desktop` |
 | `--ci`, `--no-build`, `--open-xcode` | dropped, there is no Xcode project |
-| `--temp-load` | `--sign temporary` |
+| `--temp-load` | `--sign temporary`; `--headless` loads it into a windowless Firefox and quits, as a CI check |
 | `--zip` | an `.xpi` is always written; `--zip` also writes the unsigned zip |
 | `--clean` | same |
 | `--install`, `--install-dir`, `--verify` | `--install`, `--profile`, `--firefox`, `--verify` |
