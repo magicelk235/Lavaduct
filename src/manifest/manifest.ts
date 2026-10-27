@@ -1,6 +1,15 @@
 import { readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import type { Manifest, Issue } from "../types.js";
+import type { Manifest, Issue, Platforms } from "../types.js";
+import { NAME } from "../name.js";
+import {
+  INSTALL_TIME_PERMISSIONS,
+  OPTIONAL_ONLY_PERMISSIONS,
+  SHIMMED_PERMISSIONS,
+  UNSUPPORTED_PERMISSIONS,
+  compareFirefoxVersions,
+} from "./compat-data.js";
+import { FIREFOX_PERMISSION_SUPPORT } from "./compat-generated.js";
 
 /**
  * Parse JSON that may carry // and /* *\/ comments or trailing commas — both are
@@ -84,7 +93,7 @@ export function loadManifest(extPath: string): Manifest {
     } catch {}
     throw new Error(
       `No manifest.json found in ${extPath}.${listing}\n` +
-        "  Point viaduct at the folder holding manifest.json, or at the .crx/.zip Chrome itself packed.",
+        `  Point ${NAME} at the folder holding manifest.json, or at the .crx/.zip Chrome itself packed.`,
     );
   }
   return parseJsonc<Manifest>(readFileSync(p, "utf-8"));
@@ -92,8 +101,8 @@ export function loadManifest(extPath: string): Manifest {
 
 /**
  * Resolve a __MSG_key__ manifest value from _locales. Chrome substitutes these
- * at load time; the converter needs the literal text to derive the app name /
- * bundle id / output dir (otherwise they become "__MSG_extName___Safari").
+ * at load time; the converter needs the literal text to derive the add-on name and
+ * output dir (otherwise they become "__MSG_extName___Firefox").
  * Lookup order: default_locale, English variants, then any locale present.
  * Message names are case-insensitive, matching Chrome. Returns the input
  * unchanged when it is not a __MSG_ reference; undefined when unresolvable.
@@ -137,7 +146,7 @@ export function resolveI18nString(value: string | undefined, extPath: string, de
  * Strict variant for the analyzer's placeholder check. Chrome substitutes manifest
  * __MSG_ placeholders ONLY from the default_locale's messages.json — it does NOT apply
  * the runtime UI-locale fallback to manifest fields. So a key present in en but missing
- * from default_locale 'de' is NOT substituted: Chrome/Safari render the literal token.
+ * from default_locale 'de' is NOT substituted: Chrome renders the literal token.
  * resolveI18nString's broad cross-locale fallback would find the 'en' value and hide
  * that, so the analyzer must resolve against default_locale only. Returns the resolved
  * message, or undefined if the key is absent from the default locale (the real error
@@ -168,355 +177,328 @@ export function resolveI18nStringStrict(value: string | undefined, extPath: stri
   return undefined;
 }
 
-// Compatibility data tables live in compat-data.ts; imported for internal use
-// and re-exported so existing importers (analyze.ts, report.ts) keep their path.
-import { UNSUPPORTED_PERMISSIONS, SHIMMED_PERMISSIONS, UNSUPPORTED_APIS } from "./compat-data.js";
-export { UNSUPPORTED_PERMISSIONS, SHIMMED_PERMISSIONS, UNSUPPORTED_APIS };
+/**
+ * strict_min_version written when --min-firefox isn't given: the current ESR, so the
+ * add-on installs on every Firefox release Mozilla still supports. Raise it at each new
+ * ESR (175 arrives on 2027-06-29).
+ */
+export const DEFAULT_MIN_FIREFOX = "153.0";
 
 /**
- * Default Safari strict_min_version when --min-safari is not passed. 15.4 is the
- * floor for Manifest V3 web extensions; bump only with a matching note in the CLI
- * help. Single source of truth — referenced by the transform default and the help
- * text so they can't drift apart.
+ * Turn a Chrome version string into one Firefox and AMO accept: one to four integers of
+ * at most nine digits, without leading zeros. Each part keeps its leading digits, and
+ * the first part with anything after them ends the version, so "1.2.3-beta.1" becomes
+ * "1.2.3" rather than a "1.2.3.1" that sorts above the final release. Oversized parts
+ * are clamped. A version with no leading number becomes "0.0.0".
  */
-export const DEFAULT_MIN_SAFARI_VERSION = "15.4";
-
-/**
- * Safari runs `world:"MAIN"` content scripts only from 18.4. Below that the entry is
- * silently ignored — no error, no injection.
- */
-export const MAIN_WORLD_MIN_SAFARI_VERSION = "18.4";
-
-/** Compare dotted version strings numerically. `cmpVersion("15.4","18.4") < 0`. */
-function cmpVersion(a: string, b: string): number {
-  const pa = String(a).split(".");
-  const pb = String(b).split(".");
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const na = Number.parseInt(pa[i] ?? "0", 10) || 0;
-    const nb = Number.parseInt(pb[i] ?? "0", 10) || 0;
-    if (na !== nb) return na - nb;
+export function toFirefoxVersion(raw: string): string {
+  const parts: string[] = [];
+  for (const part of raw.trim().split(".")) {
+    const digits = /^\d+/.exec(part)?.[0];
+    if (digits === undefined) break;
+    const n = digits.replace(/^0+(?=\d)/, "");
+    parts.push(n.length > 9 ? "999999999" : n);
+    if (digits.length < part.length || parts.length === 4) break;
   }
-  return 0;
-}
-
-/**
- * Raise the Safari floor to 18.4 when THIS CONVERSION injected a `world:"MAIN"` content
- * script that cannot run below it, returning the version it replaced (or null when
- * nothing changed). `injectedJs` names those scripts; nothing else is considered.
- *
- * Safari honors `world:"MAIN"` only from 18.4 and ignores the entry in silence below
- * that. viaduct adds such entries after the transform has already written
- * strict_min_version, so the emitted manifest claimed 15.4 while depending on 18.4
- * behavior — a compatibility claim we don't meet, showing up as a feature that never
- * runs (wirePageWorldMainInjection's page-world scripts, `d35e3ad`).
- *
- * Deliberately scoped to our own injections:
- *
- * - An entry the EXTENSION declared is the author's own compatibility claim, and the
- *   analyzer's long-standing stance on it is a warning plus "provide an ISOLATED-world
- *   fallback, or feature-detect and degrade on older Safari" (`a40114e`). Raising the
- *   floor there would refuse to install on Safari 15.4–18.3 an extension whose MAIN-world
- *   script may well be optional — trading a degraded feature for no extension at all.
- * - `page-bridge.js` is never passed here: when Safari ignores its entry the isolated-world
- *   relay injects it as a web-accessible <script> instead, so it works below 18.4 and must
- *   not cost those users the install either.
- */
-export function raiseMinVersionForMainWorld(
-  manifest: Manifest,
-  injectedJs: string[]
-): string | null {
-  const scripts = manifest.content_scripts;
-  if (!Array.isArray(scripts) || injectedJs.length === 0) return null;
-  const needsFloor = scripts.some(
-    (cs) => cs && cs.world === "MAIN" && Array.isArray(cs.js) && cs.js.some((f) => injectedJs.includes(f))
-  );
-  if (!needsFloor) return null;
-  // browser_specific_settings is Record<string, unknown> (unguarded JSON.parse output
-  // upstream), so read through it rather than asserting a shape onto it.
-  const bss = manifest.browser_specific_settings ?? {};
-  const safari = bss.safari;
-  const existing: Record<string, unknown> =
-    safari && typeof safari === "object" && !Array.isArray(safari) ? { ...safari } : {};
-  const declared = existing.strict_min_version;
-  const current = typeof declared === "string" ? declared : undefined;
-  if (current && cmpVersion(current, MAIN_WORLD_MIN_SAFARI_VERSION) >= 0) return null;
-  existing.strict_min_version = MAIN_WORLD_MIN_SAFARI_VERSION;
-  manifest.browser_specific_settings = { ...bss, safari: existing };
-  return current ?? DEFAULT_MIN_SAFARI_VERSION;
+  return parts.length ? parts.join(".") : "0.0.0";
 }
 
 export interface ManifestAnalysis {
   issues: Issue[];
   permissionsToRemove: string[];
-  needsCdpShim: boolean;
 }
 
-const MATCH_SCHEMES = new Set(["http", "https", "*", "file", "ftp"]);
+// Manifest values are parsed JSON, so a key typed as a list can hold anything.
+const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
 
 /**
- * Validate a Chrome match pattern (https://developer.chrome.com/docs/extensions/mv3/match_patterns/).
- * Chrome only warns on a bad pattern, but Safari silently drops the entire
- * content script that contains it — so a malformed entry must surface as an
- * error before conversion. Returns null when valid, else a short reason.
+ * Check a match pattern against Firefox's manifest grammar (MatchPatternRestricted in
+ * toolkit/components/extensions/schemas/manifest.json). Returns null when Firefox
+ * accepts it, else a short reason.
  */
-export function matchPatternError(pattern: string): string | null {
+function matchPatternError(pattern: string): string | null {
   if (pattern === "<all_urls>") return null;
-  const m = /^(\*|https?|file|ftp):\/\/(.*)$/.exec(pattern);
-  if (!m) return "missing or unsupported scheme (expected http/https/file/ftp/*://)";
-  const scheme = m[1];
-  if (!MATCH_SCHEMES.has(scheme)) return `unsupported scheme "${scheme}"`;
-  const rest = m[2];
-
-  // file:// is host-less, but Chrome accepts an optional "*" host placeholder
-  // before the path (e.g. "file://*/*" is extremely common). Strip a leading
-  // "*" so both "file:///path" (empty host) and "file://*/path" validate.
-  if (scheme === "file") {
-    const path = rest.startsWith("*") ? rest.slice(1) : rest;
-    return path.startsWith("/") ? null : "file:// pattern path must start with '/'";
-  }
-
-  const slash = rest.indexOf("/");
-  if (slash === -1) return "missing path (a match pattern must end with a path, e.g. '/*')";
-  const host = rest.slice(0, slash);
-  if (host === "") return "empty host";
-  // '*' alone, or '*.' prefix, are the only legal wildcard host forms.
-  if (host !== "*") {
-    const body = host.startsWith("*.") ? host.slice(2) : host;
-    if (body.includes("*")) return `host "${host}" may only use '*' as a full or leftmost-label wildcard`;
-    if (body === "") return "empty host after '*.'";
+  const m = /^([^:/]*):\/\/([^/]*)(.*)$/.exec(pattern);
+  if (!m) return "not a scheme://host/path pattern";
+  const [, scheme, host, path] = m;
+  if (!/^(?:https?|wss?|ftp|file|\*)$/.test(scheme)) return `Firefox doesn't match "${scheme}:" URLs`;
+  if (!path.startsWith("/")) return "missing path (a match pattern must end with a path, e.g. '/*')";
+  if (host === "") return scheme === "file" ? null : "empty host";
+  if (host === "*") return null;
+  const body = host.startsWith("*.") ? host.slice(2) : host;
+  if (body === "") return "empty host after '*.'";
+  if (body.includes("*")) {
+    return host.endsWith(":*")
+      ? "Firefox has no port wildcard; a pattern without a port already matches every port"
+      : `host "${host}" may only use '*' as the whole host or a leading '*.'`;
   }
   return null;
 }
 
-/**
- * Validate manifest `commands` for Safari. Chrome and Safari both expect each
- * suggested_key chord to be `Modifier+[Modifier+]Key`, but Safari is stricter:
- * - A chord with NO modifier (or only Shift) is rejected — Chrome allows a few
- *   media keys bare, Safari does not register them and the command silently has
- *   no shortcut.
- * - Safari recognizes Ctrl/Command/Alt(Option)/MacCtrl/Shift; Chrome's "Search"
- *   modifier (ChromeOS) has no Safari equivalent.
- * Reserved commands (_execute_action etc.) are allowed and skipped.
- */
-const COMMAND_MODIFIERS = new Set(["Ctrl", "Command", "Alt", "Option", "MacCtrl", "Shift"]);
-
-// suggested_key platforms Safari can actually read. Chords declared only for
-// chromeos/windows/linux are dead keys on Safari — warning about them is noise.
-const SAFARI_COMMAND_PLATFORMS = new Set(["default", "mac", "ios"]);
-
-// True when a command definition has a suggested_key chord Safari would honor — a
-// plain string (all platforms) or a per-platform map with a default/mac/ios entry.
-// These are the ones that count toward Safari's 4-shortcut limit.
-function hasSafariSuggestedKey(def: unknown): boolean {
-  const suggested = (def as { suggested_key?: unknown } | undefined)?.suggested_key;
-  if (typeof suggested === "string") return suggested.trim() !== "";
-  if (suggested && typeof suggested === "object") {
-    return Object.entries(suggested as Record<string, unknown>).some(
-      ([platform, v]) => SAFARI_COMMAND_PLATFORMS.has(platform) && typeof v === "string" && v.trim() !== ""
-    );
-  }
-  return false;
+// Firefox accepts a port in a pattern but compares it as part of the host name, so a
+// pattern with a port never matches anything.
+function portIssue(pattern: string, where: string, category: string): Issue | null {
+  const port = /^[^:/]*:\/\/[^/]*?:(\d+)\//.exec(pattern)?.[1];
+  if (port === undefined) return null;
+  return {
+    severity: "warning",
+    category,
+    message: `"${pattern}" in ${where} names port ${port}; Firefox never matches a pattern with a port.`,
+    file: "manifest.json",
+    fix: `Drop the port: "${pattern.replace(`:${port}/`, "/")}" matches every port in Firefox.`,
+  };
 }
 
-export function analyzeCommands(commands: Record<string, unknown>): Issue[] {
+// Firefox's rules for suggested_key (ShortcutUtils.validate in
+// toolkit/modules/ShortcutUtils.sys.mjs). Ctrl and Command are the same modifier there.
+const SHORTCUT_MODIFIERS: Record<string, string> = { Alt: "alt", Command: "accel", Ctrl: "accel", MacCtrl: "control", Shift: "shift" };
+const MEDIA_KEY_RE = /^(?:MediaNextTrack|MediaPlayPause|MediaPrevTrack|MediaStop)$/;
+const BASIC_KEY_RE = /^(?:[A-Z0-9]|Comma|Period|Home|End|PageUp|PageDown|Space|Insert|Delete|Up|Down|Left|Right)$/;
+const FUNCTION_KEY_RE = /^(?:F[1-9]|F1[0-2])$/;
+// Firefox validates these suggested_key platforms; chromeos, android and ios stay
+// plain strings.
+const VALIDATED_SHORTCUT_PLATFORMS = ["default", "mac", "linux", "windows"];
+
+function shortcutError(chord: string): string | null {
+  if (MEDIA_KEY_RE.test(chord.trim())) return null;
+  const parts = chord.split("+").map((s) => s.trim());
+  const key = parts.pop() ?? "";
+  const unknown = parts.find((p) => !Object.hasOwn(SHORTCUT_MODIFIERS, p));
+  if (unknown !== undefined) return `"${unknown}" isn't a modifier Firefox knows (Alt, Ctrl, Command, MacCtrl, Shift)`;
+  const mods = parts.map((p) => SHORTCUT_MODIFIERS[p]);
+  if (/^F1[3-9]$/.test(key)) return "F13 to F19 can only be assigned by the user";
+  if (mods.length === 0 && !FUNCTION_KEY_RE.test(key)) return "it needs a Ctrl, Alt, Command or MacCtrl modifier";
+  if (mods.length === 1 && mods[0] === "shift" && !FUNCTION_KEY_RE.test(key)) return "Shift alone isn't enough; add Ctrl, Alt, Command or MacCtrl";
+  if (mods.length === 2 && mods[0] === mods[1]) return "it repeats a modifier (Firefox treats Ctrl and Command as one)";
+  if (mods.length > 2) return "Firefox allows at most two modifiers";
+  if (!BASIC_KEY_RE.test(key) && !FUNCTION_KEY_RE.test(key)) return `"${key}" isn't a key Firefox accepts in a shortcut`;
+  return null;
+}
+
+// Every suggested_key chord of a command that Firefox would refuse, as
+// [platform, chord, reason]. A string suggested_key is Chrome's shorthand for "default".
+function invalidShortcuts(def: unknown): Array<[string, string, string]> {
+  const suggested = typeof def === "object" && def !== null && "suggested_key" in def ? def.suggested_key : undefined;
+  const chords: Record<string, unknown> =
+    typeof suggested === "string"
+      ? { default: suggested }
+      : typeof suggested === "object" && suggested !== null
+        ? Object.fromEntries(Object.entries(suggested))
+        : {};
+  const out: Array<[string, string, string]> = [];
+  for (const platform of VALIDATED_SHORTCUT_PLATFORMS) {
+    const chord = chords[platform];
+    if (typeof chord !== "string") continue;
+    const reason = shortcutError(chord);
+    if (reason !== null) out.push([platform, chord, reason]);
+  }
+  return out;
+}
+
+function analyzeCommands(commands: Record<string, unknown>): Issue[] {
   const issues: Issue[] = [];
   for (const [name, def] of Object.entries(commands)) {
-    const suggested = (def as { suggested_key?: unknown } | undefined)?.suggested_key;
-    if (suggested == null) continue; // undefined or null → user can still bind it manually in Safari
-    // suggested_key is either a string (all platforms) or a per-platform map.
-    const chords =
-      typeof suggested === "string"
-        ? [suggested]
-        : Object.entries(suggested as Record<string, unknown>)
-            .filter(([platform]) => SAFARI_COMMAND_PLATFORMS.has(platform))
-            .map(([, v]) => v)
-            .filter((v): v is string => typeof v === "string");
-    for (const chord of chords) {
-      const parts = chord.split("+").map((p) => p.trim());
-      const key = parts.pop();
-      const mods = parts;
-      const hasPrimaryModifier = mods.some((mo) => mo === "Ctrl" || mo === "Command" || mo === "Alt" || mo === "Option" || mo === "MacCtrl");
-      if (!key || !hasPrimaryModifier) {
-        issues.push({
-          severity: "warning",
-          category: "ui",
-          message: `commands.${name} shortcut "${chord}" lacks a Ctrl/Command/Alt modifier; Safari ignores it and the command gets no shortcut.`,
-          file: "manifest.json",
-          fix: "Use a chord like Command+Shift+Y; Safari requires a primary modifier (Shift-only is not enough).",
-        });
-      }
-      const unknownMod = mods.find((mo) => !COMMAND_MODIFIERS.has(mo));
-      if (unknownMod) {
-        issues.push({
-          severity: "warning",
-          category: "ui",
-          message: `commands.${name} uses modifier "${unknownMod}" which Safari does not support.`,
-          file: "manifest.json",
-          fix: "Use Ctrl/Command/Alt/Option/MacCtrl/Shift; ChromeOS-only modifiers (e.g. Search) have no Safari equivalent.",
-        });
-      }
+    for (const [platform, chord, reason] of invalidShortcuts(def)) {
+      issues.push({
+        severity: "warning",
+        category: "ui",
+        message: `commands.${name} shortcut "${chord}" (${platform}) isn't valid in Firefox: ${reason}. Firefox refuses a manifest with it, so the shortcut is removed.`,
+        file: "manifest.json",
+        fix: "Users can assign a shortcut in about:addons → Manage Extension Shortcuts.",
+        autoFixed: true,
+      });
     }
-  }
-
-  // Safari allows at most 4 commands with a suggested_key; a 5th makes it reject the
-  // whole manifest at load. transformManifest strips the default chord from the extras,
-  // so flag which lost it (they're still bindable manually in Safari's settings).
-  const withKeys = Object.keys(commands).filter((name) => hasSafariSuggestedKey(commands[name]));
-  if (withKeys.length > 4) {
-    const dropped = withKeys.slice(4);
-    issues.push({
-      severity: "warning",
-      category: "ui",
-      message: `${withKeys.length} commands declare a keyboard shortcut, but Safari allows only 4; dropping the default chord from: ${dropped.join(", ")}.`,
-      file: "manifest.json",
-      fix: "Safari rejects the manifest with a 5th shortcut. The extra commands keep working and can be bound by the user in Safari → Settings → Extensions.",
-      autoFixed: true,
-    });
   }
   return issues;
 }
 
-export function analyzeManifest(m: Manifest): ManifestAnalysis {
+// Manifest keys Firefox added after its first Manifest V3 release, and what an older
+// Firefox does when it meets them.
+const KEY_GATES: Array<{ since: string; applies: (m: Manifest) => boolean; message: string; category: string }> = [
+  {
+    since: "112",
+    applies: (m) => m.background?.type === "module",
+    message: 'background.type: "module" needs Firefox 112; older releases don\'t load module background scripts.',
+    category: "background",
+  },
+  {
+    since: "127",
+    applies: (m) => (m.manifest_version ?? 2) >= 3 && strings(m.host_permissions).length > 0,
+    message: "host_permissions are granted at install only from Firefox 127; older releases leave them off until the user allows each site.",
+    category: "permission",
+  },
+  {
+    since: "128",
+    applies: (m) => strings(m.optional_host_permissions).length > 0,
+    message: "optional_host_permissions needs Firefox 128; older releases ignore the key, so permissions.request() for those sites fails.",
+    category: "permission",
+  },
+  {
+    since: "154",
+    applies: (m) => strings(m.sandbox?.pages).length > 0,
+    message: "sandbox pages need Firefox 154; older releases load them as ordinary extension pages, where eval() and inline scripts are blocked.",
+    category: "manifest",
+  },
+];
+
+export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): ManifestAnalysis {
   const issues: Issue[] = [];
   const permissionsToRemove: string[] = [];
-  const allPerms = [
-    ...(Array.isArray(m.permissions) ? m.permissions : []),
-    ...(Array.isArray(m.optional_permissions) ? m.optional_permissions : []),
-  ];
+  const before = (version: string) => compareFirefoxVersions(opts.minFirefox, version) < 0;
+  const mv = m.manifest_version ?? 2;
+  const required = strings(m.permissions);
+  const optional = strings(m.optional_permissions);
 
-  // Bad match patterns make Safari silently drop the whole content script.
-  // Guard against a malformed manifest where these aren't arrays/strings — Chrome
-  // rejects such a manifest, but the converter must report rather than crash.
+  // Firefox validates content-script patterns strictly: one it can't parse makes it
+  // refuse the whole manifest.
   const contentScripts = Array.isArray(m.content_scripts) ? m.content_scripts : [];
   contentScripts.forEach((cs, i) => {
-    const matches = Array.isArray(cs?.matches) ? cs.matches : [];
-    for (const pat of matches) {
-      if (typeof pat !== "string") continue;
-      const err = matchPatternError(pat);
-      if (err) {
+    if (typeof cs !== "object" || cs === null) return;
+    const lists: Array<[string, unknown]> = [
+      ["matches", cs.matches],
+      ["exclude_matches", "exclude_matches" in cs ? cs.exclude_matches : undefined],
+    ];
+    for (const [key, list] of lists) {
+      for (const pat of strings(list)) {
+        const err = matchPatternError(pat);
+        if (err === null) {
+          const port = portIssue(pat, `content_scripts[${i}].${key}`, "content_scripts");
+          if (port) issues.push(port);
+          continue;
+        }
         issues.push({
           severity: "error",
           category: "content_scripts",
-          message: `Invalid match pattern "${pat}" in content_scripts[${i}]: ${err}.`,
+          message: `Invalid match pattern "${pat}" in content_scripts[${i}].${key}: ${err}. Firefox refuses to load a manifest with it.`,
           file: "manifest.json",
-          fix: "Safari drops the entire content script for one bad pattern; correct or remove it.",
+          fix: "Correct the pattern or remove it.",
         });
       }
     }
-    // world:"MAIN" injects into the page's JS context. Safari only added support in
-    // 18.4; on earlier versions the script silently does not run, and it never has
-    // access to chrome.* — a common source of "works in Chrome, dead in Safari".
-    if (cs?.world === "MAIN") {
+    if (cs.world === "MAIN" && before("128")) {
       issues.push({
         severity: "warning",
         category: "content_scripts",
-        message: `content_scripts[${i}] uses world:"MAIN"; supported only on Safari 18.4+ and has no chrome.* access.`,
+        message: `content_scripts[${i}] uses world: "MAIN", which Firefox supports from 128; older releases run it in the isolated world, where it can't reach the page's own scripts.`,
         file: "manifest.json",
-        fix: "Provide an ISOLATED-world fallback, or feature-detect and degrade on older Safari.",
+        fix: "Raise --min-firefox to 128 or later.",
       });
     }
   });
 
-  // Same "Safari silently drops a malformed pattern" failure mode as content-script
-  // matches, but for host access: a bad host_permission grants NO host access in
-  // Safari with no error. Unlike content-script matches this is auto-fixable:
-  // some patterns here are valid CHROME manifests (ws://\wss:// for webRequest
-  // websocket interception — MetaMask ships them) that Safari simply can't grant,
-  // so transformManifest drops the invalid entries and the valid rest keeps
-  // working. Removal is behavior-identical to what Safari would do anyway.
+  // Firefox drops host patterns it can't parse with a warning; the transform removes
+  // them so the manifest says what Firefox actually grants.
   for (const key of ["host_permissions", "optional_host_permissions"] as const) {
-    const hosts = Array.isArray(m[key]) ? (m[key] as unknown[]) : [];
-    for (const pat of hosts) {
-      if (typeof pat !== "string") continue;
+    for (const pat of strings(m[key])) {
       const err = matchPatternError(pat);
-      if (err) {
-        issues.push({
-          severity: "warning",
-          category: "permission",
-          message: `Invalid match pattern "${pat}" in ${key} will be removed: ${err}.`,
-          file: "manifest.json",
-          fix: "Safari grants no host access for this pattern (Chrome-only schemes like ws:// cannot be granted); the converter drops it so the remaining patterns still apply.",
-          autoFixed: true,
-        });
+      if (err === null) {
+        const port = portIssue(pat, key, "permission");
+        if (port) issues.push(port);
+        continue;
       }
+      issues.push({
+        severity: "warning",
+        category: "permission",
+        message: `Invalid match pattern "${pat}" in ${key} will be removed: ${err}.`,
+        file: "manifest.json",
+        fix: "Firefox grants no access through this pattern; the remaining patterns still apply.",
+        autoFixed: true,
+      });
     }
   }
 
-  // Set-dedupe: a permission listed in BOTH permissions and optional_permissions
-  // would otherwise produce two identical issues.
-  for (const perm of new Set(allPerms)) {
-    if (perm in UNSUPPORTED_PERMISSIONS) {
+  for (const perm of new Set([...required, ...optional])) {
+    if (perm === "<all_urls>" || perm.includes("://") || !Object.hasOwn(FIREFOX_PERMISSION_SUPPORT, perm)) continue;
+    const since = FIREFOX_PERMISSION_SUPPORT[perm];
+    if (since === null) {
       const shimmed = SHIMMED_PERMISSIONS.has(perm);
       issues.push({
-        // A shimmed permission's capability still works (the shim emulates the API),
-        // so it's informational, not a warning — matching the severity the same
-        // capability gets in UNSUPPORTED_APIS. Telling authors a working feature
-        // "will be removed" at warning level is the over-flagging the project guards
-        // against. Only a genuinely-dropped (unshimmed) permission stays a warning.
         severity: shimmed ? "info" : "warning",
         category: "permission",
         message: shimmed
-          ? `Permission "${perm}" is removed (Safari rejects it), but the shim emulates the API so it keeps working.`
-          : `Unsupported permission "${perm}" will be removed.`,
+          ? `Permission "${perm}" is removed (Firefox doesn't know it), but the shim keeps the feature working.`
+          : `Unsupported permission "${perm}" will be removed; Firefox doesn't have it.`,
         file: "manifest.json",
         fix: UNSUPPORTED_PERMISSIONS[perm],
         autoFixed: true,
-        shimmed,
+        ...(shimmed ? { shimmed: true } : {}),
       });
       permissionsToRemove.push(perm);
+    } else if (before(since)) {
+      issues.push({
+        severity: "warning",
+        category: "permission",
+        message: `Permission "${perm}" needs Firefox ${since}; older releases ignore it, so its API is missing there.`,
+        file: "manifest.json",
+        fix: `Raise --min-firefox to ${since}, or feature-detect the API.`,
+      });
     }
   }
 
-  // Under MV3, URL match patterns belong in host_permissions, not permissions.
-  // A pattern left in permissions is legal MV2 but SILENTLY IGNORED under MV3 —
-  // Safari (and Chrome MV3) grant no host access, so the extension "works in the
-  // old build, breaks after migration". Flag each misplaced entry; it's a likely
-  // bug the converter won't auto-move (intent is ambiguous).
-  if ((m.manifest_version ?? 2) === 3) {
-    const fields: Array<["permissions" | "optional_permissions", "host_permissions" | "optional_host_permissions"]> = [
-      ["permissions", "host_permissions"],
-      ["optional_permissions", "optional_host_permissions"],
-    ];
-    for (const [src, dest] of fields) {
-      const declared = Array.isArray(m[src]) ? (m[src] as unknown[]) : [];
-      for (const perm of declared) {
-        if (typeof perm !== "string") continue;
-        const looksLikeHost = perm === "<all_urls>" || perm.includes("://");
-        if (looksLikeHost && !(perm in UNSUPPORTED_PERMISSIONS)) {
-          // A host pattern whose scheme Safari can't parse (chrome://favicon/, ws://…)
-          // isn't merely ignored — Safari rejects the whole manifest and the extension
-          // never loads. transformManifest drops these, so report it as auto-fixed
-          // rather than telling the author to move a value Safari can't grant anywhere.
-          if (perm !== "<all_urls>" && matchPatternError(perm) !== null) {
-            issues.push({
-              severity: "warning",
-              category: "permission",
-              message: `"${perm}" in "${src}" uses a scheme Safari can't parse; left in place Safari rejects the whole manifest and won't load the extension. It will be removed.`,
-              file: "manifest.json",
-              fix: `Chrome-only schemes have no Safari equivalent and can't be granted in "${dest}" either, so the entry is dropped.`,
-              autoFixed: true,
-            });
-          } else {
-            issues.push({
-              severity: "warning",
-              category: "permission",
-              message: `"${perm}" is a host match pattern in "${src}"; under MV3 it is ignored and grants no host access.`,
-              file: "manifest.json",
-              fix: `Move it into "${dest}" (MV3 requires URL patterns there, not in "${src}").`,
-            });
-          }
-        }
+  for (const perm of optional) {
+    if (INSTALL_TIME_PERMISSIONS[perm] !== true || required.includes(perm)) continue;
+    issues.push({
+      severity: "warning",
+      category: "permission",
+      message: `Optional permission "${perm}" moves to permissions: Firefox grants it at install without a prompt and ignores it in optional_permissions.`,
+      file: "manifest.json",
+      fix: `permissions.request() for "${perm}" throws in Firefox; it is already granted, so check it with permissions.contains() first.`,
+      autoFixed: true,
+    });
+  }
+  for (const perm of required) {
+    if (OPTIONAL_ONLY_PERMISSIONS[perm] !== true) continue;
+    issues.push({
+      severity: "warning",
+      category: "permission",
+      message: `Permission "${perm}" moves to optional_permissions: Firefox only grants it at runtime, so chrome.${perm} stays unavailable until the user allows it.`,
+      file: "manifest.json",
+      fix: `Call permissions.request({ permissions: ["${perm}"] }) on its own from a user action, or have users allow it in about:addons.`,
+      autoFixed: true,
+    });
+  }
+
+  // Host patterns among the API permissions. Firefox can't grant one it can't parse,
+  // and Manifest V3 ignores host patterns in `permissions` (they belong in
+  // host_permissions). Firefox does accept origins in optional_permissions.
+  for (const key of ["permissions", "optional_permissions"] as const) {
+    for (const perm of strings(m[key])) {
+      if (perm !== "<all_urls>" && !perm.includes("://")) continue;
+      const err = matchPatternError(perm);
+      if (err !== null) {
+        const favicon = perm.startsWith("chrome://favicon");
+        issues.push({
+          severity: favicon ? "info" : "warning",
+          category: "permission",
+          message: `"${perm}" in ${key} isn't a pattern Firefox can grant (${err}); it will be removed.`,
+          file: "manifest.json",
+          fix: favicon ? "The shim serves chrome://favicon/ URLs itself." : "Firefox has no equivalent for this scheme.",
+          autoFixed: true,
+          ...(favicon ? { shimmed: true } : {}),
+        });
+      } else if (mv >= 3 && key === "permissions") {
+        issues.push({
+          severity: "warning",
+          category: "permission",
+          message: `"${perm}" is a host match pattern in "permissions"; under MV3 it is ignored and grants no host access.`,
+          file: "manifest.json",
+          fix: 'Move it into "host_permissions" (MV3 requires URL patterns there).',
+        });
+      } else {
+        const port = portIssue(perm, key, "permission");
+        if (port) issues.push(port);
       }
     }
   }
 
-  if (!m.description || (typeof m.description === "string" && !m.description.trim())) {
+  for (const gate of KEY_GATES) {
+    if (!gate.applies(m) || !before(gate.since)) continue;
     issues.push({
-      severity: "info",
-      category: "manifest",
-      message: "No description in the manifest; the App Store requires one for submission.",
+      severity: "warning",
+      category: gate.category,
+      message: gate.message,
       file: "manifest.json",
-      fix: "Add a short description; Safari shows it in Settings → Extensions and the App Store needs it.",
+      fix: `Raise --min-firefox to ${gate.since} or later.`,
     });
   }
 
@@ -524,100 +506,61 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     issues.push({
       severity: "info",
       category: "manifest",
-      message: "key (Chrome CRX packing identity) has no meaning for Safari; removing.",
+      message: "key (Chrome's packing key) means nothing to Firefox; removing it.",
       file: "manifest.json",
-      fix: "Safari derives extension identity from the bundle id; the key field is dropped.",
+      fix: "The add-on's identity comes from browser_specific_settings.gecko.id.",
       autoFixed: true,
     });
   }
-
   if (m.update_url) {
     issues.push({
       severity: "info",
       category: "manifest",
-      message: "update_url is ignored by Safari (no auto-update from a manifest URL); kept in the manifest.",
+      message: "update_url points at Chrome's update service; removing it.",
       file: "manifest.json",
-      fix: "The extension no longer updates itself, but the field stays because self-hosted bundles read it back at runtime.",
+      fix: "Firefox updates the add-on from AMO, or from browser_specific_settings.gecko.update_url when it is self-hosted.",
+      autoFixed: true,
     });
   }
-  if (!m.version || (typeof m.version === "string" && !m.version.trim())) {
+  if (m.minimum_chrome_version) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "minimum_chrome_version means nothing to Firefox; removing it (gecko.strict_min_version takes its place).",
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
+  const rawVersion = typeof m.version === "string" ? m.version.trim() : "";
+  const version = toFirefoxVersion(rawVersion);
+  if (!rawVersion) {
     issues.push({
       severity: "warning",
       category: "manifest",
-      message: "No version in the manifest; Apple requires a CFBundleShortVersionString and the build will fail.",
+      message: 'No version in the manifest; the add-on is packed as "0.0.0" unless --addon-version is given.',
       file: "manifest.json",
       fix: 'Add a numeric "version" (e.g. "1.0.0") to the manifest.',
+      autoFixed: true,
     });
-  } else if (typeof m.version === "string") {
-    // Apple's CFBundleShortVersionString (like Chrome) needs dot-separated
-    // non-negative integers, each 0–65535. A part like "beta" or "1-rc1" loads
-    // in Chrome from an unpacked dir but fails the Xcode build with an opaque
-    // error, so surface it up front.
-    // Mirror transformManifest's actual rewrite: it keeps leading numeric parts,
-    // clamps each to 65535, stops at the first non-numeric part, and caps at 3. So a
-    // non-numeric part only changes the shipped version if it's within the first 3
-    // (transform cuts it); a >65535 part is silently clamped, not a build failure;
-    // and parts past the 3rd are dropped. Warn for what actually changes, not for a
-    // part that gets truncated away anyway — the old check flagged discarded parts and
-    // wrongly claimed the build would fail.
-    const parts = m.version.split(".");
-    const shipped = parts.slice(0, 3);
-    const cutPart = shipped.find((p) => !/^\d+$/.test(p));
-    if (cutPart !== undefined) {
-      issues.push({
-        severity: "warning",
-        category: "manifest",
-        message: `version "${m.version}" has a non-numeric part ("${cutPart}"); Apple requires integer parts, so the version is truncated at the first non-numeric part (becoming "${shipped.slice(0, shipped.indexOf(cutPart)).map((p) => String(Math.min(Number(p), 65535))).join(".") || "1.0.0"}").`,
-        file: "manifest.json",
-        fix: 'Use a numeric dotted version like "1.2.3" (no suffixes such as -rc1 or +build).',
-        autoFixed: true,
-      });
-    } else if (parts.length > 3 || shipped.some((p) => Number(p) > 65535)) {
-      issues.push({
-        severity: "info",
-        category: "manifest",
-        message: `version "${m.version}" exceeds Apple's CFBundleShortVersionString limits (3 parts, each ≤65535); truncating/clamping.`,
-        file: "manifest.json",
-        autoFixed: true,
-      });
-    }
-  }
-
-  // Only the extension_pages policy governs the extension's own pages/SW; the
-  // sandbox policy intentionally relaxes rules for sandboxed iframes, so scanning
-  // it for "remote script-src" would false-flag legitimate sandbox allowances.
-  // A bare string is the MV2 form, which maps to extension_pages.
-  const cspObj = m.content_security_policy;
-  // A malformed-but-parseable manifest can set extension_pages to a non-string
-  // (object/number/array); coerce anything that isn't a string to "" so the
-  // .includes()/.matchAll() below can't throw and abort the analyzer.
-  const csp =
-    typeof cspObj === "string"
-      ? cspObj
-      : typeof cspObj?.extension_pages === "string"
-        ? cspObj.extension_pages
-        : "";
-  // Match the standalone 'unsafe-eval' token, not the substring inside the
-  // distinct, valid 'wasm-unsafe-eval' keyword (WebAssembly compilation, which
-  // Safari supports and which does NOT enable eval()).
-  if (/(?:^|[\s;'"])unsafe-eval(?:[\s;'"]|$)/.test(csp)) {
+  } else if (version !== rawVersion) {
     issues.push({
-      severity: "warning",
+      severity: /^[\d.]+$/.test(rawVersion) ? "info" : "warning",
       category: "manifest",
-      message: "CSP allows 'unsafe-eval'; Safari rejects eval in extension contexts regardless.",
+      message: `version "${rawVersion}" isn't a Firefox version (one to four integers of up to nine digits, no leading zeros); it is packed as "${version}".`,
       file: "manifest.json",
-      fix: "Remove eval()/new Function usage; precompile templates or use JSON.parse.",
+      fix: 'Use a numeric dotted version like "1.2.3", or pass --addon-version.',
+      autoFixed: true,
     });
   }
 
-  // A script-src/script-src-elem directive that whitelists a remote origin (a
-  // hosted CDN, etc.) means the extension loads code from the network. Safari
-  // forbids remote script in extension pages and the App Store review rejects it.
-  const scriptSrc = /(?:^|;)\s*script-src(?:-elem)?\s+([^;]+)/gi;
+  // Only extension_pages governs the extension's own pages; the sandbox policy relaxes
+  // rules on purpose. A bare string is the MV2 form.
+  const cspObj = m.content_security_policy;
+  const csp = typeof cspObj === "string" ? cspObj : typeof cspObj?.extension_pages === "string" ? cspObj.extension_pages : "";
   const remoteSrc = new Set<string>();
-  for (const dm of csp.matchAll(scriptSrc)) {
+  for (const dm of csp.matchAll(/(?:^|;)\s*script-src(?:-elem)?\s+([^;]+)/gi)) {
     for (const token of dm[1].trim().split(/\s+/)) {
-      // A bare "*" (or scheme-wildcard like https://*) whitelists the whole network.
       if (token === "*" || /^(https?:|\/\/|wss?:|\*:)/i.test(token) || /^(?:\*\.)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?$/i.test(token)) {
         remoteSrc.add(token);
       }
@@ -627,192 +570,125 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
     issues.push({
       severity: "warning",
       category: "manifest",
-      message: `CSP script-src allows remote origin(s) (${[...remoteSrc].join(", ")}); Safari blocks remote scripts and the App Store rejects them.`,
+      message: `CSP script-src allows remote origin(s) (${[...remoteSrc].join(", ")}); Firefox refuses remote scripts in Manifest V3, and AMO's policies forbid loading remote code.`,
       file: "manifest.json",
-      fix: "Bundle the script into the extension and load it locally; remove remote script-src entries.",
+      fix: "Bundle the script into the extension and load it locally.",
     });
   }
 
-  if (m.minimum_chrome_version) {
+  const bg = m.background;
+  if (bg && typeof bg === "object" && typeof bg.service_worker === "string" && !Array.isArray(bg.scripts) && !bg.page) {
     issues.push({
       severity: "info",
-      category: "manifest",
-      message: "minimum_chrome_version is meaningless for Safari; removing.",
-      file: "manifest.json",
-      autoFixed: true,
-    });
-  }
-
-  const mv = m.manifest_version ?? 2;
-  if (mv === 2 && m.background && m.background.persistent !== false) {
-    issues.push({
-      severity: "warning",
       category: "background",
-      message: "MV2 persistent background is unsupported; setting persistent:false.",
+      message: `Firefox has no extension service workers; background.service_worker "${bg.service_worker}" runs as a background script (an event page) instead.`,
       file: "manifest.json",
-      fix: "Prefer migrating to an MV3 service worker.",
+      fix: "Event pages have a DOM and a window, so code that tests for a worker context may take a different branch.",
       autoFixed: true,
     });
   }
 
-  if (mv === 3 && m.background?.type === "module") {
-    issues.push({
-      severity: "warning",
-      category: "background",
-      message: 'background.type:"module" causes silent popup failures on Safari/TestFlight.',
-      file: "manifest.json",
-      fix: "Removing type:module (use --keep-module to preserve).",
-      autoFixed: true,
-    });
-  }
-
-  const action = m.action ?? m.browser_action ?? m.page_action;
-  if (!action?.default_popup) {
+  if (m.side_panel !== undefined) {
+    const sp = m.side_panel;
+    const panel = typeof sp?.default_path === "string" ? sp.default_path : "";
     issues.push({
       severity: "info",
       category: "ui",
-      message: "Action has no default_popup; a toolbar button with no behavior is inert in Safari.",
+      message: m.sidebar_action
+        ? "side_panel is removed; the manifest's own sidebar_action stays as Firefox's sidebar."
+        : panel
+          ? `side_panel becomes Firefox's sidebar (sidebar_action showing "${panel}"), which stays closed until the user opens it.`
+          : "side_panel has no default_path, so no sidebar is declared; chrome.sidePanel.open() falls back to a popup window.",
       file: "manifest.json",
-      fix: "Wiring a detected popup/sidepanel page, or (if the background handles action.onClicked) an onClicked bridge, so the button works.",
+      fix: "Firefox opens the sidebar only from a user action, so sidePanel.open() outside one is refused.",
       autoFixed: true,
     });
   }
 
-  // web_accessible_resources.use_dynamic_url is a Chrome-only feature (rotates the
-  // resource URL per session). Safari does not implement it: an entry carrying
-  // use_dynamic_url:true fails to serve, so chrome.runtime.getURL() hands back a
-  // URL Safari refuses to load. A content script that injects a stylesheet/asset
-  // this way (e.g. a shadow-DOM sidebar's CSS) then renders unstyled and stays
-  // invisible — a silent "the popup/panel never shows". Strip the flag so the
-  // resource loads at its stable static extension URL.
-  const dynamicUrlWar = (Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []).some(
-    (e) => typeof e === "object" && e !== null && "use_dynamic_url" in e && e.use_dynamic_url === true,
-  );
-  if (dynamicUrlWar) {
-    issues.push({
-      severity: "warning",
-      category: "resources",
-      message: "web_accessible_resources use_dynamic_url is unsupported in Safari; getURL() returns an unservable URL and the resource silently fails to load.",
-      file: "manifest.json",
-      fix: "Clearing use_dynamic_url (set false) so the resource loads at its static extension URL.",
-      autoFixed: true,
-    });
-  }
-
-  if (m.externally_connectable?.ids?.length) {
+  if (m.incognito === "split") {
     issues.push({
       severity: "warning",
       category: "manifest",
-      message: "externally_connectable by extension IDs is unsupported in Safari.",
+      message: 'incognito: "split" isn\'t supported in Firefox, which would fall back to "not_allowed"; the key is removed so the add-on also runs in private windows the user allows it in.',
       file: "manifest.json",
-      fix: "Use matches for web-page messaging; ID-based connections will not resolve.",
+      fix: "Firefox shares one background between normal and private windows (spanning); keep private-window state apart in code if it matters.",
+      autoFixed: true,
     });
   }
 
-  if (allPerms.includes("storage")) {
+  const war: unknown[] = Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : [];
+  if (war.some((e) => typeof e === "object" && e !== null && "use_dynamic_url" in e)) {
     issues.push({
       severity: "info",
-      category: "storage",
-      message: "storage.sync does NOT sync across iCloud devices in Safari (maps to local).",
+      category: "resources",
+      message: "web_accessible_resources use_dynamic_url is Chrome-only; it is removed, and the resources load from their regular moz-extension:// URL.",
       file: "manifest.json",
-      fix: "Shim routes sync→local; implement custom cloud sync if cross-device is required.",
+      fix: "Firefox already gives every install its own random moz-extension:// host.",
+      autoFixed: true,
     });
   }
 
-  // Surfaced from the permission too (not just JS) because native-messaging calls
-  // are often in minified bundles the source scanner attributes imprecisely.
-  if (allPerms.includes("nativeMessaging")) {
+  const ec = m.externally_connectable;
+  if (strings(ec?.matches).length > 0) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage and connect calls.",
+      file: "manifest.json",
+      fix: "Re-test sign-in and site integrations; --no-oauth-bridge turns the bridge off.",
+      shimmed: true,
+    });
+  }
+  const ids = strings(ec?.ids).filter((id) => id !== "*");
+  if (ids.length > 0) {
+    issues.push({
+      severity: "warning",
+      category: "manifest",
+      message: `externally_connectable.ids lists Chrome extension IDs (${ids.join(", ")}); those extensions have other IDs in Firefox, and any add-on may message this one.`,
+      file: "manifest.json",
+      fix: "Check senders against their Firefox add-on IDs instead.",
+    });
+  }
+
+  if (required.includes("nativeMessaging") || optional.includes("nativeMessaging")) {
     issues.push({
       severity: "warning",
       category: "permission",
-      message: "nativeMessaging works differently in Safari: there is no native-messaging-hosts manifest or host binary.",
+      message: "nativeMessaging needs the native app registered for Firefox: Firefox reads host manifests from its own locations, and they must list this add-on's ID in allowed_extensions instead of a chrome-extension:// origin.",
       file: "manifest.json",
-      fix: "Route messages to the containing macOS app's SafariWebExtensionHandler (beginRequest); the permission stays but the host model changes.",
+      fix: "Ask the app's vendor for Firefox support, or install a Firefox host manifest that names this add-on's ID.",
     });
   }
 
-  if (m.commands && Object.keys(m.commands).length > 0) {
-    issues.push({
-      severity: "info",
-      category: "ui",
-      message: "Keyboard commands are only partially supported in Safari; some chords are unavailable.",
-      file: "manifest.json",
-      fix: "Verify each shortcut in Safari → Settings → Extensions; provide an in-UI fallback.",
-    });
-    for (const issue of analyzeCommands(m.commands)) issues.push(issue);
-  }
+  if (m.commands && typeof m.commands === "object") issues.push(...analyzeCommands(m.commands));
 
-  if (m.chrome_url_overrides?.newtab) {
-    issues.push({
-      severity: "warning",
-      category: "ui",
-      message: "chrome_url_overrides.newtab has gaps in Safari and behaves inconsistently per platform.",
-      file: "manifest.json",
-      fix: "Test the new-tab override on macOS and iOS; consider dropping it if unreliable.",
-    });
-  }
-  for (const k of Object.keys(m.chrome_url_overrides ?? {})) {
-    if (k !== "newtab") {
+  const overrides = m.chrome_url_overrides;
+  if (overrides && typeof overrides === "object") {
+    for (const k of Object.keys(overrides)) {
+      if (k === "newtab") continue;
       issues.push({
         severity: "warning",
         category: "ui",
-        message: `chrome_url_overrides.${k} is not supported in Safari.`,
+        message: `chrome_url_overrides.${k} isn't supported in Firefox, which only lets add-ons replace the new tab page.`,
         file: "manifest.json",
-        fix: "Remove the override; Safari only partially honors newtab.",
+        fix: "Open the page from the toolbar button or a menu instead.",
       });
     }
   }
 
-  if (m.devtools_page) {
-    issues.push({
-      severity: "warning",
-      category: "ui",
-      message: "devtools_page panels use a different surface in Safari (Web Inspector Extensions).",
-      file: "manifest.json",
-      fix: "Reimplement DevTools panels via Safari Web Inspector extension APIs, or drop.",
-    });
-  }
-
-  // Under MV3 a host pattern in `permissions` grants NO access (flagged separately as
-  // misplaced above), so don't also count it as "broad host access" — that's the exact
-  // contradiction. Only MV2 puts host patterns in `permissions` legitimately.
-  const hosts = [
-    ...(Array.isArray(m.host_permissions) ? m.host_permissions : []),
-    ...((m.manifest_version ?? 2) < 3 && Array.isArray(m.permissions) ? m.permissions : []),
-  ];
-  if (hosts.some((h) => h === "<all_urls>" || h === "*://*/*" || h === "http://*/*" || h === "https://*/*")) {
-    issues.push({
-      severity: "info",
-      category: "permission",
-      message: "Broad host access (<all_urls>): Safari asks the user per-site and defaults to 'Ask'.",
-      file: "manifest.json",
-      fix: "Expect degraded behavior until the user grants access; handle permission denials gracefully.",
-    });
-  }
-
-  if (!m.icons || Object.keys(m.icons).length === 0) {
+  const icons = m.icons;
+  if (!icons || typeof icons !== "object" || Object.keys(icons).length === 0) {
     issues.push({
       severity: "info",
       category: "ui",
-      message: "No icons in the manifest; synthesizing a solid-color placeholder set (48/128/256/512px).",
+      message: "No icons in the manifest; a placeholder icon set is generated.",
       file: "manifest.json",
-      fix: "Replace with real PNG icons for production; the placeholder only avoids a blank toolbar glyph.",
+      fix: "Replace it with real icons for production.",
       autoFixed: true,
     });
   }
 
-  if (m.incognito) {
-    issues.push({
-      severity: "info",
-      category: "manifest",
-      message: `incognito:"${m.incognito}" maps to Safari Private Browsing (off by default; user opts in per extension).`,
-      file: "manifest.json",
-      fix: "Don't rely on split-process isolation; assume spanning-like and re-test state separation.",
-    });
-  }
-
-  const needsCdpShim = allPerms.includes("debugger");
-  return { issues, permissionsToRemove, needsCdpShim };
+  return { issues, permissionsToRemove };
 }
 
 /**
@@ -822,7 +698,7 @@ export function analyzeManifest(m: Manifest): ManifestAnalysis {
  * (containing '*') are skipped — only literal paths are returned. Used by the
  * stager so a declared resource is never dropped as "dev cruft" (e.g. a
  * web-accessible LICENSE.txt or a .map served to a page), which would 404 at
- * runtime in Safari.
+ * runtime.
  */
 export function collectReferencedPaths(m: Manifest): Set<string> {
   const paths = new Set<string>();
@@ -836,16 +712,17 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
   };
   const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 
-  for (const cs of arr(m.content_scripts) as Array<{ js?: unknown; css?: unknown }>) {
-    for (const j of arr(cs?.js)) add(j);
-    for (const c of arr(cs?.css)) add(c);
+  for (const cs of arr(m.content_scripts)) {
+    if (typeof cs !== "object" || cs === null) continue;
+    if ("js" in cs) for (const j of arr(cs.js)) add(j);
+    if ("css" in cs) for (const c of arr(cs.css)) add(c);
   }
   for (const b of arr(m.background?.scripts)) add(b);
   add(m.background?.service_worker);
   add(m.background?.page);
   for (const a of [m.action, m.browser_action, m.page_action]) {
-    add((a as { default_popup?: unknown } | undefined)?.default_popup);
-    const di = (a as { default_icon?: unknown } | undefined)?.default_icon;
+    add(a?.default_popup);
+    const di = a?.default_icon;
     if (typeof di === "string") add(di);
     else if (di && typeof di === "object") for (const p of Object.values(di)) add(p);
   }
@@ -855,398 +732,165 @@ export function collectReferencedPaths(m: Manifest): Set<string> {
   add(m.devtools_page);
   for (const p of Object.values(m.chrome_url_overrides ?? {})) add(p);
   for (const p of arr(m.sandbox?.pages)) add(p);
-  for (const r of arr(m.declarative_net_request?.rule_resources) as Array<{ path?: unknown }>) add(r?.path);
-  // side_panel.default_path: the shim opens this page at runtime (see shim.ts),
-  // so a miss here drops the panel HTML and open() 404s in Safari.
-  add((m as { side_panel?: { default_path?: unknown } }).side_panel?.default_path);
-  add((m as { sidebar_action?: { default_panel?: unknown } }).sidebar_action?.default_panel);
-  add((m as { storage?: { managed_schema?: unknown } }).storage?.managed_schema);
+  for (const r of arr(m.declarative_net_request?.rule_resources)) {
+    if (typeof r === "object" && r !== null && "path" in r) add(r.path);
+  }
+  // side_panel.default_path becomes the Firefox sidebar page, so a miss here leaves an
+  // empty sidebar.
+  add(m.side_panel?.default_path);
+  add(m.sidebar_action?.default_panel);
+  const storage = m.storage;
+  if (typeof storage === "object" && storage !== null && "managed_schema" in storage) add(storage.managed_schema);
 
   // web_accessible_resources: MV2 string[], MV3 [{resources: string[]}], or a bare
-  // string (invalid but hand-edited manifests produce it — transformManifest wraps
-  // it, so stage it here too or the referenced file is dropped).
+  // string (invalid, but hand-edited manifests produce it).
   if (typeof m.web_accessible_resources === "string") add(m.web_accessible_resources);
   for (const entry of arr(m.web_accessible_resources)) {
     if (typeof entry === "string") add(entry);
-    else for (const r of arr((entry as { resources?: unknown })?.resources)) add(r);
+    else if (typeof entry === "object" && entry !== null && "resources" in entry) for (const r of arr(entry.resources)) add(r);
   }
   return paths;
 }
 
+export interface TransformOptions {
+  /** browser_specific_settings.gecko.id. */
+  addonId: string;
+  /** browser_specific_settings.gecko.strict_min_version. */
+  minFirefoxVersion: string;
+  platforms: Platforms;
+  /** Version written to the manifest, already in Firefox's format. */
+  version: string;
+  /** Values for gecko.data_collection_permissions.required; undefined leaves the key out. */
+  dataCollection?: string[];
+  /** Files put first in every content script that runs in the isolated world. */
+  contentScriptPrepend?: string[];
+  /** Query string added to the sidebar page made from side_panel. */
+  sidebarPanelQuery?: string;
+}
+
+// Add `query` to a page path ahead of its fragment, after any query it already has.
+function withQuery(path: string, query: string | undefined): string {
+  const q = (query ?? "").replace(/^\?/, "");
+  if (!q) return path;
+  const hash = path.indexOf("#");
+  const page = hash === -1 ? path : path.slice(0, hash);
+  const fragment = hash === -1 ? "" : path.slice(hash);
+  const sep = !page.includes("?") ? "?" : /[?&]$/.test(page) ? "" : "&";
+  return page + sep + q + fragment;
+}
+
 /**
- * Add `'self'` (and `blob:`) to a CSP's connect-src so Safari allows same-origin
- * fetch/XHR of bundled resources and of the page's own blob URLs (Chrome implies
- * both; Safari enforces connect-src strictly, and per spec 'self' never matches a
- * blob: URL). Only touches a connect-src that EXISTS but lacks 'self' — a policy
- * with no connect-src already falls back to default-src/'self'. Leaves every
- * other directive untouched. Accepts the MV3 object form, the bare MV2 string, or
- * undefined, and returns the same shape.
+ * Produce the Firefox manifest. Pure: deep-clones its input and writes nothing.
+ * `background` is left as it is; wireBackground rewrites it.
  */
-export function addSelfToConnectSrc<T extends string | Record<string, string> | undefined>(csp: T): T {
-  const fixOne = (policy: string): string => {
-    if (/(?:^|;)\s*connect-src(?:\s|;|$)/i.test(policy)) {
-      return policy.replace(/(^|;)\s*connect-src\s+([^;]*)/i, (full, sep: string, sources: string) => {
-        const tokens = sources.trim().split(/\s+/).filter(Boolean);
-        // 'none' means "block everything" — don't loosen it.
-        if (tokens.includes("'none'")) return full;
-        const add = ["'self'", "blob:"].filter((t) => !tokens.includes(t));
-        if (add.length === 0) return full;
-        return `${sep} connect-src ${add.join(" ")} ${tokens.join(" ")}`;
-      });
-    }
-    // No connect-src: fetches fall back to default-src. Chrome still implies
-    // same-origin there; Safari doesn't — a default-src without 'self' (e.g.
-    // "default-src 'none'") blocks the extension's own bundled fetches too.
-    // Synthesize a connect-src that keeps the author's default scope + 'self'.
-    const dm = /(?:^|;)\s*default-src\s+([^;]*)/i.exec(policy);
-    if (!dm) return policy; // no default-src either → browser default covers 'self'
-    const tokens = dm[1].trim().split(/\s+/).filter(Boolean);
-    if (tokens.includes("'self'")) return policy;
-    const scope = tokens.filter((t) => t !== "'none'");
-    return `${policy.replace(/;?\s*$/, "")}; connect-src 'self' blob:${scope.length ? " " + scope.join(" ") : ""}`;
-  };
-  if (csp == null) return csp;
-  if (typeof csp === "string") return fixOne(csp) as T;
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(csp)) out[k] = typeof v === "string" ? fixOne(v) : v;
-  return out as T;
-}
-
-// True when a background script registers action.onClicked — i.e. the toolbar button's
-// behavior lives in code, not in a popup page. Same heuristic (and same signal) as the
-// shim's own detector in runtime/shim.ts; kept as a local copy here because shim.ts
-// already imports from this module, and reversing that edge to share one function would
-// create an import cycle. Both read the staged background source; neither owns the other.
-function backgroundRegistersActionOnClicked(manifest: Manifest, extPath: string): boolean {
-  const files: string[] = [];
-  const sw = manifest.background?.service_worker;
-  if (typeof sw === "string") files.push(sw);
-  for (const s of manifest.background?.scripts ?? []) if (typeof s === "string") files.push(s);
-  // Collective scan over all background files (not a per-file short-circuit): a non-empty
-  // setPopup ANYWHERE makes the button popup-driven, which wins over an onClicked
-  // registration in another file. Mirrors the shim's detector (runtime/shim.ts); the shim
-  // there is prepended to background.scripts and references onClicked without setPopup, so
-  // a per-file return-true would fire on it before reaching the bundle's own setPopup.
-  // Empty setPopup({popup:""}) clears the popup and doesn't count.
-  let sawOnClicked = false;
-  for (const rel of files) {
-    const p = join(extPath, rel.replace(/^\.?\//, ""));
-    if (!existsSync(p)) continue;
-    let src: string;
-    try { src = readFileSync(p, "utf-8"); } catch { continue; }
-    if (/setPopup\s*\(\s*\{[^}]*\bpopup\s*:\s*(["'`])(?!\1)[^"'`]/.test(src)) return false;
-    if (/onClicked/.test(src) && /\b(?:action|browserAction)\b/.test(src)) sawOnClicked = true;
-  }
-  return sawOnClicked;
-}
-
-/** Produce the Safari-ready manifest. Pure: does not write to disk. */
-export function transformManifest(
-  m: Manifest,
-  permissionsToRemove: string[],
-  extPath: string,
-  opts: { keepModuleBackground: boolean; shimFile?: string; polyfillFile?: string; minSafariVersion?: string; cdpShim?: boolean }
-): Manifest {
+export function transformManifest(m: Manifest, permissionsToRemove: string[], opts: TransformOptions): Manifest {
   const out: Manifest = JSON.parse(JSON.stringify(m));
 
   delete out.key;
+  delete out.update_url;
   delete out.minimum_chrome_version;
-  // Keep version_name: the App Store ignores it, but it's a real runtime field —
-  // extensions read chrome.runtime.getManifest().version_name for display (Salesforce
-  // Inspector renders it in its footer and crashes on undefined.replace if it's gone).
-  // Harmless to leave in the Safari bundle; removing it breaks that read.
-  //
-  // Keep update_url for the same reason. Safari never fetches it, but a self-hosted
-  // bundle reads it back to learn that it updates itself, and the idiom is a chain of
-  // ORs across the browsers' update fields:
-  //   !!(manifest.update_url || (manifest.browser_specific_settings && manifest.browser_specific_settings.gecko.update_url))
-  // Deleting update_url makes that fall through to the Firefox operand, and since we
-  // ADD browser_specific_settings.safari (for strict_min_version) the object now exists
-  // without a `gecko` block — so the read throws at the top level of the background
-  // script and everything after it in that file never runs. Live: Bypass Paywalls Clean
-  // (background.js:260) registered no DNR rules and injected no content scripts at all.
+  out.version = opts.version;
 
-  if (out.version) {
-    // Safari/Xcode require dot-separated integers (max 3 components, each ≤ 65535).
-    // Keep leading numeric parts and stop at the first non-numeric one; if nothing
-    // usable remains, fall back to 1.0.0 rather than writing a manifest that fails the build.
-    const numeric: string[] = [];
-    for (const p of out.version.split(".")) {
-      if (!/^\d+$/.test(p)) break;
-      numeric.push(String(Math.min(Number(p), 65535)));
-      if (numeric.length === 3) break;
-    }
-    out.version = numeric.length ? numeric.join(".") : "1.0.0";
-  }
+  // Drop what Firefox doesn't know, including patterns with schemes it can't grant,
+  // then put each permission in the list Firefox reads it from.
+  const removed = new Set(permissionsToRemove);
+  const keep = (p: unknown): p is string =>
+    typeof p === "string" && !removed.has(p) && (!p.includes("://") || matchPatternError(p) === null);
+  const required = Array.isArray(out.permissions) ? out.permissions.filter(keep) : [];
+  const optional = Array.isArray(out.optional_permissions) ? out.optional_permissions.filter(keep) : [];
+  const permissions = [
+    ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] !== true),
+    ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] === true && !required.includes(p)),
+  ];
+  const optionalPermissions = [
+    ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] !== true),
+    ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] === true && !optional.includes(p)),
+  ];
+  if (Array.isArray(out.permissions) || permissions.length) out.permissions = permissions;
+  if (optionalPermissions.length) out.optional_permissions = optionalPermissions;
+  else delete out.optional_permissions;
 
-  const removeSet = new Set(permissionsToRemove);
-  // A permissions entry that is a host match pattern with a scheme Safari can't
-  // parse (chrome://favicon/, ws://…) is not just ignored like a stray https://
-  // pattern — Safari treats the whole manifest as invalid and refuses to load the
-  // extension. Drop those outright, the same way host_permissions filters them
-  // below. A plain name ("tabs") has no "://" so it's untouched, and a legal
-  // https:// pattern passes matchPatternError so the warn-don't-move behavior for
-  // misplaced host patterns is preserved.
-  const isUngrantablePattern = (p: unknown): boolean =>
-    typeof p === "string" && p.includes("://") && matchPatternError(p) !== null;
-  if (Array.isArray(out.permissions)) {
-    out.permissions = out.permissions.filter((p) => !removeSet.has(p) && !isUngrantablePattern(p));
-  }
-  if (Array.isArray(out.optional_permissions)) {
-    out.optional_permissions = out.optional_permissions.filter((p) => !removeSet.has(p) && !isUngrantablePattern(p));
-  }
-  // Safari rejects the declarativeNetRequestWithHostAccess token, but either token
-  // grants the DNR API. Re-add plain declarativeNetRequest to whichever list the
-  // variant was declared in (a variant declared ONLY in optional_permissions must
-  // not silently lose the DNR capability), unless it's already present.
-  if (removeSet.has("declarativeNetRequestWithHostAccess")) {
-    const inRequired = Array.isArray(m.permissions) && m.permissions.includes("declarativeNetRequestWithHostAccess");
-    const key = inRequired ? "permissions" : "optional_permissions";
-    if (!Array.isArray(out[key])) out[key] = [];
-    const list = out[key] as string[];
-    if (!list.includes("declarativeNetRequest")) list.push("declarativeNetRequest");
-  }
-  if (Array.isArray(out.optional_permissions) && out.optional_permissions.length === 0) delete out.optional_permissions;
-
-  // The CDP shim's executor injects into arbitrary tabs via chrome.scripting, so
-  // when the debugger permission was shimmed we must keep scripting granted (debugger
-  // itself stays stripped). Broad host access (<all_urls>) is added below after the
-  // match-pattern filter so CDP can attach to any tab.
-  if (opts.cdpShim) {
-    if (!Array.isArray(out.permissions)) out.permissions = [];
-    if (!(out.permissions as string[]).includes("scripting")) (out.permissions as string[]).push("scripting");
-  }
-
-  // Drop host patterns Safari's match-pattern parser rejects (ws://*/* etc. — valid
-  // in Chrome for webRequest websockets, ungrantable in Safari). Keeping them risks
-  // Safari discarding host access; removal matches analyzeManifest's auto-fix note.
   for (const key of ["host_permissions", "optional_host_permissions"] as const) {
-    if (!Array.isArray(out[key])) continue;
-    const kept = (out[key] as unknown[]).filter((p) => typeof p !== "string" || matchPatternError(p) === null);
-    if (kept.length === 0) delete out[key];
-    else out[key] = kept as string[];
+    const list = out[key];
+    if (!Array.isArray(list)) continue;
+    const kept = list.filter((p) => typeof p === "string" && matchPatternError(p) === null);
+    if (kept.length) out[key] = kept;
+    else delete out[key];
   }
 
-  // CDP attaches to any tab, so ensure broad host access. Placed after the match-
-  // pattern filter above (<all_urls> passes matchPatternError) so it is never dropped.
-  if (opts.cdpShim) {
-    if (!Array.isArray(out.host_permissions)) out.host_permissions = [];
-    if (!(out.host_permissions as string[]).includes("<all_urls>")) (out.host_permissions as string[]).push("<all_urls>");
+  const bss = out.browser_specific_settings;
+  const settings: NonNullable<Manifest["browser_specific_settings"]> =
+    bss && typeof bss === "object" && !Array.isArray(bss) ? { ...bss } : {};
+  const gecko: NonNullable<typeof settings.gecko> = {
+    ...(settings.gecko && typeof settings.gecko === "object" ? settings.gecko : {}),
+    id: opts.addonId,
+  };
+  // For Android alone, a desktop minimum would gate Firefox for Android as well.
+  if (opts.platforms === "android") delete gecko.strict_min_version;
+  else gecko.strict_min_version = opts.minFirefoxVersion;
+  if (opts.dataCollection) {
+    const declared = typeof gecko.data_collection_permissions === "object" ? gecko.data_collection_permissions : {};
+    gecko.data_collection_permissions = { ...declared, required: [...opts.dataCollection] };
   }
+  settings.gecko = gecko;
+  if (opts.platforms === "desktop") delete settings.gecko_android;
+  else settings.gecko_android = {};
+  out.browser_specific_settings = settings;
 
-  const mv = out.manifest_version ?? 2;
-  // Guard the type, not just truthiness: a hand-edited manifest can set background to
-  // a primitive, and assigning .persistent on a string throws in strict mode (ESM).
-  if (mv === 2 && out.background && typeof out.background === "object") {
-    out.background.persistent = false;
-  }
-  if (mv === 3 && out.background?.type === "module" && !opts.keepModuleBackground) {
-    delete out.background.type;
-  }
-
-  // Safari rejects the whole manifest ("Too many shortcuts specified for commands,
-  // only 4 shortcuts are allowed") when more than 4 commands carry a suggested_key
-  // Safari can read. Chrome has no such cap, so bundles like TWP declare 8+. Keep the
-  // first 4 (declaration order) and strip suggested_key from the rest — those commands
-  // still exist and stay bindable in Safari → Settings → Extensions, they just lose
-  // their default chord. Only Safari-platform chords count toward the limit; a command
-  // whose suggested_key is windows/linux-only is already a dead key here.
-  if (out.commands && typeof out.commands === "object") {
-    let kept = 0;
-    for (const def of Object.values(out.commands as Record<string, unknown>)) {
-      if (!hasSafariSuggestedKey(def)) continue;
-      kept++;
-      if (kept > 4) delete (def as { suggested_key?: unknown }).suggested_key;
+  // Firefox's sidebar takes the side panel's place. It opens on install unless told
+  // otherwise, which Chrome's side panel never does.
+  if (out.side_panel !== undefined) {
+    const sp = out.side_panel;
+    const panel = typeof sp?.default_path === "string" ? sp.default_path : "";
+    if (!out.sidebar_action && panel) {
+      const actionTitle = (out.action ?? out.browser_action ?? out.page_action)?.default_title;
+      const title = typeof actionTitle === "string" && actionTitle ? actionTitle : out.name;
+      const sidebar: NonNullable<Manifest["sidebar_action"]> = { default_panel: withQuery(panel, opts.sidebarPanelQuery) };
+      if (title) sidebar.default_title = title;
+      const icons = out.icons;
+      if (icons && typeof icons === "object" && Object.keys(icons).length) sidebar.default_icon = { ...icons };
+      sidebar.open_at_install = false;
+      out.sidebar_action = sidebar;
     }
+    delete out.side_panel;
   }
 
-  // page_action has no Safari equivalent; fold it into the toolbar-button key that
-  // is valid for THIS manifest version. On MV3 that's `action`; on MV2 it must be
-  // `browser_action` — injecting an `action` key into an MV2 manifest makes Safari
-  // reject it at load (same rule the popup-wiring below relies on). (MV3 dropped the
-  // show-only-on-some-pages distinction; Safari treats both as a plain action.)
-  // Treat an empty `action: {}` / `browser_action: {}` as absent — migration tools
-  // leave these stubs behind, and an empty object must not block the page_action
-  // fold (which would silently drop the page_action's real default_popup) nor pin
-  // the wrong toolbar key below.
-  const nonEmpty = (v: unknown): boolean =>
-    typeof v === "object" && v !== null && Object.keys(v as object).length > 0;
-  if (out.action && !nonEmpty(out.action)) delete out.action;
-  if (out.browser_action && !nonEmpty(out.browser_action)) delete out.browser_action;
+  // Firefox would treat "split" as "not_allowed"; without the key the add-on spans
+  // normal and private windows.
+  if (out.incognito === "split") delete out.incognito;
 
-  if (out.page_action && !out.action && !out.browser_action) {
-    const foldKey = mv === 3 ? "action" : "browser_action";
-    out[foldKey] = out.page_action as Manifest["action"];
-    delete out.page_action;
-  }
-
-  // MV3 requires content_security_policy to be an object keyed by context, not the
-  // bare MV2 string. Safari silently ignores a string-form CSP under MV3, so the
-  // extension runs with the default policy instead of the author's. Wrap it.
-  if (mv === 3 && typeof out.content_security_policy === "string") {
-    out.content_security_policy = { extension_pages: out.content_security_policy };
-  }
-
-  // Chrome implicitly allows an extension page to fetch/connect to its OWN bundled
-  // resources (same-origin) regardless of connect-src; Safari enforces connect-src
-  // strictly, so a policy that declares connect-src but omits 'self' makes Safari
-  // REFUSE same-origin fetch()/XHR of bundled assets ("Refused to connect to
-  // safari-web-extension://… because it does not appear in the connect-src
-  // directive"). Live-proven on Grammarly: its bg fetches its own fonts/*.css and
-  // the missing 'self' silently breaks init. Inject 'self' into connect-src (only
-  // when the directive exists but lacks it — if there's no connect-src, the default
-  // covers 'self' already). Applies to every CSP key (extension_pages, sandbox).
-  out.content_security_policy = addSelfToConnectSrc(out.content_security_policy);
-
-  // MV3 requires web_accessible_resources to be an array of {resources, matches}
-  // objects. A bare MV2 string[] makes Safari reject the manifest at load. Wrap
-  // the flat list, exposing it to all URLs (the MV2 default visibility).
-  // A bare-string web_accessible_resources ("inject.js") is invalid even under MV2,
-  // but hand edits / loose tooling produce it. Normalize to a one-element array so
-  // the wrapping below applies and collectReferencedPaths stages the file.
-  if (typeof out.web_accessible_resources === "string") {
-    out.web_accessible_resources = [out.web_accessible_resources] as unknown as Manifest["web_accessible_resources"];
-  }
-  if (mv === 3 && Array.isArray(out.web_accessible_resources)) {
-    const flat = out.web_accessible_resources as unknown[];
-    // Handle mixed arrays per-entry: a bare string[] is MV2-style, but hand-edited
-    // manifests sometimes mix loose strings with MV3 objects. Wrap only the loose
-    // strings and pass the already-valid objects through untouched.
-    const looseStrings = flat.filter((e): e is string => typeof e === "string");
-    const objects = flat.filter((e) => typeof e === "object" && e !== null);
-    if (looseStrings.length > 0) {
-      out.web_accessible_resources = [
-        { resources: looseStrings, matches: ["<all_urls>"] },
-        ...objects,
-      ] as Manifest["web_accessible_resources"];
-    }
-  }
-
-  // Safari does not implement web_accessible_resources.use_dynamic_url (Chrome-only
-  // per-session URL rotation). An entry left with use_dynamic_url:true is unservable
-  // in Safari, so chrome.runtime.getURL() returns a URL that 404s and any asset
-  // loaded that way (a content script's injected CSS, an <img>/<link>/iframe src)
-  // silently fails. Clear the flag on every object entry so the resource resolves at
-  // its stable static extension URL. Chrome treats the absent/false flag as the
-  // default, so this is a no-op there.
   if (Array.isArray(out.web_accessible_resources)) {
     for (const entry of out.web_accessible_resources) {
-      if (typeof entry === "object" && entry !== null && "use_dynamic_url" in entry && entry.use_dynamic_url === true) {
-        entry.use_dynamic_url = false;
-      }
+      if (typeof entry === "object" && entry !== null) Reflect.deleteProperty(entry, "use_dynamic_url");
     }
   }
 
-  const existingSafari = (out.browser_specific_settings as { safari?: { strict_min_version?: string } } | undefined)?.safari;
-  out.browser_specific_settings = {
-    ...(out.browser_specific_settings ?? {}),
-    safari: {
-      ...(existingSafari ?? {}),
-      strict_min_version: opts.minSafariVersion ?? existingSafari?.strict_min_version ?? DEFAULT_MIN_SAFARI_VERSION,
-    },
-  };
-
-  // Ensure the toolbar button does something: wire a popup if one exists. Normalize
-  // to the key VALID for this manifest version rather than trusting the input's
-  // shape — MV2 must use `browser_action` (Safari rejects `action` in an MV2
-  // manifest), MV3 must use `action` (Safari ignores `browser_action` under MV3, so
-  // a popup wired there would be dropped). Migrate a mismatched existing key so its
-  // contents (e.g. an author-set default_popup) survive into the right slot.
-  const actionKey = mv === 3 ? "action" : "browser_action";
-  const wrongKey = mv === 3 ? "browser_action" : "action";
-  if (out[wrongKey] && !out[actionKey]) {
-    out[actionKey] = out[wrongKey] as Manifest["action"];
-    delete out[wrongKey];
-  } else if (out[wrongKey]) {
-    // Both keys present (Chrome just ignores the one invalid for its MV). Keep
-    // only the valid key: Safari REJECTS an MV2 manifest carrying `action`.
-    delete out[wrongKey];
-  }
-  const action = (out[actionKey] as Manifest["action"]) ?? {};
-  if (!action.default_popup) {
-    // An extension whose UI is a Chrome side panel (chrome.sidePanel) has no Safari
-    // equivalent; the shim emulates sidePanel.open() by toggling the panel page as
-    // the action popover — which only works when that page is wired here as
-    // default_popup. Prefer the manifest's declared panel (often in a subdir, e.g.
-    // ChatGPT's codex-sidepanel/index.html) over the root-level guesses below;
-    // otherwise the action-click bridge wires an empty placeholder popover and the
-    // panel never shows (live: ChatGPT — empty popup on click).
-    const panelPath = (out.side_panel?.default_path ?? "").split(/[#?]/)[0].replace(/^\/+/, "");
-    if (panelPath && existsSync(join(extPath, panelPath))) {
-      action.default_popup = panelPath;
-    } else if (!backgroundRegistersActionOnClicked(out, extPath)) {
-      // Only guess a popup page when the toolbar button has no other behavior. If the
-      // background registers action.onClicked, the button is code-driven (it toggles
-      // in-page UI, opens a tab, etc.), and the extension's own popup.html is usually a
-      // content-script-injected iframe (a web_accessible_resource), NOT a toolbar popup —
-      // wiring it here hijacks the click into an orphan popover that never initializes
-      // (Salesforce Inspector Reloaded: empty gray box). Leave default_popup unset so
-      // wireActionClickBridge replays the real onClicked instead.
-      for (const candidate of ["popup.html", "sidepanel.html", "panel.html", "index.html"]) {
-        if (existsSync(join(extPath, candidate))) {
-          action.default_popup = candidate;
-          break;
-        }
-      }
+  // A shortcut Firefox can't parse makes it refuse the manifest. Drop just that chord;
+  // the command stays, and users can bind it in about:addons.
+  if (out.commands && typeof out.commands === "object") {
+    for (const def of Object.values(out.commands)) {
+      if (typeof def !== "object" || def === null || !("suggested_key" in def)) continue;
+      if (typeof def.suggested_key === "string") def.suggested_key = { default: def.suggested_key };
+      const suggested = def.suggested_key;
+      if (typeof suggested !== "object" || suggested === null) continue;
+      for (const [platform] of invalidShortcuts(def)) Reflect.deleteProperty(suggested, platform);
+      if (Object.keys(suggested).length === 0) delete def.suggested_key;
     }
   }
-  // Don't inject an empty action onto extensions that never had a toolbar button.
-  if (Object.keys(action).length > 0) out[actionKey] = action;
 
-  // Prepend the compat shim to every content script so sync/identity/sidePanel are
-  // patched. Then prepend the polyfill so `browser` exists before the shim runs —
-  // final order per script: [polyfill, shim, ...original].
-  if ((opts.shimFile || opts.polyfillFile) && Array.isArray(out.content_scripts)) {
+  const prepend = opts.contentScriptPrepend ?? [];
+  if (prepend.length && Array.isArray(out.content_scripts)) {
     for (const cs of out.content_scripts) {
-      if (!Array.isArray(cs.js)) continue;
-      // MAIN-world scripts run in the page context where chrome/browser don't exist;
-      // the bundled webextension-polyfill throws at top level there. Leave them alone.
-      if ((cs as { world?: string }).world === "MAIN") continue;
-      if (opts.shimFile && !cs.js.includes(opts.shimFile)) cs.js.unshift(opts.shimFile);
-      if (opts.polyfillFile && !cs.js.includes(opts.polyfillFile)) cs.js.unshift(opts.polyfillFile);
+      // MAIN-world scripts run in the page, where extension APIs don't exist.
+      if (!cs || !Array.isArray(cs.js) || cs.js.length === 0 || cs.world === "MAIN") continue;
+      const js = cs.js;
+      cs.js = [...prepend.filter((f) => !js.includes(f)), ...js];
     }
   }
-
-  // Do NOT prepend the compat shim to an MV2 background.scripts list. The shim's storage
-  // relay republishes chrome/browser as a Proxy, and Safari only delivers a content
-  // script's native runtime.sendMessage to the background when the background's onMessage
-  // is registered on the REAL, unwrapped runtime — wrapping it drops that delivery, so a
-  // content script's request (e.g. TWP's translateHTML) never reaches the background and
-  // its reply never comes back. The pre-relay builds never injected the shim into the MV2
-  // background and worked; match that. (MV3 service workers are handled separately by
-  // convertServiceWorkerToBackgroundPage, which builds background.html with the shim.)
 
   return out;
 }
 
 export function writeManifest(targetDir: string, manifest: Manifest): void {
-  // Chrome tolerates `content_scripts: []`; Safari rejects it outright ("Empty or
-  // invalid content_scripts manifest entry") and refuses to load the extension
-  // (live: ChatGPT ships an empty array). Drop the key when nothing populated it —
-  // this is the final write, after every content-script wiring step has run.
-  if (Array.isArray(manifest.content_scripts) && manifest.content_scripts.length === 0) {
-    delete manifest.content_scripts;
-  }
   writeFileSync(join(targetDir, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n", "utf-8");
-}
-
-/**
- * Remove reserved commands declared as a bare `{}` (`"_execute_action": {}`, common in
- * MV3 bundles). Chrome accepts them; Safari records "Empty or invalid command in the
- * `commands` manifest entry" and lists it under Settings → Extensions. Safari
- * synthesizes the same command without the entry (titled from the extension), so the
- * command list is identical either way. One with a shortcut or a description loads
- * cleanly and is kept. Runs after the action hotkey and click bridge are wired, which
- * read the declared commands to pick a shortcut. Returns the names removed.
- */
-export function dropEmptyReservedCommands(m: Manifest): string[] {
-  const cmds = m.commands as Record<string, unknown> | undefined;
-  if (!cmds || typeof cmds !== "object") return [];
-  const dropped = Object.keys(cmds).filter((name) => {
-    const def = cmds[name];
-    return /^_execute_/.test(name) && !!def && typeof def === "object" && Object.keys(def).length === 0;
-  });
-  for (const name of dropped) delete cmds[name];
-  if (dropped.length && Object.keys(cmds).length === 0) delete m.commands;
-  return dropped;
 }

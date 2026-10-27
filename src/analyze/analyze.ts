@@ -1,7 +1,8 @@
 import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import type { Issue, Manifest, Platforms } from "../types.js";
-import { UNSUPPORTED_APIS, parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
+import { parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
+import { UNSUPPORTED_APIS } from "../manifest/compat-data.js";
 import { matchBalancedParen, rootLiteralsFromGetURL, importScriptsTargets } from "../runtime/shim.js";
 
 /**
