@@ -1,127 +1,108 @@
-// page-bridge.js — injected into the MAIN world of externally_connectable pages.
-// Such pages probe window.chrome.runtime to talk to the extension. Safari does
-// not give web pages a `chrome` namespace (only `browser`, and that needs the
-// Safari extension id which the page can't know). Define a `chrome.runtime`
-// whose sendMessage relays over window.postMessage to the content script.
+// Page half of the bridge, run in the page's own JavaScript world on the
+// externally_connectable origins. Chrome gives those pages
+// chrome.runtime.sendMessage(<extension id>, message, callback); Firefox ignores
+// externally_connectable and gives web pages no chrome.runtime at all. This
+// provides sendMessage and hands each message to the add-on's content script
+// (page-bridge-cs.js).
+//
+// The two talk through DOM events on `window` carrying JSON strings. Unlike
+// window.postMessage, no other frame can dispatch them, and in Firefox a message
+// posted by a content script arrives with no source and an empty origin, so it
+// couldn't be checked anyway. Chrome serializes external messages as JSON too.
 (function () {
-  if (window.__claudeBridgeInstalled) return;
-  window.__claudeBridgeInstalled = true;
-  // Verbose logging OFF by default (runs in the page's MAIN world). Set
-  // window.__C2S_DEBUG = true to re-enable diagnostic logs. Read at CALL time: this
-  // script runs at document_start, so a load-time read can never be turned on from a
-  // console, which is the only place anyone debugging a stuck page can reach.
-  var DEBUG = function () { try { return !!window.__C2S_DEBUG; } catch (e) { return false; } };
+  var CHROME_ID = "__EXTENSION_ID__";
+  if (CHROME_ID === "__EXTENSION" + "_ID__") CHROME_ID = "";
+  var CHANNEL = "__BRIDGE_CHANNEL__";
+  var REQUEST_EVENT = "__pageBridge:" + CHANNEL + ":request";
+  var RESPONSE_EVENT = "__pageBridge:" + CHANNEL + ":response";
+  var DEBUG = function () { try { return !!window.__pageBridgeDebug; } catch (e) { return false; } };
   var DBG = function () { if (DEBUG()) try { console.log.apply(console, arguments); } catch (e) {} };
-  var DBGW = function () { if (DEBUG()) try { console.warn.apply(console, arguments); } catch (e) {} };
-  // The page reads chrome.runtime.id. For a faithful conversion this should be
-  // the extension's original Chrome id; the converter substitutes it at build
-  // time when known (CRX/store download). If left unsubstituted, fall back to
-  // the live Safari runtime id so messaging still works for ANY extension.
-  var CHROME_ID = "__C2S_EXTENSION_ID__";
-  if (CHROME_ID === "__C2S_" + "EXTENSION_ID__") {
-    try {
-      var liveApi = window.browser || window.chrome;
-      CHROME_ID = (liveApi && liveApi.runtime && liveApi.runtime.id) || "";
-    } catch (e) { CHROME_ID = ""; }
+
+  var ns = window.chrome || {};
+  var runtime = ns.runtime || {};
+  // Shared by every converted add-on that bridges this page.
+  var state = runtime.__pageBridgeState;
+  if (!state) {
+    state = { channels: [], lastError: undefined };
+    Object.defineProperty(runtime, "__pageBridgeState", { value: state, configurable: true });
+    if (!("lastError" in runtime)) {
+      // Like Chrome's runtime.lastError: set only while a callback runs.
+      Object.defineProperty(runtime, "lastError", { get: function () { return state.lastError; }, configurable: true, enumerable: true });
+    }
   }
+  if (state.channels.indexOf(CHANNEL) >= 0) return;
+  state.channels.push(CHANNEL);
+  // Messages for a different extension id go to the add-on that bridged the
+  // page before this one.
+  var previous = typeof runtime.sendMessage === "function" ? runtime.sendMessage : null;
+
   var pending = Object.create(null);
   var seq = 0;
-  // Scoped like Chrome's runtime.lastError: set for a callback's duration only.
-  var lastErr;
 
-  window.addEventListener("message", function (ev) {
-    if (ev.source !== window) return;
-    if (ev.origin !== window.location.origin) return;
-    var d = ev.data;
-    if (!d || d.__claudeBridge !== "cs") return;
-    var cb = pending[d.reqId];
-    if (cb) { delete pending[d.reqId]; cb(d.response, d.error); }
+  window.addEventListener(RESPONSE_EVENT, function (ev) {
+    var d = null;
+    try { d = JSON.parse(String(ev.detail)); } catch (e) { return; }
+    var done = d && pending[d.reqId];
+    if (!done) return;
+    delete pending[d.reqId];
+    done(d.response, d.error);
   });
 
   function sendMessage() {
-    var args = [].slice.call(arguments);
-    var msg, cb = null;
-    if (typeof args[0] === "string") {            // (id, msg[, opts][, cb])
-      msg = args[1];
-      cb = typeof args[2] === "function" ? args[2] : (typeof args[3] === "function" ? args[3] : null);
-    } else {                                        // (msg[, cb])
-      msg = args[0];
-      cb = typeof args[1] === "function" ? args[1] : null;
+    var args = Array.prototype.slice.call(arguments);
+    var target = typeof args[0] === "string" ? args[0] : null;
+    if (target && CHROME_ID && target !== CHROME_ID && previous) return previous.apply(this, args);
+    // (extensionId, message[, options][, callback]) or (message[, callback])
+    var msg = target !== null ? args[1] : args[0];
+    var cb = null;
+    for (var i = args.length - 1; i > 0; i--) {
+      if (typeof args[i] === "function") { cb = args[i]; break; }
     }
     var reqId = "r" + (++seq);
-    var mtype = msg && msg.type ? msg.type : "(no type)";
-    DBG("[bridge] page->SW send", mtype, "reqId", reqId);
     var p = new Promise(function (resolve, reject) {
-      // Timeout so the promise can't hang forever: if the page calls sendMessage
-      // before the isolated-world relay has attached its listener, the postMessage
-      // is dropped and no reply ever arrives. (The relay has its own 30s SW timeout;
-      // this guards the page->relay leg the relay can't see.)
-      var to = setTimeout(function () {
-        if (pending[reqId]) { delete pending[reqId]; reject(new Error("bridge timeout: no response from extension")); }
-      }, 30000);
-      pending[reqId] = function (resp, err) {
-        clearTimeout(to);
-        if (err) { console.error("[bridge] SW->page ERROR", mtype, reqId, err); reject(new Error(err)); }
-        else { DBG("[bridge] SW->page resp", mtype, reqId, resp ? "(ok)" : resp); resolve(resp); }
-      };
-    });
-    window.postMessage({ __claudeBridge: "page", reqId: reqId, msg: msg }, window.location.origin);
-    if (cb) {
-      p.then(
-        function (r) { lastErr = undefined; cb(r); },
-        function (e) {
-          // Callback form: surface the failure via lastError (Chrome's contract);
-          // a bare cb(undefined) is indistinguishable from an empty success.
-          lastErr = { message: (e && e.message) || "bridge error" };
-          try { cb(undefined); } finally { lastErr = undefined; }
+      var detail;
+      try {
+        detail = JSON.stringify({ reqId: reqId, msg: msg });
+      } catch (e) {
+        reject(new Error("Message could not be serialized: " + ((e && e.message) || e)));
+        return;
+      }
+      // The relay answers within its own timeout; this one only matters if the
+      // relay never got the request.
+      var timer = setTimeout(function () {
+        if (pending[reqId]) {
+          delete pending[reqId];
+          reject(new Error("Could not establish connection. Receiving end does not exist."));
         }
-      );
-      return;
-    }
-    return p;
+      }, 31000);
+      pending[reqId] = function (response, error) {
+        clearTimeout(timer);
+        if (error) reject(new Error(error));
+        else resolve(response);
+      };
+      DBG("[page-bridge] page -> extension", reqId);
+      window.dispatchEvent(new CustomEvent(REQUEST_EVENT, { detail: detail }));
+    });
+    if (!cb) return p;
+    p.then(function (r) {
+      cb(r);
+    }, function (e) {
+      state.lastError = { message: (e && e.message) || "Unknown error" };
+      try { cb(undefined); } finally { state.lastError = undefined; }
+    });
+    return undefined;
   }
 
   var noop = function () {};
-  var emptyEvent = { addListener: noop, removeListener: noop, hasListener: function () { return false; } };
-  var runtime = {
-    id: CHROME_ID,
-    sendMessage: sendMessage,
-    connect: function () {
-      DBGW("[bridge] runtime.connect called — returning inert port (not supported via Safari bridge)");
-      return { name: "", postMessage: noop, disconnect: noop,
-               onMessage: emptyEvent, onDisconnect: emptyEvent };
-    },
-    onMessage: emptyEvent,
-    onMessageExternal: emptyEvent,
-    onConnect: emptyEvent,
-    get lastError() { return lastErr; }
-  };
-
-  var ns = window.chrome || {};
-  if (!ns.runtime) ns.runtime = runtime;
-  else { ns.runtime.sendMessage = sendMessage; if (!ns.runtime.id) ns.runtime.id = CHROME_ID; }
+  var inertEvent = { addListener: noop, removeListener: noop, hasListener: function () { return false; } };
+  runtime.sendMessage = sendMessage;
+  if (typeof runtime.connect !== "function") {
+    // Long-lived connections from the page aren't bridged; the port is inert.
+    runtime.connect = function () {
+      DBG("[page-bridge] runtime.connect from the page is not bridged");
+      return { name: "", postMessage: noop, disconnect: noop, onMessage: inertEvent, onDisconnect: inertEvent };
+    };
+  }
+  ns.runtime = runtime;
   window.chrome = ns;
-  DBG("[bridge] page chrome.runtime installed");
-  // Tell the isolated-world relay this world actually got the bridge. It cannot read
-  // `window.chrome` across worlds, and it must know: Safari runs a world:"MAIN"
-  // content script only from 18.4, and below that the entry is ignored in silence —
-  // no bridge in the page, so an externally_connectable page's
-  // `chrome.runtime.sendMessage` is undefined, it messages nobody, and its login
-  // button spins forever with nothing logged. Absent an answer the relay injects this
-  // same file as a web-accessible <script> instead.
-  //
-  // ANSWERABLE, not announce-once: the two content scripts are separate script
-  // evaluations, so an eager announcement can be posted before the relay has attached
-  // its listener and be missed. The relay would then inject a second copy, the
-  // install-once guard at the top would return before announcing anything, and the
-  // relay would report a page with no bridge while the bridge was sitting right there.
-  // Answering a probe is idempotent and works however this world got the file.
-  window.addEventListener("message", function (ev) {
-    if (ev.source !== window) return;
-    if (ev.origin !== window.location.origin) return;
-    if (!ev.data || ev.data.__claudeBridge !== "probe") return;
-    try { window.postMessage({ __claudeBridge: "ready" }, window.location.origin); } catch (e) {}
-  });
-  // Eager announcement too: when it does land it saves the relay a probe round trip.
-  try { window.postMessage({ __claudeBridge: "ready" }, window.location.origin); } catch (e) {}
 })();
