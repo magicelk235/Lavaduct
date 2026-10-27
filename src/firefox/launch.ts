@@ -1,0 +1,96 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
+import { warn } from "../util.js";
+import type { FirefoxInstall } from "./locate.js";
+import { platform, type LockHolder, type ProfileLookup } from "./platform/index.js";
+import { pathKey, processAlive } from "./platform/shared.js";
+import { defaultProfileFor, profileInUse, profilesFor, type FirefoxProfile } from "./profiles.js";
+
+const QUIT_TIMEOUT_MS = 30_000;
+
+/**
+ * Start Firefox. A visible Firefox is detached so it outlives this process; a
+ * headless one stays attached, so stopping this process stops it too.
+ */
+export function launchFirefox(
+  install: FirefoxInstall,
+  args: string[],
+  opts: { headless?: boolean } = {},
+): ChildProcess {
+  if (!existsSync(install.binary)) throw new Error(`Firefox isn't at ${install.binary} any more.`);
+  const headless = opts.headless === true;
+  const child = spawn(install.binary, [...(headless ? ["--headless"] : platform.visibleLaunchArgs()), ...args], {
+    detached: !headless,
+    stdio: "ignore",
+  });
+  child.once("error", (err) => warn(`Couldn't start ${install.binary}: ${err.message}`));
+  if (!headless) child.unref();
+  return child;
+}
+
+/**
+ * Finds which running Firefox has a profile open. On Windows that comes from
+ * command lines, which name a profile by path, by name, or not at all (the
+ * install's default).
+ */
+function holderOf(install: FirefoxInstall, profilePath: string): LockHolder | undefined {
+  const lookup: ProfileLookup = {
+    pathForName: (name) => profilesFor(install).find((p) => p.name === name)?.path,
+    defaultForBinary: (binary) => defaultProfileFor({ ...install, binary, installDir: dirname(binary) })?.path,
+  };
+  return platform.lockHolder(profilePath, lookup);
+}
+
+/**
+ * Quit the Firefox that has the profile open, the way the user would, and wait
+ * up to 30 s for it to let go of the profile. True when the profile is free
+ * (including when nothing had it open); false when the quit couldn't be
+ * requested or Firefox is still running, e.g. waiting on a "close tabs?" prompt.
+ */
+export async function quitFirefoxForProfile(install: FirefoxInstall, profilePath: string): Promise<boolean> {
+  if (!profileInUse(profilePath)) return true;
+  const holder = holderOf(install, profilePath);
+  if (!holder || !platform.requestQuit(holder.pid)) return false;
+
+  const deadline = Date.now() + QUIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(250);
+    // Wait for the process too: until it's gone it may still take commands
+    // forwarded from a new launch.
+    if (!profileInUse(profilePath) && !processAlive(holder.pid)) return true;
+  }
+  return !profileInUse(profilePath);
+}
+
+/**
+ * Hand an .xpi to Firefox, which shows its install prompt. If Firefox already
+ * has the profile open, the new process forwards the request to it and
+ * exits. Forwarding matches on the profile path as the running Firefox
+ * spelled it, so a registered profile is passed by name like a normal start.
+ * The .xpi path must be absolute: macOS forwards no working directory.
+ *
+ * Throws when a Firefox from another install has the profile open: it can't
+ * take the request over, and the new process would end on Firefox's "already
+ * running" dialog.
+ */
+export function openXpiInFirefox(install: FirefoxInstall, profile: FirefoxProfile, xpiPath: string): void {
+  if (profileInUse(profile.path)) {
+    const exe = holderOf(install, profile.path)?.exe;
+    const dirs = [install.installDir, platform.profileSetup(install).hashDir].map(pathKey);
+    if (exe && !dirs.includes(pathKey(dirname(exe)))) {
+      throw new Error(
+        `${profile.path} is open in the Firefox at ${exe}. Quit that Firefox first, or pass --firefox "${exe}".`,
+      );
+    }
+  }
+  const own = profilesFor(install);
+  const key = pathKey(profile.path);
+  const registered = own.find((p) => pathKey(p.path) === key);
+  const name = registered?.name;
+  // -P picks the first profile with that name.
+  const byName = name !== undefined && own.find((p) => p.name === name) === registered;
+  const profileArgs = byName ? ["-P", name] : ["--profile", resolve(profile.path)];
+  launchFirefox(install, [...profileArgs, resolve(xpiPath)]);
+}
