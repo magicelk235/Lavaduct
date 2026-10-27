@@ -8,14 +8,15 @@ import { runCli, sampleExtension, tempDir, writeFiles } from "./cli-helpers.js";
 
 const noFirefox = selectFirefox(findFirefoxInstalls()) ? false : "no Firefox install found";
 
-test("--install --sign temporary --headless loads the add-on into Firefox, then quits it", { skip: noFirefox, timeout: 180_000 }, (t) => {
+// Without --sign, --headless still installs temporarily: a Firefox without a
+// window can't show the install prompt the other routes rely on.
+test("--install --headless loads the add-on temporarily into Firefox, then quits it", { skip: noFirefox, timeout: 180_000 }, (t) => {
   const ext = writeFiles(tempDir(t), sampleExtension());
   const profile = tempDir(t);
   const out = join(tempDir(t), "out");
-  const res = runCli(
-    [ext, "--install", "--sign", "temporary", "--headless", "--profile", profile, "--addon-id", "panel@example.com", "-o", out],
-    { state: tempDir(t) },
-  );
+  const res = runCli([ext, "--install", "--headless", "--profile", profile, "--addon-id", "panel@example.com", "-o", out], {
+    state: tempDir(t),
+  });
 
   assert.equal(res.code, 0, res.stderr);
   assert.match(res.stderr, /› Signing \(temporary\)/);

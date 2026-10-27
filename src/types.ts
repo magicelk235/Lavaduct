@@ -133,7 +133,7 @@ export interface ConvertOptions {
   firefoxRestart: boolean;
   /** Launch Firefox to install; false stops once the .xpi is written. */
   launch: boolean;
-  /** Temporary route: load the add-on into a Firefox without a window, then quit it (a load check). */
+  /** Install temporarily into a Firefox without a window, then quit it: a load check. auto picks the temporary route. */
   headless?: boolean;
 }
 

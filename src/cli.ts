@@ -637,8 +637,7 @@ async function main(): Promise<void> {
   if (!["all", "desktop", "android"].includes(platforms)) usage(`Invalid --platforms "${platforms}". Use desktop | android | all.`);
   if (!SIGN_ROUTES.includes(values.sign)) usage(`Invalid --sign "${values.sign}". Use ${SIGN_ROUTES.join(" | ")}.`);
   if (values.headless && (values.sign === "amo" || values.sign === "unsigned")) usage("--headless only applies to --sign temporary.");
-  // A windowless Firefox can't show an install prompt, so --headless means a temporary install.
-  const sign = (values.headless ? "temporary" : values.sign) as SignRoute | "auto";
+  const sign = values.sign as SignRoute | "auto";
   if (values.install && platforms === "android") usage("--install targets desktop Firefox; use --platforms desktop or all.");
   if (values.verify && !values.install) usage("--verify requires --install (it checks the installed add-on).");
   if (values.headless && !values.install) usage("--headless requires --install (it is a way to install).");

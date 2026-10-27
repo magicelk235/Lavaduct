@@ -61,7 +61,7 @@ export function findFirefox(selector?: string): FirefoxInstall {
 }
 
 /** File and folder name for an extension: its name without spaces or punctuation. */
-export function deriveAppName(name: string): string {
+function deriveAppName(name: string): string {
   return name.replace(/[^\p{L}\p{N}_-]+/gu, "") || "Extension";
 }
 
@@ -282,7 +282,11 @@ function planRoute(opts: ConvertOptions, minFirefox: string): Plan {
     return {};
   }
   const install = findFirefox(opts.firefox);
-  const route = chooseRoute(opts.sign, hasCredentials, install);
+  // A Firefox without a window can't show an install prompt.
+  const route: RouteChoice =
+    opts.headless && opts.sign === "auto"
+      ? { route: "temporary", reason: "--headless loads the add-on temporarily" }
+      : chooseRoute(opts.sign, hasCredentials, install);
   if (opts.platforms !== "android" && compareFirefoxVersions(install.version, minFirefox) < 0) {
     throw new Error(
       `Firefox ${install.version} is older than ${minFirefox}, the add-on's minimum version, and would refuse it. ` +
