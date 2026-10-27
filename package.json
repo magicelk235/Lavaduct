@@ -20,6 +20,7 @@
   "engines": { "node": ">=22.13" },
   "license": "PolyForm-Shield-1.0.0",
   "devDependencies": {
+    "@mdn/browser-compat-data": "^8.1.7",
     "@types/node": "^22.13.0",
     "typescript": "^5.9.0"
   }
