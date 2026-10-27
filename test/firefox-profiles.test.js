@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ENV_PREFIX, DEDICATED_PROFILE } from "../dist/name.js";
@@ -164,13 +164,30 @@ test("the dedicated profile lives in the state directory and answers to its name
     const saved = process.env[key];
     process.env[key] = state;
     try {
-      const profile = dedicatedProfile();
+      const profile = dedicatedProfile(install);
       assert.equal(profile.path, join(state, "profiles", DEDICATED_PROFILE));
+      assert.ok(existsSync(profile.path));
       assert.equal(resolveProfile(DEDICATED_PROFILE, install).path, profile.path);
     } finally {
       if (saved === undefined) delete process.env[key];
       else process.env[key] = saved;
       rmSync(state, { recursive: true, force: true });
     }
+  });
+});
+
+test("snap and Flatpak Firefox get the dedicated profile where their sandbox can write", async () => {
+  await withFakeHome(({ home, install }) => {
+    // The state directory sits in a hidden folder neither sandbox can reach.
+    const snap = { ...install, sandbox: "snap" };
+    const snapProfile = join(home, "snap", "firefox", "common", `${DEDICATED_PROFILE}-profile`);
+    assert.deepEqual(dedicatedProfile(snap), { path: snapProfile, isDefault: false });
+    assert.ok(existsSync(snapProfile));
+    assert.equal(resolveProfile(DEDICATED_PROFILE, snap).path, snapProfile);
+
+    const flatpak = { ...install, sandbox: "flatpak" };
+    const flatpakProfile = join(home, ".var", "app", "org.mozilla.firefox", `${DEDICATED_PROFILE}-profile`);
+    assert.deepEqual(dedicatedProfile(flatpak), { path: flatpakProfile, isDefault: false });
+    assert.ok(existsSync(flatpakProfile));
   });
 });

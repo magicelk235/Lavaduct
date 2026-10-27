@@ -3,12 +3,16 @@ import { darwin } from "./darwin.js";
 import { linux } from "./linux.js";
 import { win32 } from "./win32.js";
 
+/** Linux packages that run Firefox in a sandbox with its own view of the home directory. */
+export type Sandbox = "snap" | "flatpak";
+
 /** A Firefox binary found on disk, before its build constants are read. */
 export interface InstallCandidate {
   /** What to start: the binary itself, or the launcher a package manager put on PATH. */
   binary: string;
   /** Directory holding omni.ja and the real binary, as this process sees it. */
   installDir: string;
+  sandbox?: Sandbox;
 }
 
 /** Where an install keeps its profiles and how it picks its default one. */

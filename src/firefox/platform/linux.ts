@@ -2,7 +2,7 @@ import { closeSync, existsSync, openSync, readFileSync, readSync, readlinkSync, 
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { which } from "../../util.js";
-import type { InstallCandidate, Platform } from "./index.js";
+import type { InstallCandidate, Platform, Sandbox } from "./index.js";
 import { symlinkLockHolder } from "./shared.js";
 
 const PATH_NAMES = ["firefox", "firefox-esr", "firefox-developer-edition", "firefox-nightly"];
@@ -23,13 +23,17 @@ const FLATPAK_SANDBOX_DIR = "/app/lib/firefox";
  * `sysRoot` prefixes those paths (tests point it at a fixture tree).
  */
 export function resolveLauncher(launcher: string, sysRoot = "/"): InstallCandidate | undefined {
+  const candidate = (installDir: string): InstallCandidate => {
+    const sandbox = sandboxOf(installDir);
+    return sandbox ? { binary: launcher, installDir, sandbox } : { binary: launcher, installDir };
+  };
   let real: string;
   try {
     real = realpathSync(launcher);
   } catch {
     return undefined;
   }
-  if (existsSync(join(dirname(real), "omni.ja"))) return { binary: launcher, installDir: dirname(real) };
+  if (existsSync(join(dirname(real), "omni.ja"))) return candidate(dirname(real));
 
   const head = Buffer.alloc(64 * 1024);
   let length: number;
@@ -48,7 +52,7 @@ export function resolveLauncher(launcher: string, sysRoot = "/"): InstallCandida
   for (const [token] of text.matchAll(/\/[\w.+@/-]+/g)) {
     for (const dir of [token, dirname(token), join(token, "firefox")]) {
       const installDir = join(sysRoot, dir);
-      if (existsSync(join(installDir, "omni.ja"))) return { binary: launcher, installDir };
+      if (existsSync(join(installDir, "omni.ja"))) return candidate(installDir);
     }
   }
   return undefined;
@@ -67,37 +71,51 @@ export function linuxInstallCandidates(sysRoot = "/", home = homedir()): Install
     if (candidate) out.push(candidate);
   }
   const snapDir = join(sysRoot, SNAP_INSTALL);
-  if (existsSync(join(snapDir, "omni.ja"))) out.push({ binary: join(sysRoot, SNAP_LAUNCHER), installDir: snapDir });
+  if (existsSync(join(snapDir, "omni.ja"))) {
+    out.push({ binary: join(sysRoot, SNAP_LAUNCHER), installDir: snapDir, sandbox: "snap" });
+  }
   for (const base of [join(sysRoot, "var/lib/flatpak"), join(home, ".local/share/flatpak")]) {
     const installDir = join(base, FLATPAK_INSTALL);
     const binary = join(base, FLATPAK_LAUNCHER);
-    if (existsSync(join(installDir, "omni.ja")) && existsSync(binary)) out.push({ binary, installDir });
+    if (existsSync(join(installDir, "omni.ja")) && existsSync(binary)) {
+      out.push({ binary, installDir, sandbox: "flatpak" });
+    }
   }
   return out;
 }
 
-function sandboxOf(installDir: string): "snap" | "flatpak" | undefined {
+function sandboxOf(installDir: string): Sandbox | undefined {
   if (installDir.includes("/snap/firefox/")) return "snap";
   if (installDir.includes("/flatpak/app/org.mozilla.firefox/")) return "flatpak";
   return undefined;
 }
 
 /**
+ * The folder in the home directory a sandboxed Firefox can write: the snap's
+ * $SNAP_USER_COMMON, which it also uses as its $HOME, or the Flatpak's own app
+ * folder. Hidden folders elsewhere in the home directory, such as the state
+ * directory, are out of its reach.
+ */
+export function sandboxHome(sandbox: Sandbox, home: string): string {
+  if (sandbox === "snap") return join(home, "snap", "firefox", "common");
+  return join(home, ".var", "app", "org.mozilla.firefox");
+}
+
+/**
  * The profiles.ini directory an install reads. Firefox 147+ uses
  * $XDG_CONFIG_HOME/mozilla/firefox unless ~/.mozilla already exists or
  * MOZ_LEGACY_HOME=1. The snap keeps the legacy layout under its own $HOME.
- * The Flatpak persists ~/.mozilla in its app directory and points
- * XDG_CONFIG_HOME at the app's config directory.
+ * The Flatpak persists ~/.mozilla in its app folder and points
+ * XDG_CONFIG_HOME at the app's config folder.
  */
 export function linuxProfileRoot(
-  installDir: string,
+  sandbox: Sandbox | undefined,
   home: string,
   env: { XDG_CONFIG_HOME?: string; MOZ_LEGACY_HOME?: string },
 ): string {
-  const sandbox = sandboxOf(installDir);
-  if (sandbox === "snap") return join(home, "snap", "firefox", "common", ".mozilla", "firefox");
+  if (sandbox === "snap") return join(sandboxHome("snap", home), ".mozilla", "firefox");
   if (sandbox === "flatpak") {
-    const app = join(home, ".var", "app", "org.mozilla.firefox");
+    const app = sandboxHome("flatpak", home);
     return existsSync(join(app, ".mozilla"))
       ? join(app, ".mozilla", "firefox")
       : join(app, "config", "mozilla", "firefox");
@@ -164,24 +182,23 @@ export const linux: Platform = {
 
   profileRoots() {
     const home = homedir();
-    const flatpak = join(home, ".var", "app", "org.mozilla.firefox");
+    const flatpak = sandboxHome("flatpak", home);
     // Both native roots can exist when an older and a newer Firefox share a machine.
     return [
       join(home, ".mozilla", "firefox"),
       join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "mozilla", "firefox"),
-      join(home, "snap", "firefox", "common", ".mozilla", "firefox"),
+      join(sandboxHome("snap", home), ".mozilla", "firefox"),
       join(flatpak, ".mozilla", "firefox"),
       join(flatpak, "config", "mozilla", "firefox"),
     ];
   },
 
   profileSetup(install) {
-    const sandbox = sandboxOf(install.installDir);
     return {
-      roots: [linuxProfileRoot(install.installDir, homedir(), process.env)],
-      hashDir: sandbox === "flatpak" ? FLATPAK_SANDBOX_DIR : install.installDir,
+      roots: [linuxProfileRoot(install.sandbox, homedir(), process.env)],
+      hashDir: install.sandbox === "flatpak" ? FLATPAK_SANDBOX_DIR : install.installDir,
       // The snap runs with legacy profiles and never writes [Install…] sections.
-      legacy: sandbox === "snap",
+      legacy: install.sandbox === "snap",
     };
   },
 

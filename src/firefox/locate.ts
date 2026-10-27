@@ -1,5 +1,5 @@
 import { readAppConstants } from "./appconstants.js";
-import { platform, type InstallCandidate } from "./platform/index.js";
+import { platform, type InstallCandidate, type Sandbox } from "./platform/index.js";
 import { pathKey } from "./platform/shared.js";
 
 export interface FirefoxInstall {
@@ -12,6 +12,11 @@ export interface FirefoxInstall {
   version: string;
   /** Release and Beta builds ignore xpinstall.signatures.required. */
   requireSigning: boolean;
+  /**
+   * Set for the snap and Flatpak packages on Linux, whose Firefox only sees
+   * part of the home directory.
+   */
+  sandbox?: Sandbox;
 }
 
 // Names people use for channels, mapped to MOZ_UPDATE_CHANNEL values.

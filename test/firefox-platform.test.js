@@ -193,10 +193,15 @@ test("Linux: snap and Flatpak installs are found next to the ones on PATH", { sk
     try {
       assert.deepEqual(linuxInstallCandidates(root, home), [
         { binary: join(root, "bin/firefox"), installDir: join(root, "usr/lib/firefox") },
-        { binary: join(root, "snap/bin/firefox"), installDir: join(root, "snap/firefox/current/usr/lib/firefox") },
+        {
+          binary: join(root, "snap/bin/firefox"),
+          installDir: join(root, "snap/firefox/current/usr/lib/firefox"),
+          sandbox: "snap",
+        },
         {
           binary: join(flatpak, "exports/bin/org.mozilla.firefox"),
           installDir: join(flatpak, "app/org.mozilla.firefox/current/active/files/lib/firefox"),
+          sandbox: "flatpak",
         },
       ]);
     } finally {
@@ -207,24 +212,35 @@ test("Linux: snap and Flatpak installs are found next to the ones on PATH", { sk
 
 test("Linux: each kind of install reads its own profile root", () => {
   withTree((home) => {
-    const native = "/usr/lib/firefox";
     // Firefox 147+ with no ~/.mozilla yet: XDG config dir.
-    assert.equal(linuxProfileRoot(native, home, {}), join(home, ".config/mozilla/firefox"));
-    assert.equal(linuxProfileRoot(native, home, { XDG_CONFIG_HOME: "/cfg" }), "/cfg/mozilla/firefox");
+    assert.equal(linuxProfileRoot(undefined, home, {}), join(home, ".config/mozilla/firefox"));
+    assert.equal(linuxProfileRoot(undefined, home, { XDG_CONFIG_HOME: "/cfg" }), "/cfg/mozilla/firefox");
     // A relative XDG_CONFIG_HOME is invalid by the XDG spec and ignored.
-    assert.equal(linuxProfileRoot(native, home, { XDG_CONFIG_HOME: "cfg" }), join(home, ".config/mozilla/firefox"));
-    assert.equal(linuxProfileRoot(native, home, { MOZ_LEGACY_HOME: "1" }), join(home, ".mozilla/firefox"));
+    assert.equal(linuxProfileRoot(undefined, home, { XDG_CONFIG_HOME: "cfg" }), join(home, ".config/mozilla/firefox"));
+    assert.equal(linuxProfileRoot(undefined, home, { MOZ_LEGACY_HOME: "1" }), join(home, ".mozilla/firefox"));
     // Any ~/.mozilla (native messaging hosts, other Mozilla apps) keeps the legacy layout.
     mkdirSync(join(home, ".mozilla/native-messaging-hosts"), { recursive: true });
-    assert.equal(linuxProfileRoot(native, home, {}), join(home, ".mozilla/firefox"));
+    assert.equal(linuxProfileRoot(undefined, home, {}), join(home, ".mozilla/firefox"));
 
-    assert.equal(
-      linuxProfileRoot("/snap/firefox/current/usr/lib/firefox", home, {}),
-      join(home, "snap/firefox/common/.mozilla/firefox"),
-    );
-    const flatpakDir = "/var/lib/flatpak/app/org.mozilla.firefox/current/active/files/lib/firefox";
-    assert.equal(linuxProfileRoot(flatpakDir, home, {}), join(home, ".var/app/org.mozilla.firefox/config/mozilla/firefox"));
+    assert.equal(linuxProfileRoot("snap", home, {}), join(home, "snap/firefox/common/.mozilla/firefox"));
+    assert.equal(linuxProfileRoot("flatpak", home, {}), join(home, ".var/app/org.mozilla.firefox/config/mozilla/firefox"));
     mkdirSync(join(home, ".var/app/org.mozilla.firefox/.mozilla/firefox"), { recursive: true });
-    assert.equal(linuxProfileRoot(flatpakDir, home, {}), join(home, ".var/app/org.mozilla.firefox/.mozilla/firefox"));
+    assert.equal(linuxProfileRoot("flatpak", home, {}), join(home, ".var/app/org.mozilla.firefox/.mozilla/firefox"));
+  });
+});
+
+test("Linux: --firefox pointing into the snap or the Flatpak is treated as sandboxed", { skip: posixOnly }, () => {
+  withTree((root) => {
+    const snapDir = join(root, "snap/firefox/current/usr/lib/firefox");
+    touch(join(snapDir, "omni.ja"));
+    touch(join(snapDir, "firefox"));
+    const flatpakDir = join(root, "var/lib/flatpak/app/org.mozilla.firefox/current/active/files/lib/firefox");
+    touch(join(flatpakDir, "omni.ja"));
+    touch(join(flatpakDir, "firefox"));
+    touch(join(root, "usr/lib/firefox/omni.ja"));
+    touch(join(root, "usr/lib/firefox/firefox"));
+    assert.equal(resolveLauncher(join(snapDir, "firefox"), root)?.sandbox, "snap");
+    assert.equal(resolveLauncher(join(flatpakDir, "firefox"), root)?.sandbox, "flatpak");
+    assert.equal(resolveLauncher(join(root, "usr/lib/firefox/firefox"), root)?.sandbox, undefined);
   });
 });

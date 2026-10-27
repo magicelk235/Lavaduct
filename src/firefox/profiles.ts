@@ -1,10 +1,12 @@
 import { mkdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { DEDICATED_PROFILE } from "../name.js";
 import { stateDir } from "../state.js";
 import { installHash } from "./cityhash.js";
 import type { FirefoxInstall } from "./locate.js";
 import { platform } from "./platform/index.js";
+import { sandboxHome } from "./platform/linux.js";
 import { pathKey, realPath } from "./platform/shared.js";
 
 export interface FirefoxProfile {
@@ -187,7 +189,7 @@ export function resolveProfile(selector: string | undefined, install: FirefoxIns
   if (!/[\\/]/.test(selector)) {
     const named = own.find((p) => p.name === selector) ?? listProfiles().find((p) => p.name === selector);
     if (named) return { ...named, isDefault: own.includes(named) && named.isDefault };
-    if (selector === DEDICATED_PROFILE) return dedicatedProfile();
+    if (selector === DEDICATED_PROFILE) return dedicatedProfile(install);
     if (!isDir(selector)) {
       throw new Error(
         `No Firefox profile named "${selector}". Run --doctor to list profiles, or pass a profile directory.`,
@@ -212,10 +214,15 @@ export function profileInUse(profilePath: string): boolean {
 
 /**
  * The profile the temporary route uses unless told otherwise, kept apart from
- * the user's own profiles so they never run under remote control.
+ * the user's own profiles so they never run under remote control. It lives in
+ * the state directory, except for snap and Flatpak Firefox, whose sandboxes
+ * can't reach that hidden folder: theirs goes in the folder the sandbox can
+ * write.
  */
-export function dedicatedProfile(): FirefoxProfile {
-  const path = join(stateDir(), "profiles", DEDICATED_PROFILE);
+export function dedicatedProfile(install: FirefoxInstall): FirefoxProfile {
+  const path = install.sandbox
+    ? join(sandboxHome(install.sandbox, homedir()), `${DEDICATED_PROFILE}-profile`)
+    : join(stateDir(), "profiles", DEDICATED_PROFILE);
   mkdirSync(path, { recursive: true });
   return { path, isDefault: false };
 }
