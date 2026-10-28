@@ -173,20 +173,32 @@ it leaves Firefox alone and tells you what is left to do.
 
 ### temporary
 
-lavaduct starts Firefox with its remote protocol turned on and loads the staged
-extension folder through it. Firefox loads a temporary add-on from where it lies,
-so keep the output folder while Firefox runs; the add-on disappears when Firefox
-quits. This needs Firefox 138 or newer.
+lavaduct starts Firefox with its remote debugging server on and loads the staged
+extension folder through it, the way `web-ext run` does. Firefox loads a temporary
+add-on from where it lies, so keep the output folder while Firefox runs; the add-on
+disappears when Firefox quits. Unlike browser automation (WebDriver), remote
+debugging leaves `navigator.webdriver` false, so sites that turn automated browsers
+away at sign-in let you log in. While the debugging server runs, Firefox shows a
+robot icon in the address bar; web pages can't see it.
+
+To turn the server on, lavaduct sets `devtools.debugger.remote-enabled`,
+`devtools.chrome.enabled`, `devtools.debugger.prompt-connection` and
+`devtools.debugger.force-local` in the profile's `user.js`, and lists them when it
+does. Whatever connects to the server controls Firefox completely, and it asks for
+no password. On macOS and Linux it listens on a socket in a folder only you can
+open. On Windows, Firefox can only listen on a local network port, which other
+programs on the computer can reach while that Firefox runs.
 
 By default the add-on goes into a separate `lavaduct` profile that lavaduct creates, so your
-own profile never runs under remote control. While remote control is on, Firefox
-marks it in the address bar. `--profile` loads it into another profile; if Firefox
-has that profile open, lavaduct quits it and starts it again with remote control,
-unless you pass `--no-firefox-restart`. Further temporary installs reuse a Firefox
-lavaduct already started, so several add-ons can be loaded side by side.
+own profile never gets remote debugging turned on. `--profile` loads it into another
+profile; if Firefox has that profile open without the debugging server, lavaduct quits it
+and starts it again with the server on, unless you pass `--no-firefox-restart`.
+Further temporary installs reuse a Firefox lavaduct already started, so several add-ons
+can be loaded side by side.
 
-`--headless` loads the add-on into a Firefox without a window and quits it again,
-which checks that Firefox accepts the add-on. It is meant for CI.
+`--headless` loads the add-on into a Firefox without a window, over WebDriver, and
+quits it again, which checks that Firefox accepts the add-on. It is meant for CI and
+needs Firefox 138 or newer.
 
 ### Checking the install
 

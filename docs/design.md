@@ -43,7 +43,7 @@ src/
   analyze/          analyze.ts report.ts
   runtime/          shim.ts firefox-compat-shim.js oauth-bridge.ts debug-ring.js
   sign/             amo.ts
-  firefox/          locate.ts appconstants.ts profiles.ts cityhash.ts bidi.ts launch.ts
+  firefox/          locate.ts appconstants.ts profiles.ts cityhash.ts rdp.ts bidi.ts launch.ts
                     install.ts extensions-json.ts storage.ts snappy.ts structured-clone.ts
                     platform/darwin.ts platform/win32.ts platform/linux.ts
 scripts/
@@ -151,16 +151,25 @@ The CLI launches the chosen Firefox with the profile and the absolute `.xpi` pat
 
 ### Temporary route
 
-The CLI installs the add-on over WebDriver BiDi (`firefox/bidi.ts`, using Node's built-in `WebSocket`). It needs Firefox 138 or later, where `webExtension.install` installs temporarily and skips the signature check; older versions are below the default minimum anyway.
+The CLI loads the add-on through Firefox's devtools server over the Remote Debugging Protocol (`firefox/rdp.ts`, on `node:net`), the way `web-ext run` and about:debugging do. The addons actor's `installTemporaryAddon` loads it temporarily and skips the signature check. WebDriver BiDi's `webExtension.install` does the same, but while Firefox's remote agent runs, every page sees `navigator.webdriver` as true and the agent applies its automation prefs (safe browsing, the popup blocker and updates off, among others), so sign-in checks such as Cloudflare's and Google's take the browser for a bot. The devtools server sets neither: Firefox's `Navigator::Webdriver()` only asks Marionette and the remote agent.
 
-1. Start Firefox with `--remote-debugging-port 0` and the profile. The flag only works at process start, so the profile must not already be open in a running Firefox.
-2. Read the port from `<profile>/WebDriverBiDiServer.json` (`ws_port`).
-3. Connect to `ws://127.0.0.1:<port>/session`, send `session.new` with empty capabilities, then `webExtension.install` with `{type: "path", path: <absolute staged directory>}`.
-4. Send `session.end` and disconnect. Firefox keeps running with the add-on loaded.
+1. Write the prefs the server needs to the profile's `user.js`, and list them in the output: `devtools.debugger.remote-enabled` and `devtools.chrome.enabled`, which Firefox checks before it starts the server; `devtools.debugger.prompt-connection = false`, without which every connection waits for the user to accept it in a dialog; and `devtools.debugger.force-local = true`, the default, which keeps a TCP server on loopback.
+2. Start Firefox with `--start-debugger-server <socket path or port> --profile <path>`. The CLI only passes the flag to a Firefox it starts, so the profile must not already be open in a running Firefox.
+3. Record the address in `<profile>/lavaduct-debugger.json`, connect, wait for the root actor's greeting, send `getRoot` for the `addonsActor`, then `installTemporaryAddon` with the absolute staged directory. Each packet is a decimal byte count, a colon and that many bytes of UTF-8 JSON.
+4. Disconnect. Firefox keeps running with the add-on loaded, and its server keeps listening until Firefox quits. A later temporary install finds the address in `lavaduct-debugger.json`, connects to the same Firefox and loads its add-on next to the others instead of restarting Firefox, which would drop them.
 
-Temporary add-ons are loaded in place, so the staged directory has to stay on disk while Firefox runs; it lives in the output directory, not in scratch space. No prefs are written. While the remote agent runs, Firefox shows its remote-control indicator and applies its automation prefs for that session.
+The devtools server asks for no credentials and gives every connection full chrome privileges, so its address decides who can control that Firefox:
 
-By default the add-on goes into a dedicated `lavaduct` profile, which the CLI creates if needed, so the user's own profile is never opened under remote control. `--profile` uses another profile instead; if that profile is open, the CLI quits Firefox and relaunches it with the flag, unless `--no-firefox-restart` is set, in which case it refuses. The add-on is removed when Firefox restarts.
+- macOS and Linux: a Unix domain socket. Firefox binds a `--start-debugger-server` argument that starts with `/` as a socket file (`devtools/shared/security/socket.js`) and makes that file mode 0666, so the socket sits in a folder the CLI creates with `mkdtemp`, mode 0700: only the user's own processes can get to it. The folder goes in the profile, which Snap and Flatpak Firefox can see (their `/tmp` is their own) and which takes the folder along when it is deleted; when that would make the path longer than the 103 bytes a socket address holds, it goes in the temp directory instead. The next start on the profile removes the previous folder.
+- Windows: Firefox has no Unix domain sockets there (`nsServerSocket::InitWithFilename` is Unix-only), so the server listens on a free `127.0.0.1` port the CLI picks. Any local process, another user's included, can connect to it while that Firefox runs, as with `web-ext run`.
+
+The prefs stay in `user.js`; the server only listens in a Firefox started with the flag. While it listens, Firefox shows its remote-control cue (a striped address bar with a robot icon) as it does for the remote agent. Pages can't see the cue.
+
+Temporary add-ons are loaded in place, so the staged directory has to stay on disk while Firefox runs; it lives in the output directory, not in scratch space.
+
+By default the add-on goes into a dedicated `lavaduct` profile, which the CLI creates if needed, so the user's own profile never gets remote debugging turned on. `--profile` uses another profile instead. If the profile is open in a Firefox whose devtools server the CLI can't reach, such as one the user started or one an earlier version left running under the remote agent, the CLI quits Firefox and relaunches it with the flag, unless `--no-firefox-restart` is set, in which case it refuses. The add-on is removed when Firefox restarts.
+
+`--headless` installs go over WebDriver BiDi instead (`firefox/bidi.ts`, using Node's built-in `WebSocket`): the CLI starts Firefox without a window with `--remote-debugging-port 0`, reads the port from `<profile>/WebDriverBiDiServer.json`, connects to `ws://127.0.0.1:<port>/session`, and sends `session.new`, `webExtension.install` (temporary from Firefox 138) and `browser.close`. Nobody browses in that Firefox, so `navigator.webdriver` doesn't matter there, and BiDi can close Firefox, which the devtools protocol has no command for.
 
 ### Native messaging
 
@@ -213,7 +222,7 @@ Each install's default profile comes from its `[Install<hash>] Default=` entry, 
 
 `--list` reads `extensions.json` in the chosen profile, or every profile of the chosen install, and prints each add-on's name, ID, version and enabled state. Add-ons this CLI installed are marked.
 
-`--uninstall <name|id>` starts Firefox headless on the profile with `--remote-debugging-port 0` and calls BiDi `webExtension.uninstall`, which removes the add-on and its data the same way about:addons does. If the profile is open, the CLI quits Firefox first and relaunches it afterwards, unless `--no-firefox-restart` is set, in which case it refuses. The signed-file cache entry for that ID is removed too.
+`--uninstall <name|id>` starts Firefox headless on the profile with `--remote-debugging-port 0` and calls BiDi `webExtension.uninstall`, which removes the add-on and its data the same way about:addons does. The devtools server's `uninstallAddon` can't do this: it only removes temporary add-ons. If the profile is open, the CLI quits Firefox first and relaunches it afterwards, unless `--no-firefox-restart` is set, in which case it refuses. The signed-file cache entry for that ID is removed too.
 
 `--logs <name|id>` prints the `--debug` ring buffer from a profile:
 
@@ -248,8 +257,9 @@ Unit tests run with `node --test`, one file per behaviour or quirk:
 - The AMO JWT against a known test vector, add-on ID derivation, and version stamping.
 - `profiles.ini`, `installs.ini` and `extensions.json` parsing from fixtures for each OS, and channel detection.
 - Snappy and structured-clone decoding on fixtures captured from a real Firefox profile.
+- Devtools protocol framing against a fake server: packets counted in bytes and split mid-character, events among replies, and an address where no devtools server answers.
 
-Integration tests run in GitHub Actions on macOS, Windows and Linux with Firefox Nightly. They convert a small fixture corpus, install through the unsigned and temporary routes, and check that each add-on is active. The large real-extension corpus (Dark Reader, MetaMask, Tampermonkey, LastPass and others) stays local, as it does for viaduct-cli.
+Integration tests run in GitHub Actions on macOS, Windows and Linux with Firefox Nightly. They convert a small fixture corpus, install through the unsigned and temporary routes, and check that each add-on is active and that pages see `navigator.webdriver` as false next to a temporary add-on. The large real-extension corpus (Dark Reader, MetaMask, Tampermonkey, LastPass and others) stays local, as it does for viaduct-cli.
 
 An opt-in AMO test runs when `AMO_TEST_KEY` and `AMO_TEST_SECRET` are set. It signs one small fixture add-on with a fixed ID as unlisted.
 
@@ -261,4 +271,4 @@ For the Viaduct app, the stable contract is the `--analyze --json` schema (the s
 
 ## Sources
 
-The Firefox and AMO behaviour this design relies on was checked against Mozilla's documentation and Firefox, addons-server and web-ext source in October 2026. The main references are the AMO API docs (`mozilla.github.io/addons-server/topics/api/`), web-ext's `src/util/submit-addon.js`, Firefox's `remote/webdriver-bidi/modules/root/webExtension.sys.mjs`, `toolkit/components/extensions/ExtensionStorageIDB.sys.mjs`, `js/src/vm/StructuredClone.cpp`, and MDN's WebExtensions manifest pages.
+The Firefox and AMO behaviour this design relies on was checked against Mozilla's documentation and Firefox, addons-server and web-ext source in October 2026. The main references are the AMO API docs (`mozilla.github.io/addons-server/topics/api/`), web-ext's `src/util/submit-addon.js`, `src/firefox/remote.js` and `src/firefox/rdp-client.js`, Firefox's `remote/webdriver-bidi/modules/root/webExtension.sys.mjs`, `devtools/startup/DevToolsStartup.sys.mjs`, `devtools/shared/security/socket.js`, `devtools/server/actors/addon/addons.js`, `dom/base/Navigator.cpp`, `toolkit/components/extensions/ExtensionStorageIDB.sys.mjs`, `js/src/vm/StructuredClone.cpp`, and MDN's WebExtensions manifest pages.
