@@ -151,7 +151,7 @@ test(
 
     const profile = join(scratch, "profile");
     mkdirSync(profile);
-    const session = await BidiSession.start(firefox, profile, { headless: true });
+    const session = await BidiSession.start(firefox, profile);
     let steps = {};
     try {
       const id = await session.installExtension(result.stagedPath);

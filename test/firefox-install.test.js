@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { ENV_PREFIX } from "../dist/name.js";
 import {
   allowUnsignedInProfile,
+  enableDebuggerServerInProfile,
   recordInstall,
   recordedInstalls,
   removeInstallRecord,
@@ -53,6 +54,27 @@ test("allowUnsignedInProfile creates user.js in a profile that has none", async 
   await withDir("lavaduct-userjs-", (profile) => {
     assert.deepEqual(allowUnsignedInProfile(profile), { changed: true });
     assert.equal(readFileSync(join(profile, "user.js"), "utf-8"), 'user_pref("xpinstall.signatures.required", false);\n');
+  });
+});
+
+test("enableDebuggerServerInProfile turns on the devtools server without a connection prompt, keeping other prefs", async () => {
+  await withDir("lavaduct-userjs-", (profile) => {
+    const userJs = join(profile, "user.js");
+    // A prompting server would leave every install waiting on a dialog.
+    writeFileSync(
+      userJs,
+      'user_pref("xpinstall.signatures.required", false);\r\n' + 'user_pref("devtools.debugger.prompt-connection", true);\r\n',
+    );
+    assert.deepEqual(enableDebuggerServerInProfile(profile), { changed: true });
+    assert.equal(
+      readFileSync(userJs, "utf-8"),
+      'user_pref("xpinstall.signatures.required", false);\r\n' +
+        'user_pref("devtools.debugger.prompt-connection", false);\r\n' +
+        'user_pref("devtools.debugger.remote-enabled", true);\r\n' +
+        'user_pref("devtools.chrome.enabled", true);\r\n' +
+        'user_pref("devtools.debugger.force-local", true);\r\n',
+    );
+    assert.deepEqual(enableDebuggerServerInProfile(profile), { changed: false });
   });
 });
 

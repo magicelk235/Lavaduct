@@ -477,8 +477,9 @@ async function uninstallAddon(query: string, profileSelector: string | undefined
     try {
       info(`Removing ${addon.name} (${addon.id}) from ${profile.path} …`);
       // A Firefox without a window, started just for this: the remote agent only
-      // starts with a new process.
-      const session = await BidiSession.start(install, profile.path, { headless: true });
+      // starts with a new process. The devtools server the temporary route uses
+      // can only remove temporary add-ons.
+      const session = await BidiSession.start(install, profile.path);
       try {
         await session.uninstallExtension(addon.id);
       } finally {

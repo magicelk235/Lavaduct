@@ -53,10 +53,11 @@ function connect(port: number): Promise<WebSocket> {
 }
 
 /**
- * A WebDriver BiDi session with a Firefox that runs its remote agent. Firefox
- * only starts the agent when launched with --remote-debugging-port, so a
- * session either comes with a Firefox started for it, or attaches to one an
- * earlier session started and left running.
+ * A WebDriver BiDi session with a windowless Firefox started for it, for jobs
+ * nobody browses in: --headless installs and --uninstall. While the remote
+ * agent runs, every page sees navigator.webdriver as true, so the temporary
+ * route a user sees goes through Firefox's devtools server instead (rdp.ts).
+ * Unlike that server, BiDi can uninstall add-ons for good and close Firefox.
  */
 export class BidiSession {
   private nextId = 1;
@@ -66,8 +67,7 @@ export class BidiSession {
 
   private constructor(
     private readonly ws: WebSocket,
-    /** The Firefox started for this session; unset for an attached one. */
-    private readonly child: ChildProcess | undefined,
+    private readonly child: ChildProcess,
     private readonly profilePath: string,
   ) {
     ws.addEventListener("message", (event) => this.onMessage(event.data));
@@ -75,15 +75,12 @@ export class BidiSession {
   }
 
   /**
-   * Launch Firefox on the profile with its remote agent on a free port and open
-   * a session. Fails when a running Firefox already has the profile open:
-   * that Firefox would take over the launch without starting the agent.
+   * Launch Firefox without a window on the profile, with its remote agent on a
+   * free port, and open a session. Fails when a running Firefox already has
+   * the profile open: that Firefox would take over the launch without starting
+   * the agent.
    */
-  static async start(
-    install: FirefoxInstall,
-    profilePath: string,
-    opts: { headless?: boolean } = {},
-  ): Promise<BidiSession> {
+  static async start(install: FirefoxInstall, profilePath: string): Promise<BidiSession> {
     const profile = resolve(profilePath);
     if (profileInUse(profile)) {
       throw new Error(
@@ -95,8 +92,7 @@ export class BidiSession {
     // Left behind by a Firefox that didn't shut down cleanly; its port is stale.
     rmSync(serverFile, { force: true });
 
-    const headless = opts.headless === true;
-    const child = launchFirefox(install, ["--remote-debugging-port", "0", "--profile", profile], { headless });
+    const child = launchFirefox(install, ["--remote-debugging-port", "0", "--profile", profile], { headless: true });
     let failure: string | undefined;
     child.once("error", (err) => {
       failure = err.message;
@@ -123,7 +119,7 @@ export class BidiSession {
       await sleep(100);
     }
     if (!ws) {
-      if (headless) child.kill();
+      child.kill();
       throw new Error(`Couldn't start a remote session with ${install.binary}: ${failure ?? lastError}.`);
     }
 
@@ -132,29 +128,8 @@ export class BidiSession {
       await session.open(install);
     } catch (err) {
       ws.close();
-      if (headless) child.kill();
+      child.kill();
       throw err;
-    }
-    return session;
-  }
-
-  /**
-   * Open a session with the Firefox that has the profile open with its remote
-   * agent running, such as one a session ended with end() left behind. Undefined
-   * when there's no such Firefox, or its agent already serves another session.
-   */
-  static async attach(install: FirefoxInstall, profilePath: string): Promise<BidiSession | undefined> {
-    const profile = resolve(profilePath);
-    if (!profileInUse(profile)) return undefined;
-    const port = readServerPort(join(profile, SERVER_FILE));
-    const ws = port ? await connect(port).catch(() => undefined) : undefined;
-    if (!ws) return undefined;
-    const session = new BidiSession(ws, undefined, profile);
-    try {
-      await session.open(install);
-    } catch {
-      ws.close();
-      return undefined;
     }
     return session;
   }
@@ -206,16 +181,6 @@ export class BidiSession {
     }
   }
 
-  /** End the session and disconnect. Firefox keeps running. */
-  async end(): Promise<void> {
-    try {
-      if (!this.closed) await this.command("session.end", {});
-    } finally {
-      this.ws.close();
-      this.child?.unref();
-    }
-  }
-
   /** Quit Firefox and wait until it has let go of the profile. */
   async closeBrowser(): Promise<void> {
     if (!this.closed) {
@@ -227,11 +192,8 @@ export class BidiSession {
       }
     }
     const deadline = Date.now() + QUIT_TIMEOUT_MS;
-    // An attached session has no process of its own to watch; the profile lock tells.
-    const running = (): boolean =>
-      (this.child !== undefined && this.child.exitCode === null && this.child.signalCode === null) ||
-      profileInUse(this.profilePath);
-    while (running()) {
+    // Firefox may have restarted itself into a new process, which holds the profile lock.
+    while ((this.child.exitCode === null && this.child.signalCode === null) || profileInUse(this.profilePath)) {
       if (Date.now() > deadline) throw new Error(`Firefox didn't quit within ${QUIT_TIMEOUT_MS / 1000} s.`);
       await sleep(100);
     }

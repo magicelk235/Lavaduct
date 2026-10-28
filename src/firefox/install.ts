@@ -6,16 +6,28 @@ import type { SignRoute } from "../types.js";
 import { readInstalledAddons } from "./extensions-json.js";
 import { pathKey } from "./platform/shared.js";
 
-const SIGNATURE_PREF_LINE = 'user_pref("xpinstall.signatures.required", false);';
-const SIGNATURE_PREF_RE = /^\s*(?:user_|sticky_)?pref\(\s*["']xpinstall\.signatures\.required["']/;
+// A line of user.js or prefs.js that sets a pref, and the pref's name.
+const PREF_LINE_RE = /^\s*(?:user_|sticky_)?pref\(\s*["']([^"']+)["']/;
 
 /**
- * Turn off add-on signature enforcement in a profile through its user.js,
- * replacing any line that already sets the pref. Firefox reads user.js at
- * startup, so `changed` means a running Firefox needs a restart to pick it up.
- * Release and Beta builds ignore the pref.
+ * Prefs Firefox checks before it starts its devtools server, the one the
+ * temporary route loads add-ons through.
  */
-export function allowUnsignedInProfile(profilePath: string): { changed: boolean } {
+export const DEBUGGER_SERVER_PREFS: Readonly<Record<string, boolean>> = {
+  "devtools.debugger.remote-enabled": true,
+  "devtools.chrome.enabled": true,
+  // Otherwise each connection waits for the user to accept it in a dialog.
+  "devtools.debugger.prompt-connection": false,
+  // The default: a server on a TCP port (Windows) listens on loopback only.
+  "devtools.debugger.force-local": true,
+};
+
+/**
+ * Set prefs in the profile's user.js, replacing any line that already sets one
+ * of them and keeping the rest. Firefox reads user.js at startup, so `changed`
+ * means a running Firefox needs a restart to pick them up.
+ */
+function setUserPrefs(profilePath: string, prefs: Readonly<Record<string, boolean>>): { changed: boolean } {
   const file = join(profilePath, "user.js");
   let before = "";
   try {
@@ -27,19 +39,40 @@ export function allowUnsignedInProfile(profilePath: string): { changed: boolean 
   const lines = before ? before.split(/\r?\n/) : [];
   if (lines.at(-1) === "") lines.pop();
 
-  let placed = false;
+  const placed = new Set<string>();
   const kept = lines.flatMap((line) => {
-    if (!SIGNATURE_PREF_RE.test(line)) return [line];
-    if (placed) return [];
-    placed = true;
-    return [SIGNATURE_PREF_LINE];
+    const name = PREF_LINE_RE.exec(line)?.[1];
+    if (name === undefined || !Object.hasOwn(prefs, name)) return [line];
+    if (placed.has(name)) return [];
+    placed.add(name);
+    return [`user_pref(${JSON.stringify(name)}, ${prefs[name]});`];
   });
-  if (!placed) kept.push(SIGNATURE_PREF_LINE);
+  for (const [name, value] of Object.entries(prefs)) {
+    if (!placed.has(name)) kept.push(`user_pref(${JSON.stringify(name)}, ${value});`);
+  }
 
   const after = kept.join(eol) + eol;
   if (after === before) return { changed: false };
   writeFileSync(file, after);
   return { changed: true };
+}
+
+/**
+ * Turn off add-on signature enforcement in a profile through its user.js;
+ * `changed` means a running Firefox needs a restart to pick that up. Release
+ * and Beta builds ignore the pref.
+ */
+export function allowUnsignedInProfile(profilePath: string): { changed: boolean } {
+  return setUserPrefs(profilePath, { "xpinstall.signatures.required": false });
+}
+
+/**
+ * Let Firefox start its devtools server on the profile, through its user.js.
+ * The server itself only starts when Firefox is launched with
+ * --start-debugger-server, and only listens until Firefox quits.
+ */
+export function enableDebuggerServerInProfile(profilePath: string): { changed: boolean } {
+  return setUserPrefs(profilePath, DEBUGGER_SERVER_PREFS);
 }
 
 /**

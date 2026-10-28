@@ -129,7 +129,7 @@ export interface ConvertOptions {
   firefox?: string;
   /** After installing, poll extensions.json until the add-on is active. */
   verify?: boolean;
-  /** Allow quitting and relaunching Firefox when a pref or remote agent needs a restart. */
+  /** Allow quitting and relaunching Firefox when a pref, the devtools server or the remote agent needs a restart. */
   firefoxRestart: boolean;
   /** Launch Firefox to install; false stops once the .xpi is written. */
   launch: boolean;

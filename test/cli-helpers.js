@@ -1,7 +1,8 @@
 // Shared setup for the CLI tests: runs the built CLI in a child process with its
 // per-user directories in a throwaway dir and no AMO credentials from the
 // environment, so a developer's own keys never reach AMO from a test.
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -19,12 +20,7 @@ export function tempDir(t, prefix = "lavaduct-cli-") {
   return dir;
 }
 
-/**
- * Run the CLI. `state` holds the state and cache dirs; pass the same one to two
- * runs to share the add-on ID salt. With `home`, profile discovery reads that
- * directory instead of the real Firefox profiles.
- */
-export function runCli(args, { cwd, state, home, env = {} } = {}) {
+function cliEnv({ state, home, env = {} }) {
   const base = { ...process.env, NO_COLOR: "1" };
   for (const name of CREDENTIAL_VARS) delete base[name];
   if (state) {
@@ -36,8 +32,28 @@ export function runCli(args, { cwd, state, home, env = {} } = {}) {
     delete base.XDG_CONFIG_HOME;
     delete base.MOZ_LEGACY_HOME;
   }
-  const res = spawnSync(process.execPath, [CLI, ...args], { cwd, encoding: "utf-8", env: { ...base, ...env } });
+  return { ...base, ...env };
+}
+
+/**
+ * Run the CLI. `state` holds the state and cache dirs; pass the same one to two
+ * runs to share the add-on ID salt. With `home`, profile discovery reads that
+ * directory instead of the real Firefox profiles.
+ */
+export function runCli(args, { cwd, ...opts } = {}) {
+  const res = spawnSync(process.execPath, [CLI, ...args], { cwd, encoding: "utf-8", env: cliEnv(opts) });
   return { code: res.status, stdout: res.stdout, stderr: res.stderr };
+}
+
+/** runCli without blocking the event loop, for a test that serves pages to Firefox while the CLI runs. */
+export async function runCliAsync(args, { cwd, ...opts } = {}) {
+  const child = spawn(process.execPath, [CLI, ...args], { cwd, env: cliEnv(opts) });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf-8").on("data", (chunk) => (stdout += chunk));
+  child.stderr.setEncoding("utf-8").on("data", (chunk) => (stderr += chunk));
+  const [code] = await once(child, "close");
+  return { code, stdout, stderr };
 }
 
 /** Write files into `dir`; objects are written as JSON. */

@@ -1,11 +1,13 @@
 // Runs a real Firefox, headless and on throwaway profiles only.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { BidiSession } from "../dist/firefox/bidi.js";
-import { openXpiInFirefox, quitFirefoxForProfile } from "../dist/firefox/launch.js";
+import { launchFirefox, openXpiInFirefox, quitFirefoxForProfile } from "../dist/firefox/launch.js";
 import { findFirefoxInstalls, selectFirefox } from "../dist/firefox/locate.js";
 import { profileInUse } from "../dist/firefox/profiles.js";
 
@@ -34,12 +36,12 @@ test("a headless session installs and uninstalls an unpacked add-on", { skip: no
         browser_specific_settings: { gecko: { id: "bidi-probe@example.invalid" } },
       }),
     );
-    const session = await BidiSession.start(firefox, profile, { headless: true });
+    const session = await BidiSession.start(firefox, profile);
     try {
       assert.equal(profileInUse(profile), true);
       // A running Firefox would swallow a second launch without starting its
       // remote agent, so a second session on the profile is refused up front.
-      await assert.rejects(BidiSession.start(firefox, profile, { headless: true }), /already has the profile/);
+      await assert.rejects(BidiSession.start(firefox, profile), /already has the profile/);
 
       assert.equal(await session.installExtension(ext), "bidi-probe@example.invalid");
       await session.uninstallExtension("bidi-probe@example.invalid");
@@ -47,34 +49,6 @@ test("a headless session installs and uninstalls an unpacked add-on", { skip: no
       await assert.rejects(session.installExtension(join(ext, "missing")), /Nothing to install/);
     } finally {
       await session.closeBrowser();
-    }
-    assert.equal(profileInUse(profile), false);
-  });
-});
-
-test("a later session attaches to the Firefox an earlier one left running", { skip: noFirefox, timeout: 180_000 }, async () => {
-  await withTempDirs(async (profile, ext) => {
-    for (const name of ["a", "b"]) {
-      mkdirSync(join(ext, name));
-      const id = `${name}@example.invalid`;
-      const manifest = { manifest_version: 2, name: id, version: "1.0", browser_specific_settings: { gecko: { id } } };
-      writeFileSync(join(ext, name, "manifest.json"), JSON.stringify(manifest));
-    }
-
-    assert.equal(await BidiSession.attach(firefox, profile), undefined, "nothing runs on the profile yet");
-    const first = await BidiSession.start(firefox, profile, { headless: true });
-    let second;
-    try {
-      assert.equal(await first.installExtension(join(ext, "a")), "a@example.invalid");
-      // Firefox keeps running with its remote agent, and the add-on loaded.
-      await first.end();
-      second = await BidiSession.attach(firefox, profile);
-      assert.ok(second, "no session with the running Firefox");
-      assert.equal(await second.installExtension(join(ext, "b")), "b@example.invalid");
-      // The first add-on survived: it can still be uninstalled in the same Firefox.
-      await second.uninstallExtension("a@example.invalid");
-    } finally {
-      await (second ?? first).closeBrowser().catch(() => {});
     }
     assert.equal(profileInUse(profile), false);
   });
@@ -88,15 +62,17 @@ test(
   },
   async () => {
     await withTempDirs(async (profile) => {
-      const session = await BidiSession.start(firefox, profile, { headless: true });
-      // Ending the session leaves Firefox running with the profile open.
-      await session.end();
+      const child = launchFirefox(firefox, ["--profile", profile], { headless: true });
       try {
+        for (let i = 0; i < 300 && !profileInUse(profile); i++) await sleep(100);
         assert.equal(profileInUse(profile), true);
         assert.equal(await quitFirefoxForProfile(firefox, profile), true);
         assert.equal(profileInUse(profile), false);
       } finally {
-        if (profileInUse(profile)) await session.closeBrowser().catch(() => {});
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill();
+          await once(child, "exit");
+        }
       }
     });
   },
@@ -118,7 +94,7 @@ test(
       chmodSync(binary, 0o755);
       const otherInstall = { binary, installDir, channel: "nightly", version: "161.0a1", requireSigning: false };
 
-      const session = await BidiSession.start(firefox, profile, { headless: true });
+      const session = await BidiSession.start(firefox, profile);
       try {
         // The other install's Firefox would wait on the profile lock and then
         // show "Firefox is already running", so nothing is launched.

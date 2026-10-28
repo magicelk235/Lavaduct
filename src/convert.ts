@@ -30,7 +30,14 @@ import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firef
 import { dedicatedProfile, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
 import { openXpiInFirefox, quitFirefoxForProfile } from "./firefox/launch.js";
 import { BidiSession } from "./firefox/bidi.js";
-import { allowUnsignedInProfile, recordInstall, waitForAddon } from "./firefox/install.js";
+import { RdpSession } from "./firefox/rdp.js";
+import {
+  allowUnsignedInProfile,
+  DEBUGGER_SERVER_PREFS,
+  enableDebuggerServerInProfile,
+  recordInstall,
+  waitForAddon,
+} from "./firefox/install.js";
 import { registerNativeHosts } from "./firefox/native-hosts.js";
 import { DEBUG_LOG_KEY } from "./firefox/storage.js";
 import { fail, info, ok, warn } from "./util.js";
@@ -316,7 +323,7 @@ function planRoute(opts: ConvertOptions, minFirefox: string): Plan {
         "Drop --no-launch, or pick --sign amo or --sign unsigned.",
     );
   }
-  // The temporary route keeps the user's own profiles out of remote control unless told otherwise.
+  // The temporary route turns remote debugging on in a profile of its own, not the user's, unless told otherwise.
   const profile =
     route.route === "temporary" && opts.profile === undefined ? dedicatedProfile(install) : resolveProfile(opts.profile, install);
   return { route, target: { install, profile } };
@@ -344,56 +351,79 @@ function sandboxProblem(install: FirefoxInstall, path: string): string | undefin
 
 type InstallOutcome = "installed" | "skipped" | "failed";
 
-/** The temporary route: a remote-controlled Firefox loads the staged folder in place. */
+/**
+ * The temporary route: Firefox loads the staged folder in place through its
+ * devtools server, the way web-ext run does. Unlike WebDriver, that server
+ * leaves navigator.webdriver false, so sign-in pages don't take Firefox for a bot.
+ */
 async function installTemporarily(
   { install, profile }: InstallTarget,
   stageDir: string,
   addonId: string,
   opts: ConvertOptions,
 ): Promise<InstallOutcome> {
-  // A Firefox that an earlier temporary install left running still has its
-  // remote agent: load this add-on next to the others rather than restart it,
+  if (opts.headless) return installHeadless({ install, profile }, stageDir, addonId);
+  // A Firefox that an earlier temporary install started still has its devtools
+  // server: load this add-on next to the others rather than restart it,
   // which would drop them.
-  let session = opts.headless ? undefined : await BidiSession.attach(install, profile.path);
+  let session = await RdpSession.attach(profile.path);
   if (session) {
-    info(`Using the Firefox that already has ${profile.path} open under remote control`);
+    info(`Using the Firefox that already has ${profile.path} open with remote debugging on`);
   } else {
     if (profileInUse(profile.path)) {
-      if (opts.headless) {
-        fail(`Firefox has the profile at ${profile.path} open. --headless needs a profile no Firefox has open; quit it, or pass another --profile.`);
-        return "failed";
-      }
       if (!opts.firefoxRestart) {
         fail(
-          `Firefox has the profile at ${profile.path} open. A temporary install has to restart it with remote control on; ` +
+          `Firefox has the profile at ${profile.path} open. A temporary install has to restart it with remote debugging on; ` +
             "quit Firefox first, or drop --no-firefox-restart.",
         );
         return "failed";
       }
-      info(`Quitting the Firefox that has ${profile.path} open, to restart it with remote control on …`);
+      info(`Quitting the Firefox that has ${profile.path} open, to restart it with remote debugging on …`);
       if (!(await quitFirefoxForProfile(install, profile.path))) {
         fail(`Couldn't quit the Firefox that has ${profile.path} open. Quit it yourself, then run this again.`);
         return "failed";
       }
     }
-    session = await BidiSession.start(install, profile.path, { headless: opts.headless });
+    if (enableDebuggerServerInProfile(profile.path).changed) {
+      const prefs = Object.entries(DEBUGGER_SERVER_PREFS).map(([name, value]) => `${name} = ${value}`);
+      ok(`Turned on remote debugging in ${join(profile.path, "user.js")} (${prefs.join(", ")})`);
+    }
+    session = await RdpSession.start(install, profile.path);
   }
+  let id: string;
+  try {
+    id = await session.installTemporaryAddon(stageDir);
+  } finally {
+    session.end();
+  }
+  ok(`Installed → ${profile.path}`);
+  if (id !== addonId) warn(`Firefox loaded the add-on as ${id}, not ${addonId}.`);
+  info(`Loaded ${id} temporarily: Firefox removes it when it quits.`);
+  return "installed";
+}
+
+/**
+ * --headless: a windowless Firefox loads the add-on over WebDriver BiDi and
+ * quits again. BiDi can close Firefox cleanly, and nobody browses in that
+ * Firefox, so the navigator.webdriver it sets doesn't matter there.
+ */
+async function installHeadless({ install, profile }: InstallTarget, stageDir: string, addonId: string): Promise<InstallOutcome> {
+  if (profileInUse(profile.path)) {
+    fail(`Firefox has the profile at ${profile.path} open. --headless needs a profile no Firefox has open; quit it, or pass another --profile.`);
+    return "failed";
+  }
+  const session = await BidiSession.start(install, profile.path);
   let id: string;
   try {
     id = await session.installExtension(stageDir);
   } catch (err) {
-    await (opts.headless ? session.closeBrowser() : session.end()).catch(() => {});
+    await session.closeBrowser().catch(() => {});
     throw err;
   }
   ok(`Installed → ${profile.path}`);
   if (id !== addonId) warn(`Firefox loaded the add-on as ${id}, not ${addonId}.`);
-  if (opts.headless) {
-    await session.closeBrowser();
-    info(`Firefox loaded ${id} and has quit again (--headless); temporary add-ons go with it.`);
-  } else {
-    await session.end();
-    info(`Loaded ${id} temporarily: Firefox removes it when it quits.`);
-  }
+  await session.closeBrowser();
+  info(`Firefox loaded ${id} and has quit again (--headless); temporary add-ons go with it.`);
   return "installed";
 }
 

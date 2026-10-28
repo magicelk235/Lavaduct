@@ -214,10 +214,10 @@ export function profileInUse(profilePath: string): boolean {
 
 /**
  * The profile the temporary route uses unless told otherwise, kept apart from
- * the user's own profiles so they never run under remote control. It lives in
- * the state directory, except for snap and Flatpak Firefox, whose sandboxes
- * can't reach that hidden folder: theirs goes in the folder the sandbox can
- * write.
+ * the user's own profiles so they never get remote debugging turned on. It
+ * lives in the state directory, except for snap and Flatpak Firefox, whose
+ * sandboxes can't reach that hidden folder: theirs goes in the folder the
+ * sandbox can write.
  */
 export function dedicatedProfile(install: FirefoxInstall): FirefoxProfile {
   const path = install.sandbox
