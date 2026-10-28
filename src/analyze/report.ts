@@ -39,11 +39,18 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   const removedOptPerms = optional.filter((p) => !optionalAfter.includes(p) && !toRequired.includes(p));
   if (removedOptPerms.length) out.push(`Removed optional permission(s): ${quoted(removedOptPerms)}.`);
 
-  for (const key of ["host_permissions", "optional_host_permissions"] as const) {
+  // Permissions the converter grants for an emulation (chrome.debugger runs on
+  // scripting, tabs, webNavigation and webRequest), host patterns aside.
+  const addedPerms = requiredAfter.filter((p) => !required.includes(p) && !toRequired.includes(p) && p !== "<all_urls>" && !p.includes("://"));
+  if (addedPerms.length) out.push(`Added permission(s) ${quoted(addedPerms)}, which the shim's emulations run on.`);
+
+  for (const key of ["permissions", "host_permissions", "optional_host_permissions"] as const) {
     const beforeHosts = Array.isArray(before[key]) ? (before[key] as unknown[]).filter((p): p is string => typeof p === "string") : [];
-    const afterHosts = new Set(Array.isArray(after[key]) ? (after[key] as string[]) : []);
-    const removed = beforeHosts.filter((p) => !afterHosts.has(p));
+    const afterHosts = Array.isArray(after[key]) ? (after[key] as unknown[]).filter((p): p is string => typeof p === "string") : [];
+    const removed = key === "permissions" ? [] : beforeHosts.filter((p) => !afterHosts.includes(p));
     if (removed.length) out.push(`Removed \`${key}\` pattern(s): ${removed.map((p) => `\`${p}\``).join(", ")}.`);
+    const added = afterHosts.filter((p) => (p === "<all_urls>" || p.includes("://")) && !beforeHosts.includes(p));
+    if (added.length) out.push(`Added \`${key}\` pattern(s) ${added.map((p) => `\`${p}\``).join(", ")}: the chrome.debugger emulation needs access to every page.`);
   }
 
   const gecko = after.browser_specific_settings?.gecko;
@@ -66,6 +73,9 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   if (before.side_panel && !after.side_panel && after.sidebar_action) {
     const panel = after.sidebar_action.default_panel;
     out.push(`Mapped \`side_panel\` to \`sidebar_action\`${panel ? ` → \`${panel}\`` : ""} (not opened on install).`);
+  } else if (!before.side_panel && !before.sidebar_action && after.sidebar_action) {
+    const panel = after.sidebar_action.default_panel;
+    out.push(`Added \`sidebar_action\`${panel ? ` → \`${panel}\`` : ""} for the page the extension opens with chrome.sidePanel (not opened on install).`);
   }
 
   if (before.incognito === "split" && after.incognito === undefined)

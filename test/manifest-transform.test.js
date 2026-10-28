@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { transformManifest, DEFAULT_MIN_FIREFOX } from "../dist/manifest/manifest.js";
+import { summarizeManifestChanges } from "../dist/analyze/report.js";
 
 const ID = "aaaabbbbccccddddeeeeffffgggghhhh.0123abcd@lavaduct";
 
@@ -84,6 +85,39 @@ test("a side_panel without a page gives no sidebar_action, which Firefox would r
   const out = transformManifest(m, [], options());
   assert.equal("sidebar_action" in out, false);
   assert.equal("side_panel" in out, false);
+});
+
+test("a panel the code opens through chrome.sidePanel gets a sidebar even without side_panel", () => {
+  const m = sidePanelManifest();
+  delete m.side_panel;
+  const out = transformManifest(m, ["sidePanel"], options({ sidebarPanel: "sidepanel.html", sidebarPanelQuery: "mode=window" }));
+  assert.deepEqual(out.sidebar_action, {
+    default_panel: "sidepanel.html?mode=window",
+    default_title: "Open helper",
+    default_icon: { 16: "icon16.png", 128: "icon128.png" },
+    open_at_install: false,
+  });
+  assert.ok(summarizeManifestChanges(m, out).some((l) => l.startsWith("Added `sidebar_action` → `sidepanel.html?mode=window`")));
+  assert.equal(transformManifest(m, ["sidePanel"], options()).sidebar_action, undefined, "nothing to declare without a page");
+});
+
+test("the debugger emulation gets the APIs it runs on and access to every page, and the report says so", () => {
+  const m = {
+    manifest_version: 3, name: "Agent", version: "1",
+    permissions: ["debugger", "storage"], optional_permissions: ["tabs"], host_permissions: ["https://a.test/*"],
+  };
+  const out = transformManifest(m, ["debugger"], options({ debuggerEmulation: true }));
+  assert.deepEqual(out.permissions, ["storage", "scripting", "tabs", "webNavigation", "webRequest"]);
+  assert.equal(out.optional_permissions, undefined, "tabs is granted outright now");
+  assert.deepEqual(out.host_permissions, ["https://a.test/*", "<all_urls>"]);
+  const lines = summarizeManifestChanges(m, out);
+  assert.ok(lines.includes("Added permission(s) `scripting`, `webNavigation`, `webRequest`, which the shim's emulations run on."), lines.join("\n"));
+  assert.ok(lines.some((l) => l.startsWith("Added `host_permissions` pattern(s) `<all_urls>`")), lines.join("\n"));
+
+  const mv2 = transformManifest({ manifest_version: 2, name: "Agent", version: "1", permissions: ["debugger"] }, ["debugger"], options({ debuggerEmulation: true }));
+  assert.ok(mv2.permissions.includes("<all_urls>"), "Manifest V2 keeps host patterns among the permissions");
+  assert.equal(mv2.host_permissions, undefined);
+  assert.deepEqual(transformManifest(m, ["debugger"], options()).permissions, ["storage"], "nothing is added without the emulation");
 });
 
 test("an existing sidebar_action is kept as the author wrote it", () => {

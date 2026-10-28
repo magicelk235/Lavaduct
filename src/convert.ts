@@ -21,7 +21,7 @@ import { compareFirefoxVersions } from "./manifest/compat-data.js";
 import { applyDnr } from "./manifest/dnr.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { countBlocking, printIssues, summarizeManifestChanges, writeReportFile, type ReportMeta } from "./analyze/report.js";
-import { derivePanelWindowQuery, injectShimIntoHtmlPages, wireBackground, writeShim } from "./runtime/shim.js";
+import { backendHosts, derivePanelPage, derivePanelWindowQuery, injectShimIntoHtmlPages, usesDebugger, wireBackground, writeShim } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { deriveAddonId } from "./sign/addon-id.js";
 import { signWithAmo } from "./sign/amo.js";
@@ -31,6 +31,7 @@ import { dedicatedProfile, profileInUse, resolveProfile, type FirefoxProfile } f
 import { openXpiInFirefox, quitFirefoxForProfile } from "./firefox/launch.js";
 import { BidiSession } from "./firefox/bidi.js";
 import { allowUnsignedInProfile, recordInstall, waitForAddon } from "./firefox/install.js";
+import { registerNativeHosts } from "./firefox/native-hosts.js";
 import { DEBUG_LOG_KEY } from "./firefox/storage.js";
 import { fail, info, ok, warn } from "./util.js";
 
@@ -154,21 +155,32 @@ function buildAddon(
     if (r.count > 0) log.ok(`${r.name} in ${r.count} file(s)`);
   }
 
+  // The side panel's page, when the manifest declares none and the code passes it
+  // to chrome.sidePanel.setOptions, and the query its window form needs.
+  const panelPage = derivePanelPage(stageDir, manifest);
+  const panelQuery = settings.panelQuery ?? derivePanelWindowQuery(stageDir, manifest);
+  const debuggerEmulation = settings.generateShim && usesDebugger(stageDir, manifest);
+
   let shimFile: string | undefined;
   if (settings.generateShim) {
+    const bg = manifest.background;
     shimFile = writeShim(stageDir, {
       debug: settings.debug === true,
-      sidePanelPath: manifest.side_panel?.default_path,
+      sidePanelPath: manifest.side_panel?.default_path ?? panelPage,
+      panelQuery,
       extensionId: src.chromeId,
+      debuggerEmulation,
+      serviceWorker: typeof bg?.service_worker === "string" && !Array.isArray(bg.scripts) && !bg.page,
+      backendHosts: backendHosts(manifest),
     });
     if (settings.debug) {
       log.ok(`Debug build: shim tracing on, kept in storage.local under ${DEBUG_LOG_KEY} (read it with ${NAME} --logs). Don't ship this build.`);
     }
+    if (debuggerEmulation) log.ok("chrome.debugger emulated on scripting, tabs, webNavigation and webRequest");
     const pages = injectShimIntoHtmlPages(stageDir, shimFile);
     if (pages > 0) log.ok(`Shim injected into ${pages} HTML page(s)`);
   }
 
-  const panelQuery = settings.panelQuery ?? derivePanelWindowQuery(stageDir, manifest);
   const out = transformManifest(manifest, src.permissionsToRemove, {
     addonId: src.addonId,
     minFirefoxVersion: settings.minFirefoxVersion ?? DEFAULT_MIN_FIREFOX,
@@ -177,7 +189,12 @@ function buildAddon(
     dataCollection: settings.dataCollection,
     contentScriptPrepend: shimFile ? [shimFile] : [],
     sidebarPanelQuery: panelQuery,
+    sidebarPanel: panelPage,
+    debuggerEmulation,
   });
+  if (!manifest.side_panel && out.sidebar_action && panelPage) {
+    log.ok(`Sidebar declared for ${panelPage}, the page the extension opens with chrome.sidePanel`);
+  }
   if (out.sidebar_action && panelQuery) {
     log.ok(
       settings.panelQuery !== undefined
@@ -516,6 +533,17 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     result.zipPath = zipPath;
     ok(`Packed → ${xpiPath}`);
     if (zipPath) ok(`Zipped the unsigned add-on → ${zipPath}`);
+
+    // Firefox reads host manifests when the add-on connects, so they go in before
+    // any install starts it.
+    const permitted = [...(built.permissions ?? []), ...(built.optional_permissions ?? [])].includes("nativeMessaging");
+    if (permitted && (opts.nativeHosts ?? opts.install)) {
+      for (const r of registerNativeHosts({ dir: stageDir, addonId, chromeId: src.chromeId })) {
+        if (r.outcome === "skipped") warn(`Native app ${r.name} not registered for Firefox: ${r.detail}.`);
+        else if (r.outcome === "present") info(`Native app ${r.name}: ${r.detail}`);
+        else ok(`Native app ${r.name}: ${r.detail}`);
+      }
+    }
 
     if (!plan.route) {
       result.success = true;

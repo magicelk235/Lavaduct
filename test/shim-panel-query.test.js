@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { derivePanelWindowQuery } from "../dist/runtime/shim.js";
+import { derivePanelPage, derivePanelWindowQuery } from "../dist/runtime/shim.js";
 
 // An extension that also opens its side-panel page as a standalone window says
 // how the page behaves outside Chrome's docked panel:
@@ -69,4 +69,24 @@ test("with no side_panel key a `sidepanel` page name still counts, any other pag
   assert.equal(derivePanelWindowQuery(dir, { manifest_version: 3 }), "mode=window");
   const dir2 = bundle(t, { "assets/sw.js": 'chrome.windows.create({url:"popup.html?mode=window"});' });
   assert.equal(derivePanelWindowQuery(dir2, { manifest_version: 3 }), "");
+});
+
+// Some extensions declare no side_panel and hand the page to chrome.sidePanel at
+// runtime, so the sidebar has to come from the code.
+test("the page a bundle passes to sidePanel.setOptions becomes the sidebar page", (t) => {
+  const claude = bundle(t, {
+    "sidepanel.html": "<!doctype html>",
+    "assets/sw.js": "chrome.sidePanel.setOptions({tabId:e,path:`sidepanel.html?tabId=${encodeURIComponent(e)}`,enabled:!0});chrome.sidePanel.open({tabId:e});",
+  });
+  assert.equal(derivePanelPage(claude, { manifest_version: 3, permissions: ["sidePanel"] }), "sidepanel.html");
+  assert.equal(derivePanelPage(claude, { manifest_version: 3, side_panel: { default_path: "sidepanel.html" } }), "", "a declared side_panel is mapped as it is");
+
+  const twoPages = bundle(t, {
+    "a.html": "", "b.html": "",
+    "assets/sw.js": 'chrome.sidePanel.setOptions({path:"a.html"});chrome.sidePanel.setOptions({tabId:1,path:"b.html"});',
+  });
+  assert.equal(derivePanelPage(twoPages, { manifest_version: 3, permissions: ["sidePanel"] }), "", "which one is the panel can't be told");
+
+  const unused = bundle(t, { "sidepanel.html": "", "assets/sw.js": "chrome.tabs.query({});" });
+  assert.equal(derivePanelPage(unused, { manifest_version: 3 }), "", "no sidebar for an extension without a side panel");
 });

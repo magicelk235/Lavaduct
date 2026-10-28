@@ -656,7 +656,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       category: "permission",
       message: "nativeMessaging needs the native app registered for Firefox: Firefox reads host manifests from its own locations, and they must list this add-on's ID in allowed_extensions instead of a chrome-extension:// origin.",
       file: "manifest.json",
-      fix: "Ask the app's vendor for Firefox support, or install a Firefox host manifest that names this add-on's ID.",
+      fix: `With --install or --native-hosts, ${NAME} registers this add-on with each native app it talks to whose Chrome host manifest is installed on this machine; other apps need a Firefox host manifest that names this add-on's ID.`,
     });
   }
 
@@ -766,7 +766,17 @@ export interface TransformOptions {
   contentScriptPrepend?: string[];
   /** Query string added to the sidebar page made from side_panel. */
   sidebarPanelQuery?: string;
+  /**
+   * Page for a sidebar_action when the manifest declares no side_panel and the code
+   * sets its panel through chrome.sidePanel.setOptions (see derivePanelPage).
+   */
+  sidebarPanel?: string;
+  /** The shim emulates chrome.debugger: grant the APIs and site access it runs on. */
+  debuggerEmulation?: boolean;
 }
+
+/** What the chrome.debugger emulation drives tabs with. */
+export const DEBUGGER_EMULATION_PERMISSIONS = ["scripting", "tabs", "webNavigation", "webRequest"];
 
 // Add `query` to a page path ahead of its fragment, after any query it already has.
 function withQuery(path: string, query: string | undefined): string {
@@ -806,6 +816,16 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] !== true),
     ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] === true && !optional.includes(p)),
   ];
+  // Chrome's debugger reaches every tab on its own permission. Its emulation runs
+  // on these APIs, which need site access to every page as well.
+  const allSites = opts.debuggerEmulation === true;
+  if (allSites) {
+    for (const p of DEBUGGER_EMULATION_PERMISSIONS) {
+      if (!permissions.includes(p)) permissions.push(p);
+      const i = optionalPermissions.indexOf(p);
+      if (i >= 0) optionalPermissions.splice(i, 1);
+    }
+  }
   if (Array.isArray(out.permissions) || permissions.length) out.permissions = permissions;
   if (optionalPermissions.length) out.optional_permissions = optionalPermissions;
   else delete out.optional_permissions;
@@ -816,6 +836,12 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     const kept = list.filter((p) => typeof p === "string" && matchPatternError(p) === null);
     if (kept.length) out[key] = kept;
     else delete out[key];
+  }
+  if (allSites) {
+    // MV2 keeps host patterns among the permissions.
+    const hostKey = (out.manifest_version ?? 2) >= 3 ? "host_permissions" : "permissions";
+    const hosts = out[hostKey] ?? [];
+    if (!hosts.includes("<all_urls>")) out[hostKey] = [...hosts, "<all_urls>"];
   }
 
   const bss = out.browser_specific_settings;
@@ -837,23 +863,23 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   else settings.gecko_android = {};
   out.browser_specific_settings = settings;
 
-  // Firefox's sidebar takes the side panel's place. It opens on install unless told
-  // otherwise, which Chrome's side panel never does.
-  if (out.side_panel !== undefined) {
-    const sp = out.side_panel;
-    const panel = typeof sp?.default_path === "string" ? sp.default_path : "";
-    if (!out.sidebar_action && panel) {
-      const actionTitle = (out.action ?? out.browser_action ?? out.page_action)?.default_title;
-      const title = typeof actionTitle === "string" && actionTitle ? actionTitle : out.name;
-      const sidebar: NonNullable<Manifest["sidebar_action"]> = { default_panel: withQuery(panel, opts.sidebarPanelQuery) };
-      if (title) sidebar.default_title = title;
-      const icons = out.icons;
-      if (icons && typeof icons === "object" && Object.keys(icons).length) sidebar.default_icon = { ...icons };
-      sidebar.open_at_install = false;
-      out.sidebar_action = sidebar;
-    }
-    delete out.side_panel;
+  // Firefox's sidebar takes the side panel's place: the manifest's side_panel, or
+  // the page the code passes to chrome.sidePanel.setOptions when it declares
+  // none. It opens on install unless told otherwise, which Chrome's side panel
+  // never does.
+  const sidePanelPath = typeof out.side_panel?.default_path === "string" ? out.side_panel.default_path : "";
+  const panel = out.side_panel !== undefined ? sidePanelPath : (opts.sidebarPanel ?? "");
+  if (!out.sidebar_action && panel) {
+    const actionTitle = (out.action ?? out.browser_action ?? out.page_action)?.default_title;
+    const title = typeof actionTitle === "string" && actionTitle ? actionTitle : out.name;
+    const sidebar: NonNullable<Manifest["sidebar_action"]> = { default_panel: withQuery(panel, opts.sidebarPanelQuery) };
+    if (title) sidebar.default_title = title;
+    const icons = out.icons;
+    if (icons && typeof icons === "object" && Object.keys(icons).length) sidebar.default_icon = { ...icons };
+    sidebar.open_at_install = false;
+    out.sidebar_action = sidebar;
   }
+  delete out.side_panel;
 
   // Firefox would treat "split" as "not_allowed"; without the key the add-on spans
   // normal and private windows.

@@ -87,6 +87,28 @@ test("without a sidebar_action the panel opens as a popup window", async () => {
   assert.equal(create[1].type, "popup");
 });
 
+test("a panel path set at runtime carries the window-mode query, without overriding a key the path sets", async () => {
+  const config = { sidePanelPath: "panel.html", panelQuery: "mode=window" };
+  const { browser } = background({ config });
+  // Claude in Chrome sets its panel per tab, with a query of its own.
+  await browser.sidePanel.setOptions({ tabId: 5, path: "panel.html?tabId=5", enabled: true });
+  await browser.sidePanel.setOptions({ tabId: 6, path: "panel.html?mode=compact&tabId=6" });
+  await browser.sidePanel.setOptions({ tabId: 7, path: "other.html?tabId=7" });
+  const setPanel = browser.calls.filter((c) => c[0] === "sidebarAction.setPanel").map((c) => plain(c[1]));
+  assert.deepEqual(setPanel, [
+    { tabId: 5, panel: EXT_ORIGIN + "/panel.html?tabId=5&mode=window" },
+    { tabId: 6, panel: EXT_ORIGIN + "/panel.html?mode=compact&tabId=6" },
+    { tabId: 7, panel: EXT_ORIGIN + "/other.html?tabId=7" },
+  ]);
+  assert.equal(plain(await browser.sidePanel.getOptions({ tabId: 5 })).path, "panel.html?tabId=5", "the extension reads back what it set");
+
+  const popup = background({ config, withSidebar: false });
+  await popup.browser.sidePanel.setOptions({ tabId: 5, path: "panel.html?tabId=5" });
+  await popup.browser.sidePanel.open({ tabId: 5 });
+  const create = popup.browser.calls.find((c) => c[0] === "windows.create");
+  assert.equal(create[1].url, EXT_ORIGIN + "/panel.html?tabId=5&mode=window");
+});
+
 test("members Firefox already provides are never replaced", () => {
   const browser = fakeBrowser({ manifest: MANIFEST });
   const nativeSidePanel = { open() {} };
