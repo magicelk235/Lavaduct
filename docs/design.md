@@ -80,7 +80,8 @@ Progress lines stay stable so the Viaduct app can map them to phases the way it 
 - Convert `background.service_worker` into `background.scripts`. Firefox runs background scripts as event pages rather than service workers. Scripts loaded through a literal `importScripts(...)` list are moved into the `scripts` array ahead of the worker, using viaduct-cli's hoisting logic. `background.type: "module"` is kept because Firefox supports module background scripts.
 - Rewrite `chrome-extension://` to `moz-extension://` in staged sources.
 - Remove `key`, `update_url` and `minimum_chrome_version`.
-- Map `side_panel` to `sidebar_action`, with `open_at_install: false` so Firefox does not open the sidebar on install. `--panel-query` controls the query string on the sidebar page, with the same default as viaduct-cli.
+- Map `side_panel` to `sidebar_action`, with `open_at_install: false` so Firefox does not open the sidebar on install. An extension that declares no `side_panel` but hands its page to `chrome.sidePanel.setOptions({ path })` gets a `sidebar_action` for that page. `--panel-query` controls the query string on the sidebar page, with the same default as viaduct-cli; the shim also adds it to panel paths set at runtime that don't set its keys.
+- When the shim emulates `chrome.debugger`, add the permissions it runs on (`scripting`, `tabs`, `webNavigation`, `webRequest`) and `<all_urls>` site access, and remove `debugger`. The report lists both changes.
 - Replace `externally_connectable` with the page bridge from viaduct-cli's `oauth-bridge.ts`. `--no-oauth-bridge` turns this off.
 - Run `dnr.ts` with Firefox's declarativeNetRequest limits: 20 enabled static rulesets, 30,000 static rules, 5,000 dynamic and 5,000 session rules, and 1,000 regex rules. Rules using conditions Firefox lacks (`responseHeaders`, `excludedResponseHeaders`, `domains`, `excludedDomains`) or resource types `webbundle`/`webtransport` are dropped with a warning, because Firefox drops invalid static rules silently.
 - Delete `incognito: "split"` (giving the default, `spanning`) and warn. Firefox would otherwise fall back to `not_allowed`.
@@ -98,6 +99,10 @@ Progress lines stay stable so the Viaduct app can map them to phases the way it 
 - `chrome.offscreen.*` using a hidden iframe in the event page, since Firefox's background page has a DOM.
 - `chrome.identity.getAuthToken`, `removeCachedAuthToken` and `getProfileUserInfo` on top of `launchWebAuthFlow`, ported from viaduct-cli's `identity-polyfill.js`. Firefox implements only `getRedirectURL` and `launchWebAuthFlow`.
 - `chrome://favicon` and `_favicon` URLs.
+- `chrome.debugger`, for add-ons that declare the permission or call the API (`runtime/cdp-emulation.js`, spliced in only then). It maps the DevTools protocol commands extensions drive tabs with onto Firefox's APIs: `Runtime.evaluate` (with V8's REPL mode and its compile errors, so clients that retry inside an async function do), `callFunctionOn` and `getProperties` through `scripting` in the page's world; `Input.*` as DOM events dispatched in the page; `Page.captureScreenshot` through `tabs.captureTab` (clips included, in device pixels); navigation and lifecycle events from `webNavigation`; `Network.*` events from `webRequest`; dialogs answered in the page and reported; console calls and uncaught errors from a hook in the page. The background page owns every session; extension pages forward their calls to it and hear its events, so a side panel and the background agree on what is attached. Limits: input is synthetic (`isTrusted` is false, no user activation), `Runtime.evaluate` fails on pages whose CSP forbids eval, response bodies aren't available, and cross-origin frames are reached only through Firefox's frame IDs.
+- `ServiceWorkerGlobalScope` in a background that was a service worker, for bundles that ask whether they run in the worker; the extension's other pages keep answering no.
+- `chrome://newtab` in `tabs.create`, `tabs.update` and `windows.create`, which Firefox refuses: those calls open Firefox's new tab page instead.
+- The add-on's Chrome origin on its own requests to the hosts its CSP `connect-src` names, through a session DNR rule scoped to the add-on as initiator. Some backends allow an extension by its `chrome-extension://<id>` origin and refuse Firefox's random `moz-extension://` one.
 - Smaller `runtime` and `tabs` gaps found while testing against the extension corpus.
 
 The shim is injected first in background scripts, every content script and every extension HTML page. `--no-shim` skips it. `--debug` builds the shim with the tracing ring buffer from viaduct-cli, which keeps the last 2000 entries in `storage.local` under `__viaduct_debug_log__`.
@@ -157,6 +162,10 @@ Temporary add-ons are loaded in place, so the staged directory has to stay on di
 
 By default the add-on goes into a dedicated `lavaduct` profile, which the CLI creates if needed, so the user's own profile is never opened under remote control. `--profile` uses another profile instead; if that profile is open, the CLI quits Firefox and relaunches it with the flag, unless `--no-firefox-restart` is set, in which case it refuses. The add-on is removed when Firefox restarts.
 
+### Native messaging
+
+Firefox reads native host manifests from its own places (`~/Library/Application Support/Mozilla/NativeMessagingHosts` on macOS, `~/.mozilla/native-messaging-hosts` on Linux, `HKCU\Software\Mozilla\NativeMessagingHosts\<name>` on Windows) and lists add-on IDs in `allowed_extensions`. With `--install` (or `--native-hosts`), for each host name the add-on's code uses with `connectNative`/`sendNativeMessage`, the CLI finds the Chrome host manifest (Chrome, Chromium, Brave, Edge, Vivaldi, Arc; the registry on Windows). If it allows the extension's Chrome ID and names a program that exists, the add-on ID goes into the Firefox manifest for that host: an existing per-user one is extended, a machine-wide one is copied into a per-user one that keeps its add-ons, and otherwise a new one points at the Chrome manifest's program. Chrome's manifests are never touched. `--uninstall` takes the add-on out again once no profile has it. `--no-native-hosts` skips the step. Firefox starts a host with the manifest path and the add-on ID as arguments where Chrome passes the caller's origin, so a host that checks its caller may still refuse a Firefox add-on.
+
 ## Firefox discovery
 
 `firefox/locate.ts` finds installs on each OS:
@@ -194,6 +203,7 @@ Each install's default profile comes from its `[Install<hash>] Default=` entry, 
 | `--background-launch` | `--no-launch` |
 | `--team <id>` | `--sign <route>`, `--amo-key`, `--amo-secret`, `--addon-version`, `--data-collection` |
 | `--no-shim`, `--no-oauth-bridge`, `--panel-query`, `--debug` | same |
+| native messaging broker in the host app | `--native-hosts`, `--no-native-hosts`: Firefox host manifests written from the Chrome ones (on by default with `--install`) |
 | `--keep-module` | dropped, module background scripts are always kept |
 | `--force`, `--strict`, `--analyze`, `--json`, `--report`, `--config` | same; config file is `lavaduct.config.json` |
 | `--doctor`, `--list`, `--uninstall`, `--logs` | re-targeted at Firefox, described below |

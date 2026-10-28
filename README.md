@@ -79,9 +79,10 @@ The manifest gets a `browser_specific_settings.gecko` block with the add-on ID a
 because Firefox runs extension backgrounds as event pages; scripts loaded with a
 literal `importScripts(...)` list are loaded ahead of the worker instead, and a
 module worker keeps `"type": "module"`. `side_panel` becomes Firefox's sidebar,
-closed until the user opens it. Chrome-only keys (`key`, `update_url`,
-`minimum_chrome_version`) and permissions Firefox doesn't know are removed, and
-`chrome-extension://` URLs in the sources become `moz-extension://`.
+closed until the user opens it; an extension that sets its panel page only through
+`chrome.sidePanel.setOptions` gets a sidebar for that page too. Chrome-only keys
+(`key`, `update_url`, `minimum_chrome_version`) and permissions Firefox doesn't know
+are removed, and `chrome-extension://` URLs in the sources become `moz-extension://`.
 
 declarativeNetRequest rules that use conditions Firefox can't evaluate are dropped
 with a warning, since Firefox would otherwise ignore them without saying so.
@@ -91,8 +92,21 @@ off).
 
 The shim covers `chrome.sidePanel` (on top of Firefox's sidebar), `chrome.offscreen`
 (a hidden frame in the background page), `chrome.identity.getAuthToken` and its
-relatives (on top of `launchWebAuthFlow`), and `chrome://favicon` URLs. It only
-fills in what Firefox lacks. `--no-shim` leaves it out.
+relatives (on top of `launchWebAuthFlow`), and `chrome://favicon` URLs. For an
+extension that uses `chrome.debugger`, it emulates the DevTools protocol commands
+extensions drive tabs with (evaluation, clicks and typing as synthetic page events,
+screenshots, navigation, console and network events) on `scripting`, `tabs`,
+`webNavigation` and `webRequest`, which the conversion adds along with access to
+all sites. A background that was a service worker says so to code that asks
+(`ServiceWorkerGlobalScope`), `chrome://newtab` opens Firefox's new tab page, and
+the add-on's requests to the backends its CSP names carry its Chrome origin. The
+shim only fills in what Firefox lacks. `--no-shim` leaves it out.
+
+An extension that talks to a native app (`connectNative`, `sendNativeMessage`)
+needs a Firefox host manifest naming the add-on. With `--install`, lavaduct writes or
+extends one for each app whose Chrome host manifest on this machine allows the
+extension (`--native-hosts` does it without installing, `--no-native-hosts` skips
+it); `--uninstall` takes the add-on out again.
 
 `--analyze` prints the issues and previews these manifest changes without converting
 anything. Each issue is an error, a warning or info. Errors stop a conversion unless
