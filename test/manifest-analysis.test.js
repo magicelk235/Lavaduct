@@ -6,17 +6,21 @@ const analyze = (m, minFirefox = DEFAULT_MIN_FIREFOX) => analyzeManifest({ manif
 const find = (issues, text) => issues.filter((i) => i.message.includes(text));
 
 test("a permission Firefox lacks is removed with a warning, a shimmed one is only noted", () => {
-  const { issues, permissionsToRemove } = analyze({ permissions: ["tabs", "debugger", "offscreen"] });
-  assert.deepEqual(permissionsToRemove.sort(), ["debugger", "offscreen"]);
+  const { issues, permissionsToRemove } = analyze({ permissions: ["tabs", "pageCapture", "offscreen", "debugger"] });
+  assert.deepEqual(permissionsToRemove.sort(), ["debugger", "offscreen", "pageCapture"]);
 
-  const [debuggerIssue] = find(issues, '"debugger"');
-  assert.equal(debuggerIssue.severity, "warning");
-  assert.equal(debuggerIssue.autoFixed, true);
-  assert.ok(!debuggerIssue.shimmed);
+  const [lost] = find(issues, '"pageCapture"');
+  assert.equal(lost.severity, "warning");
+  assert.equal(lost.autoFixed, true);
+  assert.ok(!lost.shimmed);
 
-  const [offscreenIssue] = find(issues, '"offscreen"');
-  assert.equal(offscreenIssue.severity, "info");
-  assert.equal(offscreenIssue.shimmed, true);
+  for (const perm of ["offscreen", "debugger"]) {
+    const [issue] = find(issues, `"${perm}"`);
+    assert.equal(issue.severity, "info", perm);
+    assert.equal(issue.shimmed, true, perm);
+  }
+  // The note says what the emulation can't do, so a user knows what to re-test.
+  assert.match(find(issues, '"debugger"')[0].fix, /isTrusted/);
 
   assert.equal(find(issues, '"tabs"').length, 0);
 });

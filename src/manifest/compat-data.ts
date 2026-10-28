@@ -44,7 +44,7 @@ export const OPTIONAL_ONLY_PERMISSIONS: Record<string, true> = { userScripts: tr
  * Permissions that are removed (Firefox doesn't know them) while the runtime shim keeps
  * the feature working, so the report tags them shimmed instead of lost.
  */
-export const SHIMMED_PERMISSIONS = new Set(["favicon", "identity.email", "offscreen", "sidePanel"]);
+export const SHIMMED_PERMISSIONS = new Set(["debugger", "favicon", "identity.email", "offscreen", "sidePanel"]);
 
 const CHROMEOS_ONLY = "ChromeOS-only; Firefox has no equivalent.";
 
@@ -52,10 +52,16 @@ const PERMISSION_NOTES: Record<string, string> = {
   favicon: "The shim answers chrome://favicon/ and /_favicon/ URLs with the site's icon.",
   "identity.email": "The shim's identity.getProfileUserInfo reads the email from Google when the cached token's scopes include it.",
   offscreen: "The shim runs offscreen documents as hidden iframes in the background page, which has a DOM in Firefox.",
-  sidePanel: "side_panel becomes Firefox's sidebar (sidebar_action) and the shim maps chrome.sidePanel onto sidebarAction.",
+  sidePanel: "The side panel's page becomes Firefox's sidebar (sidebar_action), from side_panel or from the page the code passes to sidePanel.setOptions, and the shim maps chrome.sidePanel onto sidebarAction.",
   background: "Firefox can't start add-ons before the browser or keep them running after it quits; the background script itself is unaffected.",
   contentSettings: "Firefox has no per-site content settings for add-ons; privacy and browserSettings cover a few of the same switches.",
-  debugger: "Firefox gives add-ons no Chrome DevTools Protocol access; rework the feature with scripting, webRequest or the devtools APIs.",
+  debugger:
+    "The shim emulates chrome.debugger for tabs: Runtime.evaluate (REPL mode included) and console events, " +
+    "Input mouse, wheel and key events and insertText, Page screenshots (tabs.captureTab), navigation, dialogs and " +
+    "lifecycle events, Network request events (webRequest), and some DOM, Target and Accessibility calls. It adds " +
+    "scripting, tabs, webNavigation, webRequest and access to all sites. Input events are synthetic (isTrusted is " +
+    "false, no user activation), pages whose CSP forbids eval can't be evaluated in, response bodies aren't " +
+    "available, and cross-origin frames are only reached through Firefox's frame IDs.",
   declarativeContent: "Show the toolbar button per tab with action.enable()/disable() from tabs.onUpdated instead.",
   desktopCapture: "Capture the screen with navigator.mediaDevices.getDisplayMedia() from an extension page.",
   "downloads.ui": "Firefox doesn't let add-ons hide its downloads panel.",
@@ -118,12 +124,16 @@ type ApiNote = {
   since?: string;
 };
 
-const SHIMMED_NAMESPACES: Record<string, true> = { offscreen: true, sidePanel: true };
+const SHIMMED_NAMESPACES: Record<string, true> = { debugger: true, offscreen: true, sidePanel: true };
 
 // Everything the runtime shim defines, keyed like FIREFOX_API_SUPPORT.
 const SHIMMED_APIS: Record<string, { message: string; fix: string }> = {
+  debugger: {
+    message: "chrome.debugger is emulated on scripting, tabs, webNavigation and webRequest; the DevTools protocol commands extensions drive tabs with work, as synthetic input in the page.",
+    fix: "Input events are synthetic (isTrusted is false, popups they open are blocked), Runtime.evaluate fails on pages whose CSP forbids eval, and Network.getResponseBody isn't available.",
+  },
   sidePanel: {
-    message: "chrome.sidePanel is emulated on Firefox's sidebar (sidebarAction); the manifest's side_panel becomes sidebar_action.",
+    message: "chrome.sidePanel is emulated on Firefox's sidebar (sidebarAction); the panel's page (side_panel, or the page passed to setOptions) becomes sidebar_action.",
     fix: "Firefox opens the sidebar only in response to a user action, so sidePanel.open() from a timer or a message handler is refused.",
   },
   offscreen: {
@@ -156,7 +166,6 @@ const SHIMMED_APIS: Record<string, { message: string; fix: string }> = {
 // namespace are covered by the namespace's entry.
 const API_FIXES: Record<string, string> = {
   contentSettings: PERMISSION_NOTES.contentSettings,
-  debugger: PERMISSION_NOTES.debugger,
   declarativeContent: PERMISSION_NOTES.declarativeContent,
   desktopCapture: PERMISSION_NOTES.desktopCapture,
   "devtools.performance": "Firefox's devtools has no hooks into its Performance panel.",

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { UNSUPPORTED_APIS, UNSUPPORTED_PERMISSIONS } from "../dist/manifest/compat-data.js";
 
 test("APIs the shim covers are reported as shimmed, not as failures", () => {
-  for (const key of ["chrome.offscreen", "chrome.sidePanel", "chrome.identity.getAuthToken", "chrome.identity.getProfileUserInfo"]) {
+  for (const key of ["chrome.debugger", "chrome.offscreen", "chrome.sidePanel", "chrome.identity.getAuthToken", "chrome.identity.getProfileUserInfo"]) {
     assert.equal(UNSUPPORTED_APIS[key]?.shimmed, true, key);
     assert.equal(UNSUPPORTED_APIS[key].severity, "info", key);
   }
@@ -15,7 +15,7 @@ test("asking getContexts for offscreen documents is flagged, since the shim can'
 });
 
 test("an API Firefox lacks is a warning; one Firefox added later carries its release", () => {
-  assert.equal(UNSUPPORTED_APIS["chrome.debugger"]?.severity, "warning");
+  assert.equal(UNSUPPORTED_APIS["chrome.pageCapture"]?.severity, "warning");
   assert.equal(UNSUPPORTED_APIS["chrome.tabGroups"]?.since, "139");
   assert.equal("chrome.tabs.query" in UNSUPPORTED_APIS, false, "a long-standing API isn't listed");
 });

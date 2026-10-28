@@ -11,26 +11,47 @@ export const SHIM_FILENAME = `${NAME}-compat-shim.js`;
 const SHIM_TEMPLATE = "firefox-compat-shim.js";
 /** Spliced into the shim for --debug builds only; never staged on its own. */
 const DEBUG_RING_FILENAME = "debug-ring.js";
+/** Spliced into the shim for add-ons that use chrome.debugger; never staged on its own. */
+const DEBUGGER_FILENAME = "cdp-emulation.js";
 
 /** Build-time settings baked into the shim. */
 export interface ShimConfig {
   /** Emit the shim with tracing on and the persistent ring-buffer logger spliced in. */
   debug?: boolean;
-  /** The Chrome manifest's side_panel.default_path: what sidePanel.getOptions reports as the default page. */
+  /** The side panel's page: the Chrome manifest's side_panel.default_path, or the page derivePanelPage found. */
   sidePanelPath?: string;
+  /** Query the side panel's page is opened with (derivePanelWindowQuery or --panel-query). */
+  panelQuery?: string;
   /** The extension's Chrome ID, so hardcoded chrome-extension://<id>/_favicon/ URLs are recognised. */
   extensionId?: string;
+  /** Emulate chrome.debugger (see usesDebugger). */
+  debuggerEmulation?: boolean;
+  /** The Chrome background was a service worker; it now runs as an event page. */
+  serviceWorker?: boolean;
+  /** Hosts whose requests from the add-on carry its Chrome origin (see backendHosts). */
+  backendHosts?: string[];
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
 // emitted for an add-on that needs them: favicon support wraps fetch and watches
-// <img> elements, and the offscreen emulation adds a `clients` global to the
-// background page, which code testing for a service worker would notice.
+// <img> elements, the offscreen emulation adds a `clients` global to the
+// background page, which code testing for a service worker would notice, the
+// new tab fix wraps tabs.create, and a background that claims to be a service
+// worker changes what code testing for one does.
 const FAVICON_REF_RE = /chrome:\/\/favicon|(?:^|[^\w$])_favicon\//m;
 const OFFSCREEN_REF_RE = /\.\s*offscreen\b|\[\s*["']offscreen["']\s*\]/;
+const NEW_TAB_REF_RE = /["'`]chrome:\/\/new-?tab(?:-page)?\/?["'`]/i;
+const SW_SCOPE_REF_RE = /\bServiceWorkerGlobalScope\b/;
 
-function scanUsage(dir: string): { favicon: boolean; offscreen: boolean } {
-  const found = { favicon: false, offscreen: false };
+interface Usage {
+  favicon: boolean;
+  offscreen: boolean;
+  newTab: boolean;
+  serviceWorkerScope: boolean;
+}
+
+function scanUsage(dir: string): Usage {
+  const found: Usage = { favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
     let src: string;
@@ -40,30 +61,120 @@ function scanUsage(dir: string): { favicon: boolean; offscreen: boolean } {
       continue;
     }
     if (!found.favicon) found.favicon = FAVICON_REF_RE.test(src);
-    if (!found.offscreen && /\.m?js$/i.test(file)) found.offscreen = OFFSCREEN_REF_RE.test(src);
-    if (found.favicon && found.offscreen) break;
+    if (/\.m?js$/i.test(file)) {
+      if (!found.offscreen) found.offscreen = OFFSCREEN_REF_RE.test(src);
+      if (!found.newTab) found.newTab = NEW_TAB_REF_RE.test(src);
+      if (!found.serviceWorkerScope) found.serviceWorkerScope = SW_SCOPE_REF_RE.test(src);
+    }
   }
   return found;
 }
 
 function shimSource(dir: string, config: ShimConfig): string {
+  const usage = scanUsage(dir);
   // The config goes in as a JSON literal, so nothing from the manifest is ever
   // interpolated into code. JSON.stringify leaves U+2028/U+2029 raw, which are
   // line terminators inside a JS string literal; escape them.
   const json = JSON.stringify({
     sidePanelPath: (config.sidePanelPath ?? "").split(/[?#]/)[0].replace(/^\/+/, ""),
+    panelQuery: (config.panelQuery ?? "").replace(/^\?/, ""),
     extensionId: config.extensionId ?? "",
-    ...scanUsage(dir),
+    favicon: usage.favicon,
+    offscreen: usage.offscreen,
+    newTab: usage.newTab,
+    serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
+    backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
+  // Exact-string splices: a build without them never contains their source, so
+  // nothing ships disabled-but-present.
   if (config.debug) {
-    // Exact-string splices: a release build never contains the ring source, so
-    // no persistent-log write path ships disabled-but-present.
     src = src
       .split("var __SHIM_DEBUG__ = false;").join("var __SHIM_DEBUG__ = true;")
       .split("// __SHIM_DEBUG_RING__").join(readFileSync(join(RUNTIME_DIR, DEBUG_RING_FILENAME), "utf-8"));
   }
+  if (config.debuggerEmulation) {
+    src = src.split("  // __SHIM_DEBUGGER__\n").join(readFileSync(join(RUNTIME_DIR, DEBUGGER_FILENAME), "utf-8"));
+  }
   return src.split("__SHIM_CONFIG_JSON__").join(json);
+}
+
+// chrome.debugger calls, and the debugger permission, mean the add-on drives tabs
+// through the DevTools protocol.
+const DEBUGGER_CALL_RE = /\.\s*debugger\s*\.\s*(?:attach|detach|sendCommand|getTargets|onEvent|onDetach)\b/;
+
+/** Whether the add-on uses chrome.debugger: it asks for the permission, or its code calls the API. */
+export function usesDebugger(dir: string, manifest: Manifest): boolean {
+  const declared = [manifest.permissions, manifest.optional_permissions].some((list) => Array.isArray(list) && list.includes("debugger"));
+  if (declared) return true;
+  for (const file of walkScripts(dir)) {
+    if (basename(file) === SHIM_FILENAME) continue;
+    try {
+      if (DEBUGGER_CALL_RE.test(readFileSync(file, "utf-8"))) return true;
+    } catch {
+      // An unreadable file can't call anything.
+    }
+  }
+  return false;
+}
+
+/**
+ * The hosts an extension's pages may talk to by its own content security policy
+ * (extension_pages connect-src): its backends. Chrome sends them the extension's
+ * chrome-extension://<id> origin, which some allow by name; Firefox would send a
+ * moz-extension:// origin with a random per-install host. Wildcard hosts give
+ * their domain, which covers every subdomain.
+ */
+export function backendHosts(manifest: Manifest): string[] {
+  const cspObj = manifest.content_security_policy;
+  const csp = typeof cspObj === "string" ? cspObj : typeof cspObj?.extension_pages === "string" ? cspObj.extension_pages : "";
+  const hosts = new Set<string>();
+  for (const directive of csp.split(";")) {
+    const [name, ...sources] = directive.trim().split(/\s+/);
+    if (name?.toLowerCase() !== "connect-src") continue;
+    for (const source of sources) {
+      const host = /^(?:(?:https?|wss?):\/\/)?(?:\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?(?:\/.*)?$/i.exec(source)?.[1];
+      if (host) hosts.add(host.toLowerCase());
+    }
+  }
+  return [...hosts].sort();
+}
+
+/**
+ * The page an extension shows in its side panel when the manifest declares no
+ * side_panel and the code sets the page at runtime instead:
+ * `chrome.sidePanel.setOptions({ path: "sidepanel.html?tabId=" + id })`. The page
+ * is the literal head of the path, up to its query or first interpolation, and
+ * must exist. Failing that, a lone page named like a side panel counts. Empty when
+ * the manifest declares side_panel, the add-on doesn't use chrome.sidePanel, or
+ * the bundle names more than one page.
+ */
+export function derivePanelPage(dir: string, manifest: Manifest): string {
+  if (manifest.side_panel !== undefined || manifest.sidebar_action !== undefined) return "";
+  const permitted = [manifest.permissions, manifest.optional_permissions].some((list) => Array.isArray(list) && list.includes("sidePanel"));
+  const pages = new Set<string>();
+  let used = permitted;
+  const pathRe = /\bpath\s*:\s*(["'`])\/?([A-Za-z0-9_\-./]+\.html?)(?=[?#"'`$])/g;
+  for (const file of walkScripts(dir)) {
+    if (basename(file) === SHIM_FILENAME) continue;
+    let src: string;
+    try { src = readFileSync(file, "utf-8"); } catch { continue; }
+    if (!/\bsidePanel\s*\./.test(src)) continue;
+    used = true;
+    for (let at = src.indexOf("setOptions("); at >= 0; at = src.indexOf("setOptions(", at + 11)) {
+      const end = matchBalancedParen(src, at + 10);
+      const args = src.slice(at, end < 0 ? at + 600 : end);
+      pathRe.lastIndex = 0;
+      for (let m = pathRe.exec(args); m; m = pathRe.exec(args)) {
+        if (isFile(join(dir, m[2]))) pages.add(m[2].replace(/^\.\//, ""));
+      }
+    }
+  }
+  if (!used) return "";
+  if (pages.size === 1) return [...pages][0];
+  if (pages.size > 1) return "";
+  const named = walkHtmlFiles(dir).filter((f) => /side[-_]?panel/i.test(basename(f)));
+  return named.length === 1 ? relative(dir, named[0]).split("\\").join("/") : "";
 }
 
 /** Write the compat shim into the staged add-on; returns its root-relative file name. */

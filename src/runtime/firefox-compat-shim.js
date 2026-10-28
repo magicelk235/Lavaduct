@@ -6,9 +6,15 @@
 //   - chrome.sidePanel, on top of the manifest's sidebar_action;
 //   - chrome.offscreen, as a hidden iframe in the event page (background only);
 //   - identity.getAuthToken and friends, on top of launchWebAuthFlow;
-//   - chrome://favicon/ and /_favicon/ URLs, for fetch() and <img>.
-// A member is only defined where Firefox has none. Nothing Firefox provides is
-// replaced.
+//   - chrome://favicon/ and /_favicon/ URLs, for fetch() and <img>;
+//   - chrome.debugger, spliced in for add-ons that use it (cdp-emulation.js);
+//   - ServiceWorkerGlobalScope in a background that was a service worker;
+//   - chrome://newtab URLs, which tabs.create and windows.create refuse;
+//   - the add-on's Chrome origin on requests to its own backends.
+// A member is only defined where Firefox has none, and the parts with side
+// effects are only emitted for an add-on whose code needs them. Firefox's own
+// methods are wrapped only to translate an argument Chrome accepts and Firefox
+// refuses, or to keep the shim's internal messages from the add-on's listeners.
 //
 // The shim shares its script evaluation with the extension's own background
 // code, so nothing may throw out of it.
@@ -189,10 +195,11 @@
   }
 
   // ── chrome.sidePanel ────────────────────────────────────────────────────────
-  // The manifest's side_panel became a sidebar_action. Firefox's sidebar is per
-  // window, opens only from a user action, and has no enable/disable switch, so
-  // `enabled` is tracked here. Without a sidebar_action (an extension that only
-  // sets its panel through setOptions) the panel opens as a popup window.
+  // The panel is Firefox's sidebar: the converter declares a sidebar_action for
+  // the manifest's side_panel, or for the page the bundle passes to setOptions
+  // when it declares none. Firefox's sidebar is per window, opens only from a
+  // user action, and has no enable/disable switch, so `enabled` is tracked here.
+  // Without a sidebar_action the panel opens as a popup window.
   var PANEL_STATE_KEY = "__sidePanelShim";
   var PANEL_EVENT_KEY = "__sidePanelShim:event";
 
@@ -226,11 +233,29 @@
     } catch (e) {}
     var defaultPath = stripSlashes(CONFIG.sidePanelPath || manifestPanel.split(/[?#]/)[0]);
 
+    // A page whose docked form only works in Chrome carries the query that
+    // selects its window form (CONFIG.panelQuery, derived from the bundle or
+    // given with --panel-query). The query's keys are added to a path to the
+    // panel page that doesn't set them itself.
+    var panelQuery = String(CONFIG.panelQuery || "").replace(/^\?/, "");
+    function withPanelQuery(path) {
+      var p = stripSlashes(path);
+      if (!panelQuery || !defaultPath) return p;
+      var hash = p.indexOf("#");
+      var page = hash < 0 ? p : p.slice(0, hash);
+      var q = page.indexOf("?");
+      if ((q < 0 ? page : page.slice(0, q)) !== defaultPath) return p;
+      var query = q < 0 ? "" : page.slice(q + 1);
+      var have = query.split("&").map(function (kv) { return kv.split("=")[0]; });
+      var add = panelQuery.split("&").filter(function (kv) { return kv && have.indexOf(kv.split("=")[0]) < 0; });
+      if (!add.length) return p;
+      return page + (q < 0 ? "?" : /[?&]$/.test(page) ? "" : "&") + add.join("&") + (hash < 0 ? "" : p.slice(hash));
+    }
     // The default page keeps the query the converter put on default_panel.
     function panelUrl(path) {
       var p = stripSlashes(path);
-      if (manifestPanel && p === defaultPath) return extensionUrl(manifestPanel);
-      return extensionUrl(p);
+      if (manifestPanel && p === defaultPath && manifestPanel.split(/[?#]/)[0] === p) return extensionUrl(manifestPanel);
+      return extensionUrl(withPanelQuery(p));
     }
     function reportedPath(url) {
       var rel = relativePath(url);
@@ -248,7 +273,7 @@
     }
     function openWindow(path) {
       if (!path) return Promise.reject(new Error("No side panel page is set; call sidePanel.setOptions({ path }) first."));
-      return Promise.resolve(api.windows.create({ url: extensionUrl(path), type: "popup", width: 420, height: 720 }))
+      return Promise.resolve(api.windows.create({ url: panelUrl(path), type: "popup", width: 420, height: 720 }))
         .then(function (w) { panelWindowId = w && w.id != null ? w.id : null; });
     }
     function showPanel(tabId) {
@@ -325,8 +350,10 @@
           if (typeof options === "function") { cb = options; options = {}; }
           var tabId = options && options.tabId;
           var enabled = enabledFor(tabId);
+          // The path as the extension set it, without the query added for Firefox.
+          var stored = tabId != null ? (tabOptions[tabId] && tabOptions[tabId].path) : panelState().path;
           var p;
-          if (sidebar) {
+          if (sidebar && !stored) {
             p = Promise.resolve(sidebar.getPanel(tabId != null ? { tabId: tabId } : {})).then(function (url) {
               var out = { enabled: enabled };
               var path = reportedPath(url);
@@ -335,7 +362,7 @@
             });
           } else {
             var out = { enabled: enabled };
-            var path = pathFor(tabId);
+            var path = stored || pathFor(tabId);
             if (path) out.path = path;
             p = Promise.resolve(out);
           }
@@ -824,8 +851,95 @@
     } catch (e) {}
   }
 
+  // ── ServiceWorkerGlobalScope ────────────────────────────────────────────────
+  // A Chrome background is a service worker, and a bundle that shares code
+  // between it and its pages asks where it runs:
+  //   if ("ServiceWorkerGlobalScope" in globalThis) refreshHere();
+  //   else await chrome.runtime.sendMessage({ type: "refresh" });
+  // The converted background is an event page, which would take the second
+  // branch and message itself, and no context receives its own messages. So the
+  // background answers yes, while the extension's pages keep answering no, as in
+  // Chrome. Only emitted for a bundle that asks.
+  function installServiceWorkerScope() {
+    if (!CONFIG.serviceWorkerScope || !isBackground || G.ServiceWorkerGlobalScope != null) return;
+    var scope = function ServiceWorkerGlobalScope() { throw new TypeError("Illegal constructor."); };
+    try {
+      Object.defineProperty(scope, Symbol.hasInstance, { value: function (v) { return v === G; } });
+      Object.defineProperty(G, "ServiceWorkerGlobalScope", { value: scope, writable: true, configurable: true });
+    } catch (e) {}
+    // The worker's branch may call skipWaiting(), which a page doesn't have.
+    defineMissing(G, "skipWaiting", function () { return Promise.resolve(); });
+  }
+
+  // ── chrome://newtab ─────────────────────────────────────────────────────────
+  // tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox
+  // ("Illegal URL"). A bundle that opens Chrome's new tab page gets Firefox's,
+  // which those calls open when given no url. Only emitted for a bundle that
+  // names chrome://newtab.
+  var NEW_TAB_RE = /^chrome:\/\/new-?tab(?:-page)?\/?$/i;
+
+  function installNewTabUrls() {
+    if (!CONFIG.newTab) return;
+    var isNewTab = function (u) { return typeof u === "string" && NEW_TAB_RE.test(u); };
+    function fixed(props) {
+      var url = props.url;
+      if (!isNewTab(url) && !(Array.isArray(url) && url.some(isNewTab))) return props;
+      var copy = Object.assign({}, props);
+      var rest = Array.isArray(url) ? url.filter(function (u) { return !isNewTab(u); }) : [];
+      if (rest.length) copy.url = rest;
+      else delete copy.url;
+      return copy;
+    }
+    function wrap(obj, name) {
+      if (!obj || typeof obj[name] !== "function") return;
+      var original = obj[name];
+      var wrapped = function () {
+        var args = Array.prototype.slice.call(arguments);
+        for (var i = 0; i < args.length; i++) if (args[i] && typeof args[i] === "object") args[i] = fixed(args[i]);
+        return original.apply(obj, args);
+      };
+      try { Object.defineProperty(obj, name, { value: wrapped, writable: true, configurable: true, enumerable: true }); } catch (e) {}
+    }
+    namespaces.forEach(function (ns) {
+      wrap(ns.tabs, "create");
+      wrap(ns.tabs, "update");
+      wrap(ns.windows, "create");
+    });
+  }
+
+  // ── The add-on's origin at its own backends ────────────────────────────────
+  // Chrome sends an extension's requests with its chrome-extension://<id> origin,
+  // and some backends allow the extension by that name: a WebSocket handshake
+  // with Firefox's moz-extension://<random uuid> origin is refused outright.
+  // For the hosts the add-on's own content security policy lets it connect to,
+  // a session rule gives its requests (and only its: the initiator is this
+  // add-on) the Chrome origin they have in Chrome.
+  var BACKEND_ORIGIN_RULE_ID = 2147480001;
+
+  function installBackendOrigin() {
+    var hosts = Array.isArray(CONFIG.backendHosts) ? CONFIG.backendHosts : [];
+    var dnr = api.declarativeNetRequest;
+    if (!isBackground || !hosts.length || !CONFIG.extensionId || !dnr || typeof dnr.updateSessionRules !== "function") return;
+    var rule = {
+      id: BACKEND_ORIGIN_RULE_ID,
+      priority: 1,
+      action: {
+        type: "modifyHeaders",
+        requestHeaders: [{ header: "origin", operation: "set", value: "chrome-extension://" + String(CONFIG.extensionId).toLowerCase() }],
+      },
+      condition: { requestDomains: hosts, initiatorDomains: [loc.host], resourceTypes: ["websocket", "xmlhttprequest", "other"] },
+    };
+    Promise.resolve(dnr.updateSessionRules({ removeRuleIds: [BACKEND_ORIGIN_RULE_ID], addRules: [rule] })).catch(function (e) {
+      dbg("backend origin rule failed:", errorMessage(e));
+    });
+  }
+
   try { installSidePanel(); } catch (e) { dbg("sidePanel shim failed:", errorMessage(e)); }
   try { installOffscreen(); } catch (e) { dbg("offscreen shim failed:", errorMessage(e)); }
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
   try { installFavicon(); } catch (e) { dbg("favicon shim failed:", errorMessage(e)); }
+  try { installServiceWorkerScope(); } catch (e) { dbg("ServiceWorkerGlobalScope shim failed:", errorMessage(e)); }
+  try { installNewTabUrls(); } catch (e) { dbg("new tab URL shim failed:", errorMessage(e)); }
+  try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
+  // __SHIM_DEBUGGER__
 })();
