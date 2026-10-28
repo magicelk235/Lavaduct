@@ -135,6 +135,11 @@ export interface ConvertOptions {
   launch: boolean;
   /** Install temporarily into a Firefox without a window, then quit it: a load check. auto picks the temporary route. */
   headless?: boolean;
+  /**
+   * Write Firefox host manifests for the native apps the add-on talks to, from their
+   * Chrome ones; undefined = when installing.
+   */
+  nativeHosts?: boolean;
 }
 
 export interface ConvertResult {

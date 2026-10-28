@@ -33,6 +33,39 @@ export function firefoxExesFromReg(output: string): string[] {
   return exes;
 }
 
+/**
+ * The default value in `reg query <key> /ve` output. The value's label is
+ * localized ("(Default)", "(Standard)", …), so the first REG_SZ row counts; a key
+ * whose default isn't set shows a parenthesized note instead of a value.
+ */
+export function registryDefaultFromReg(output: string): string | undefined {
+  for (const line of output.split(/\r?\n/)) {
+    const value = /^\s+\S.*?\s+REG_(?:EXPAND_)?SZ\s+(.*?)\s*$/i.exec(line)?.[1];
+    if (value !== undefined) return value && !/^\(.*\)$/.test(value) ? value : undefined;
+  }
+  return undefined;
+}
+
+/** A registry key's default value. Machine-wide keys are read in both registry views. */
+export function readRegistryDefault(key: string): string | undefined {
+  const views = /^(?:HKLM|HKEY_LOCAL_MACHINE)\\/i.test(key) ? ["/reg:64", "/reg:32"] : [undefined];
+  for (const view of views) {
+    const res = run("reg", ["query", key, "/ve", ...(view ? [view] : [])]);
+    const value = res.code === 0 ? registryDefaultFromReg(res.stdout) : undefined;
+    if (value !== undefined) return value.replace(/%([^%]+)%/g, (all, name: string) => process.env[name] ?? all);
+  }
+  return undefined;
+}
+
+/** Create the key if needed and set its default value. */
+export function writeRegistryDefault(key: string, value: string): boolean {
+  return run("reg", ["add", key, "/ve", "/t", "REG_SZ", "/d", value, "/f"]).code === 0;
+}
+
+export function deleteRegistryKey(key: string): boolean {
+  return run("reg", ["delete", key, "/f"]).code === 0;
+}
+
 export interface WinProcess {
   pid: number;
   parentPid?: number;

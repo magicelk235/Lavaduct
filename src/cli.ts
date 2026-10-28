@@ -18,6 +18,7 @@ import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firef
 import { listProfiles, profileInUse, profilesFor, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
 import { readInstalledAddons } from "./firefox/extensions-json.js";
 import { recordedInstalls, removeInstallRecord } from "./firefox/install.js";
+import { unregisterNativeHosts } from "./firefox/native-hosts.js";
 import { openProfileInFirefox, quitFirefoxForProfile } from "./firefox/launch.js";
 import { BidiSession } from "./firefox/bidi.js";
 import { formatDebugLog, readDebugLog } from "./firefox/storage.js";
@@ -47,6 +48,8 @@ const CONFIG_KEYS: Record<string, "string" | "boolean"> = {
   verify: "boolean",
   "no-firefox-restart": "boolean",
   "no-launch": "boolean",
+  "native-hosts": "boolean",
+  "no-native-hosts": "boolean",
   "no-shim": "boolean",
   "no-oauth-bridge": "boolean",
   "panel-query": "string",
@@ -193,6 +196,10 @@ SIGNING AND INSTALLING
       --no-launch             Don't start Firefox: stop once the .xpi is written (and signed)
       --headless              Load the add-on temporarily into a Firefox without a window, then
                               quit it again: a load check for CI. Implies --sign temporary.
+      --native-hosts          Register the add-on with the native apps it talks to: for each one
+                              whose Chrome host manifest allows the extension, write or extend its
+                              Firefox host manifest. On by default with --install.
+      --no-native-hosts       Don't touch native host manifests, even with --install
 
 COMPATIBILITY
       --no-shim               Do not write or inject the compatibility shim
@@ -488,6 +495,11 @@ async function uninstallAddon(query: string, profileSelector: string | undefined
   }
   removeSignedCache(addon.id);
   removeInstallRecord(addon.id, profile.path);
+  // Host manifests are per user, not per profile: they keep the add-on while
+  // another profile has it installed.
+  if (!recordedInstalls().some((r) => r.id === addon.id)) {
+    for (const note of unregisterNativeHosts(addon.id)) (note.ok ? ok : warn)(`Native messaging: ${note.detail}`);
+  }
   ok(`Uninstalled ${addon.name} (${addon.id}) from ${profile.path}`);
   return 0;
 }
@@ -547,6 +559,8 @@ async function main(): Promise<void> {
         "no-firefox-restart": { type: "boolean", default: false },
         "no-launch": { type: "boolean", default: false },
         headless: { type: "boolean", default: false },
+        "native-hosts": { type: "boolean", default: false },
+        "no-native-hosts": { type: "boolean", default: false },
         "no-shim": { type: "boolean", default: false },
         "no-oauth-bridge": { type: "boolean", default: false },
         "panel-query": { type: "string" },
@@ -642,6 +656,7 @@ async function main(): Promise<void> {
   if (values.verify && !values.install) usage("--verify requires --install (it checks the installed add-on).");
   if (values.headless && !values.install) usage("--headless requires --install (it is a way to install).");
   if (values.debug && values["no-shim"]) usage("--debug enables the shim's debug tracing; remove --no-shim.");
+  if (values["native-hosts"] && values["no-native-hosts"]) usage("--native-hosts and --no-native-hosts contradict each other; pick one.");
   if (values["addon-id"] !== undefined && !isAmoAddonId(values["addon-id"])) {
     usage(`Invalid --addon-id "${values["addon-id"]}". Use an ID like name@example.com or a {UUID}: at most 80 letters, digits, ".", "_" or "-".`);
   }
@@ -773,6 +788,7 @@ async function main(): Promise<void> {
           firefoxRestart: !values["no-firefox-restart"],
           launch: !values["no-launch"],
           headless: values.headless,
+          nativeHosts: values["no-native-hosts"] ? false : values["native-hosts"] ? true : undefined,
         });
       } catch (e) {
         fail((e as Error).message);
