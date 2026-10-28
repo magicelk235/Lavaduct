@@ -126,3 +126,18 @@ test("importScripts in a classic worker is auto-hoisted, in a module worker it i
   const module = { ...classic, background: { service_worker: "sw.js", type: "module" } };
   assert.deepEqual(scanExtension(dir, module, MIN).filter((i) => i.category === "background"), []);
 });
+
+test("an API Firefox already has at the minimum version isn't reported", (t) => {
+  const manifest = { manifest_version: 3, name: "Gates", version: "1", background: { service_worker: "sw.js" } };
+  const dir = makeExtension({
+    "sw.js": "chrome.storage.session.get('k');\nchrome.tabGroups.query({});\nchrome.runtime.getVersion();\n",
+  });
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const gates = (minFirefox) =>
+    scanExtension(dir, manifest, { minFirefox }).filter((i) => /needs Firefox/.test(i.message)).map((i) => i.message.match(/chrome\.[\w.]+/)[0]);
+
+  // storage.session is from 115 and tabGroups from 139: both there in 153.
+  assert.deepEqual(gates("153.0"), ["chrome.runtime.getVersion"]);
+  assert.deepEqual(gates("128.0").sort(), ["chrome.runtime.getVersion", "chrome.tabGroups"]);
+  assert.deepEqual(gates("158"), []);
+});

@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "n
 import { join, relative } from "node:path";
 import type { Issue, Manifest } from "../types.js";
 import { parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
-import { UNSUPPORTED_APIS } from "../manifest/compat-data.js";
+import { UNSUPPORTED_APIS, compareFirefoxVersions } from "../manifest/compat-data.js";
 import { matchBalancedParen, rootLiteralsFromGetURL, importScriptsTargets } from "../runtime/shim.js";
 
 /**
@@ -107,7 +107,9 @@ const HARDCODED_EXT_URL_RE = /chrome-extension:\/\/[a-p]{32}\b/;
 // chrome:// pages in Firefox, and Firefox's own pages live under about:. The bare
 // "chrome://" prefix used in restricted-URL checks has no host and doesn't match;
 // favicon URLs are handled above.
-const CHROME_PAGE_URL_RE = /chrome:\/\/(?!favicon\b)[a-z][\w-]*(?:\/[\w-]+)?/;
+const CHROME_PAGE_URL_RE = /chrome:\/\/(?!favicon\b|new-?tab(?:-page)?\b)[a-z][\w-]*(?:\/[\w-]+)?/;
+// chrome://newtab, which the shim turns into Firefox's new tab page.
+const NEW_TAB_URL_RE = /["'`]chrome:\/\/new-?tab(?:-page)?\/?["'`]/i;
 // Detect code that pulls a Chrome version token out of the UA string — the telltale
 // of UA version sniffing (e.g. /Chrome\/(\d+)/, /Chrom(e|ium)\/([0-9]+)\./). We
 // match two source signals: a `Chrome/` or `Chromium/` literal where the slash may
@@ -126,11 +128,13 @@ function majorVersion(v: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function scanJsContent(content: string, rel: string, issues: Issue[], isClassicServiceWorker: boolean): void {
+function scanJsContent(content: string, rel: string, issues: Issue[], isClassicServiceWorker: boolean, minFirefox: string): void {
   const lineAt = makeLineResolver(content);
 
   const hits: Array<{ name: string; at: number; info: (typeof API_PATTERNS)[number]["info"] }> = [];
   for (const { name, literal, re, info } of API_PATTERNS) {
+    // An API Firefox gained by the minimum version is simply there.
+    if (info.since !== undefined && compareFirefoxVersions(info.since, minFirefox) <= 0) continue;
     const at = literal !== null ? indexOfApi(content, literal) : re!.exec(content)?.index ?? -1;
     if (at >= 0) hits.push({ name, at, info });
   }
@@ -390,6 +394,7 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
   let faviconNoted = false;
   let extUrlNoted = false;
   let chromeUrlNoted = false;
+  let newTabNoted = false;
   let mainWorldNoted = !checkMainWorld;
   for (const file of walkFiles(extPath, [".js", ".mjs", ".html", ".css"])) {
     const isJs = file.endsWith(".js") || file.endsWith(".mjs");
@@ -460,6 +465,20 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
         });
       }
     }
+    if (isJs && !newTabNoted) {
+      const m = NEW_TAB_URL_RE.exec(content);
+      if (m) {
+        newTabNoted = true;
+        issues.push({
+          severity: "info",
+          category: "api",
+          message: "chrome://newtab is opened as Firefox's new tab page: the shim drops the URL from tabs.create, tabs.update and windows.create, which refuse chrome:// URLs.",
+          file: rel,
+          line: lineAt(m.index),
+          shimmed: true,
+        });
+      }
+    }
 
     if (isJs && !mainWorldNoted) {
       const m = MAIN_WORLD_RE.exec(content);
@@ -476,7 +495,7 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
       }
     }
 
-    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel);
+    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel, opts.minFirefox);
   }
 
   return issues;
