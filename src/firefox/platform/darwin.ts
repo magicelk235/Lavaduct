@@ -102,6 +102,11 @@ export const darwin: Platform = {
     return res.code === 0 && res.stdout.trim() === "sent";
   },
 
+  // Measured on Firefox 158: about one in nine processes asked to quit within
+  // the first second after taking the profile lock never quit, however often
+  // the request is repeated. Asked five seconds in, every one did.
+  quitMinAgeMs: 5_000,
+
   visibleLaunchArgs() {
     // Started from a terminal, Firefox would otherwise open behind it.
     return ["-foreground"];

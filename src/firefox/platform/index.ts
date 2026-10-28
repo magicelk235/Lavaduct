@@ -54,6 +54,11 @@ export interface Platform {
   lockHolder(profilePath: string, lookup: ProfileLookup): LockHolder | undefined;
   /** Ask a Firefox process to quit the way the user would. False if the request couldn't be sent. */
   requestQuit(pid: number): boolean;
+  /**
+   * How old a Firefox process must be before a quit request reaches it. A
+   * younger one may drop the request and then ignore every later one.
+   */
+  quitMinAgeMs: number;
   /** Extra arguments for a Firefox the user will see. */
   visibleLaunchArgs(): string[];
 }

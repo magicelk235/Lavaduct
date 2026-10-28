@@ -5,7 +5,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { warn } from "../util.js";
 import type { FirefoxInstall } from "./locate.js";
 import { platform, type LockHolder, type ProfileLookup } from "./platform/index.js";
-import { pathKey, processAlive } from "./platform/shared.js";
+import { pathKey, processAgeMs, processAlive } from "./platform/shared.js";
 import { defaultProfileFor, profileInUse, profilesFor, type FirefoxProfile } from "./profiles.js";
 
 const QUIT_TIMEOUT_MS = 30_000;
@@ -52,7 +52,12 @@ function holderOf(install: FirefoxInstall, profilePath: string): LockHolder | un
 export async function quitFirefoxForProfile(install: FirefoxInstall, profilePath: string): Promise<boolean> {
   if (!profileInUse(profilePath)) return true;
   const holder = holderOf(install, profilePath);
-  if (!holder || !platform.requestQuit(holder.pid)) return false;
+  if (!holder) return false;
+  if (platform.quitMinAgeMs > 0) {
+    const age = processAgeMs(holder.pid);
+    if (age !== undefined && age < platform.quitMinAgeMs) await sleep(platform.quitMinAgeMs - age);
+  }
+  if (!platform.requestQuit(holder.pid)) return false;
 
   const deadline = Date.now() + QUIT_TIMEOUT_MS;
   while (Date.now() < deadline) {

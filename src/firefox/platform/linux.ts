@@ -229,6 +229,8 @@ export const linux: Platform = {
     }
   },
 
+  quitMinAgeMs: 0,
+
   visibleLaunchArgs() {
     return [];
   },

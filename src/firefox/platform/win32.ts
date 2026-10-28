@@ -277,6 +277,8 @@ export const win32: Platform = {
     return run("taskkill", ["/PID", String(pid)]).code === 0;
   },
 
+  quitMinAgeMs: 0,
+
   visibleLaunchArgs() {
     return [];
   },

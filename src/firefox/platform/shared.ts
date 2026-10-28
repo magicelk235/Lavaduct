@@ -1,5 +1,6 @@
 import { readlinkSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import { run } from "../../util.js";
 
 /** The canonical spelling of a path (symlinks resolved, true case), or the path itself when it isn't on disk. */
 export function realPath(path: string): string {
@@ -42,4 +43,16 @@ export function processAlive(pid: number): boolean {
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+/**
+ * How long a process has been running, from `ps -o etime=` (`[[dd-]hh:]mm:ss`).
+ * Undefined when ps can't say, e.g. the process is gone.
+ */
+export function processAgeMs(pid: number): number | undefined {
+  const etime = run("ps", ["-o", "etime=", "-p", String(pid)]).stdout.trim();
+  const match = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(etime);
+  if (!match) return undefined;
+  const [, days = "0", hours = "0", minutes, seconds] = match;
+  return (((Number(days) * 24 + Number(hours)) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1000;
 }
