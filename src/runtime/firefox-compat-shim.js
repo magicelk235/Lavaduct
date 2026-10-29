@@ -10,7 +10,8 @@
 //   - chrome.debugger, spliced in for add-ons that use it (cdp-emulation.js);
 //   - ServiceWorkerGlobalScope in a background that was a service worker;
 //   - chrome://newtab URLs, which tabs.create and windows.create refuse;
-//   - the add-on's Chrome origin on requests to its own backends.
+//   - the add-on's Chrome origin on requests to its own backends;
+//   - Chrome's enum objects that Firefox's declarativeNetRequest lacks.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -934,6 +935,56 @@
     });
   }
 
+  // ── Chrome's enum objects ───────────────────────────────────────────────────
+  // Chrome gives each enum type in its API an object of the values, keyed in
+  // upper snake case, and extensions build their arguments from it:
+  //   action: { type: chrome.declarativeNetRequest.RuleActionType.MODIFY_HEADERS }
+  // Firefox makes that object only for the types its own schemas name, keyed by
+  // the value upper-cased as it stands (SYNTAXERROR where Chrome has
+  // SYNTAX_ERROR), and its declarativeNetRequest names no RuleActionType,
+  // HeaderOperation, RequestMethod or DomainType. RuleActionType.MODIFY_HEADERS
+  // then throws, and whatever builds a rule that way fails before Firefox sees
+  // the rule. These are Chrome's, with the values both browsers take: defined
+  // where Firefox has no object, and their keys added where Firefox spells them
+  // otherwise.
+  var CHROME_ENUMS = {
+    declarativeNetRequest: {
+      DomainType: ["firstParty", "thirdParty"],
+      HeaderOperation: ["append", "set", "remove"],
+      RequestMethod: ["connect", "delete", "get", "head", "options", "patch", "post", "put", "other"],
+      RuleActionType: ["block", "redirect", "allow", "upgradeScheme", "modifyHeaders", "allowAllRequests"],
+      UnsupportedRegexReason: ["syntaxError", "memoryLimitExceeded"],
+    },
+  };
+
+  // Chrome's key for a value: camelCase words and dashes are split by underscores.
+  function chromeEnumKey(value) {
+    return value.replace(/([a-z])([A-Z])/g, "$1_$2").replace(/-/g, "_").toUpperCase();
+  }
+
+  function installEnums() {
+    Object.keys(CHROME_ENUMS).forEach(function (area) {
+      var types = CHROME_ENUMS[area];
+      namespaces.forEach(function (ns) {
+        var target = null;
+        try { target = ns[area]; } catch (e) {}
+        if (!target || typeof target !== "object") return;
+        Object.keys(types).forEach(function (type) {
+          var values = types[type];
+          var existing = null;
+          try { existing = target[type]; } catch (e) {}
+          if (existing && typeof existing === "object") {
+            values.forEach(function (v) { defineMissing(existing, chromeEnumKey(v), v); });
+            return;
+          }
+          var obj = {};
+          values.forEach(function (v) { obj[chromeEnumKey(v)] = v; });
+          defineMissing(target, type, obj);
+        });
+      });
+    });
+  }
+
   try { installSidePanel(); } catch (e) { dbg("sidePanel shim failed:", errorMessage(e)); }
   try { installOffscreen(); } catch (e) { dbg("offscreen shim failed:", errorMessage(e)); }
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
@@ -941,5 +992,6 @@
   try { installServiceWorkerScope(); } catch (e) { dbg("ServiceWorkerGlobalScope shim failed:", errorMessage(e)); }
   try { installNewTabUrls(); } catch (e) { dbg("new tab URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
+  try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
