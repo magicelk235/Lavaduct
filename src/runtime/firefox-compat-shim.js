@@ -162,6 +162,11 @@
     return obj[name] === value;
   }
 
+  // Put the shim's wrapper in place of obj[name].
+  function replaceMember(obj, name, value) {
+    try { Object.defineProperty(obj, name, { value: value, configurable: true, writable: true, enumerable: true }); } catch (e) {}
+  }
+
   function readLocal(key) {
     try {
       var v = localStore && localStore.getItem(key);
@@ -195,14 +200,102 @@
     return u.protocol + "//" + u.host;
   }
 
+  // ── Messages between the shim's own pages ──────────────────────────────────
+  // Parts of the shim talk to the background page over runtime messages that
+  // carry one of these keys. Every page of the add-on hears every runtime
+  // message, so runtime.onMessage is wrapped to keep them from the add-on's own
+  // listeners; the shim's listener for a key goes in underneath, where it hears
+  // them.
+  var internalKeys = [];
+  var wrappedMessageEvents = [];
+
+  function isInternalMessage(message) {
+    if (!message || typeof message !== "object") return false;
+    for (var i = 0; i < internalKeys.length; i++) {
+      try { if (message[internalKeys[i]]) return true; } catch (e) {}
+    }
+    return false;
+  }
+
+  // Wrap one onMessage event's listener methods, once; returns its own addListener.
+  function wrapMessageEvent(ev) {
+    for (var i = 0; i < wrappedMessageEvents.length; i++) {
+      if (wrappedMessageEvents[i].ev === ev) return wrappedMessageEvents[i].add;
+    }
+    var nativeAdd = ev.addListener;
+    var nativeRemove = ev.removeListener;
+    var nativeHas = ev.hasListener;
+    wrappedMessageEvents.push({ ev: ev, add: nativeAdd });
+    var wrappers = new Map();
+    function wrap(fn) {
+      var w = wrappers.get(fn);
+      if (!w) {
+        w = function (message) {
+          if (isInternalMessage(message)) return undefined;
+          return fn.apply(this, arguments);
+        };
+        wrappers.set(fn, w);
+      }
+      return w;
+    }
+    replaceMember(ev, "addListener", function (fn) {
+      if (typeof fn !== "function") return nativeAdd.apply(ev, arguments);
+      return nativeAdd.call(ev, wrap(fn));
+    });
+    replaceMember(ev, "removeListener", function (fn) {
+      return nativeRemove.call(ev, wrappers.get(fn) || fn);
+    });
+    replaceMember(ev, "hasListener", function (fn) {
+      return nativeHas.call(ev, wrappers.get(fn) || fn);
+    });
+    return nativeAdd;
+  }
+
+  // Keep messages carrying `key` from the add-on's listeners, and register
+  // `internal` (if any) for them. In MV2 pages `chrome` and `browser` each
+  // have an onMessage, and a listener on either hears every message, so
+  // `internal` goes on one of them only.
+  function hideInternalMessages(key, internal) {
+    if (internalKeys.indexOf(key) < 0) internalKeys.push(key);
+    var pending = internal;
+    namespaces.forEach(function (ns) {
+      var ev = null;
+      try { ev = ns.runtime && ns.runtime.onMessage; } catch (e) {}
+      if (!ev || typeof ev.addListener !== "function") return;
+      var add = wrapMessageEvent(ev);
+      if (pending) {
+        add.call(ev, pending);
+        pending = null;
+      }
+    });
+  }
+
   // ── chrome.sidePanel ────────────────────────────────────────────────────────
   // The panel is Firefox's sidebar: the converter declares a sidebar_action for
   // the manifest's side_panel, or for the page the bundle passes to setOptions
   // when it declares none. Firefox's sidebar is per window, opens only from a
   // user action, and has no enable/disable switch, so `enabled` is tracked here.
   // Without a sidebar_action the panel opens as a popup window.
+  //
+  // An add-on whose Chrome manifest declares no side panel (CONFIG.noDefaultPanel)
+  // has one only on the tabs its code gives one, with setOptions({ tabId, path }),
+  // usually from its toolbar button; Chrome shows nothing on its other tabs.
+  // Such a panel often finds its tab in its URL (sidepanel.html?tabId=42).
+  // Firefox's sidebar stays open across tabs, though, and shows the
+  // sidebar_action page on any tab without a panel of its own: after a switch
+  // to another tab, and when the user opens the sidebar from Firefox's own UI.
+  // That page has no tab, and Chrome never shows it. So the page a tab's panel
+  // puts in the sidebar stays there for the window's other tabs, and a sidebar
+  // that comes up on a tab without a panel does what a click on the add-on's
+  // toolbar button would: the add-on's action.onClicked listeners run for that
+  // tab, and give it its panel.
   var PANEL_STATE_KEY = "__sidePanelShim";
   var PANEL_EVENT_KEY = "__sidePanelShim:event";
+  // The panel each tab was given, in storage.session: every page of the add-on
+  // reads it, and it ends with the browser session, as tab IDs do.
+  var PANEL_TAB_KEY = "__sidePanelShim:tab:";
+  // Runtime messages from the sidebar page to the background.
+  var PANEL_MSG_KEY = "__sidePanelShim:message";
 
   function installSidePanel() {
     if (!isExtensionPage) return;
@@ -277,29 +370,141 @@
       return Promise.resolve(api.windows.create({ url: panelUrl(path), type: "popup", width: 420, height: 720 }))
         .then(function (w) { panelWindowId = w && w.id != null ? w.id : null; });
     }
-    function showPanel(tabId) {
+    function isOpenIn(tabId, windowId) {
+      if (typeof sidebar.isOpen !== "function") return Promise.resolve(false);
+      var win = windowId != null ? Promise.resolve(windowId)
+        : tabId != null && api.tabs ? Promise.resolve(api.tabs.get(tabId)).then(function (t) { return t ? t.windowId : undefined; })
+        : Promise.resolve(undefined);
+      return win.then(function (w) {
+        return sidebar.isOpen(w != null ? { windowId: w } : {});
+      }).then(Boolean, function () { return false; });
+    }
+    function showPanel(tabId, windowId) {
+      if (!sidebar) return openWindow(pathFor(tabId));
       // sidebarAction.open() only works inside a user action, so it must be
-      // called before this returns; nothing may be awaited first.
-      return sidebar ? sidebar.open() : openWindow(pathFor(tabId));
+      // called before this returns; nothing may be awaited first. Outside one
+      // Firefox refuses it even when the sidebar is already open, where
+      // Chrome's open() succeeds.
+      var opening;
+      try { opening = sidebar.open(); } catch (e) { opening = Promise.reject(e); }
+      return Promise.resolve(opening).catch(function (err) {
+        return isOpenIn(tabId, windowId).then(function (open) { if (!open) throw err; });
+      });
+    }
+
+    // Whether Chrome shows a panel on tabs the add-on gave none: its manifest
+    // declares one, or its code set one for all tabs.
+    function hasDefaultPanel() {
+      return !CONFIG.noDefaultPanel || !!panelState().path;
+    }
+    var session = null;
+    if (CONFIG.noDefaultPanel && sidebar) {
+      try { session = (api.storage && api.storage.session) || null; } catch (e) {}
+    }
+    function rememberTabPanel(tabId, url) {
+      if (!session) return undefined;
+      var o = {};
+      o[PANEL_TAB_KEY + tabId] = url;
+      return Promise.resolve(session.set(o)).catch(noop);
+    }
+    // The panel the add-on gave a tab: its URL, null for none, or undefined
+    // when that can't be known (no storage.session).
+    function tabPanel(tabId) {
+      if (!session) return Promise.resolve(undefined);
+      var key = PANEL_TAB_KEY + tabId;
+      return Promise.resolve(session.get(key)).then(function (r) {
+        return r && typeof r[key] === "string" ? r[key] : null;
+      }, function () { return undefined; });
     }
 
     var actionListening = false;
+    // Toggles the panel on a click when openPanelOnActionClick is on.
+    function toggleOnClick() {
+      if (!panelState().behavior) return;
+      try {
+        var p = sidebar ? (typeof sidebar.toggle === "function" ? sidebar.toggle() : sidebar.open()) : openWindow(pathFor(null));
+        if (p && typeof p.catch === "function") p.catch(noop);
+      } catch (e) {}
+    }
     function listenForActionClicks() {
       if (!isBackground || actionListening) return;
       var action = api.action || api.browserAction;
       if (!action || !action.onClicked || typeof action.onClicked.addListener !== "function") return;
       actionListening = true;
-      action.onClicked.addListener(function () {
-        if (!panelState().behavior) return;
-        try {
-          var p = sidebar ? (typeof sidebar.toggle === "function" ? sidebar.toggle() : sidebar.open()) : openWindow(pathFor(null));
-          if (p && typeof p.catch === "function") p.catch(noop);
-        } catch (e) {}
-      });
+      action.onClicked.addListener(toggleOnClick);
     }
     // An event page woken by an action click doesn't run setPanelBehavior again,
     // so the listener goes in at startup whenever the behaviour was turned on.
     if (panelState().behavior) listenForActionClicks();
+
+    // The add-on's own action.onClicked listeners, for a sidebar that comes up
+    // on a tab without a panel.
+    var actionListeners = [];
+    function recordActionListeners() {
+      namespaces.forEach(function (ns) {
+        var action = null;
+        try { action = ns.action || ns.browserAction; } catch (e) {}
+        var ev = action && action.onClicked;
+        if (!ev || typeof ev.addListener !== "function") return;
+        var add = ev.addListener;
+        var remove = ev.removeListener;
+        replaceMember(ev, "addListener", function (fn) {
+          if (typeof fn === "function" && actionListeners.indexOf(fn) < 0) actionListeners.push(fn);
+          return add.apply(ev, arguments);
+        });
+        replaceMember(ev, "removeListener", function (fn) {
+          var i = actionListeners.indexOf(fn);
+          if (i >= 0) actionListeners.splice(i, 1);
+          return remove.apply(ev, arguments);
+        });
+      });
+    }
+    // What a click on the toolbar button in that window would do, for the tab
+    // it shows. With openPanelOnActionClick Chrome opens the panel on a click
+    // instead of telling the add-on, and there is no panel for the tab to open.
+    function clickForTab(windowId, tabId) {
+      var listeners = actionListeners.filter(function (fn) { return fn !== toggleOnClick; });
+      if (!listeners.length || panelState().behavior || !api.tabs) return Promise.resolve(false);
+      return Promise.resolve(api.tabs.get(tabId)).then(function (tab) {
+        if (!tab || !tab.active || tab.windowId !== windowId) return false;
+        dbg("sidePanel: the sidebar came up on tab", tabId, "which has no panel; running the toolbar button's listeners");
+        listeners.forEach(function (fn) { invoke(fn, [tab, { button: 0, modifiers: [] }]); });
+        return true;
+      }, function () { return false; });
+    }
+    if (CONFIG.noDefaultPanel && sidebar) {
+      if (isBackground) {
+        recordActionListeners();
+        hideInternalMessages(PANEL_MSG_KEY, function (message) {
+          if (!message || typeof message !== "object" || message[PANEL_MSG_KEY] !== "openForTab") return undefined;
+          return clickForTab(message.windowId, message.tabId);
+        });
+      } else {
+        hideInternalMessages(PANEL_MSG_KEY, null);
+      }
+    }
+
+    // In the sidebar of an add-on without a default panel (see above): keep the
+    // page a tab's panel put up for the window's other tabs, or have the add-on
+    // give the selected tab a panel when it has none.
+    function settleSidebar(windowId) {
+      if (windowId == null || windowId < 0 || !api.tabs) return;
+      var here = loc.href;
+      Promise.resolve(api.tabs.query({ active: true, windowId: windowId })).then(function (tabs) {
+        var tab = tabs && tabs[0];
+        if (!tab || tab.id == null) return undefined;
+        return tabPanel(tab.id).then(function (own) {
+          // Without a record, a page other than sidebar_action's counts as the tab's own.
+          if (own === undefined) own = relativePath(here) === manifestPanel ? null : here;
+          if (own === here) return sidebar.setPanel({ windowId: windowId, panel: here });
+          // The tab has a panel of its own, which Firefox is about to show.
+          if (own !== null) return undefined;
+          var message = { windowId: windowId, tabId: tab.id };
+          message[PANEL_MSG_KEY] = "openForTab";
+          return api.runtime.sendMessage(message);
+        });
+      }).catch(function (e) { dbg("sidePanel: settling the sidebar failed:", errorMessage(e)); });
+    }
 
     var opened = makeEvent();
     var closed = makeEvent();
@@ -313,7 +518,7 @@
             if (!enabledFor(tabId)) {
               throw new Error("No active side panel for " + (tabId != null ? "tabId: " + tabId : "windowId: " + (options && options.windowId)));
             }
-            p = showPanel(tabId);
+            p = showPanel(tabId, options && options.windowId);
           } catch (e) { p = Promise.reject(e); }
           return respond(ns, Promise.resolve(p).then(noop), cb);
         },
@@ -335,7 +540,12 @@
               if (typeof o.enabled === "boolean") t.enabled = o.enabled;
               if (hasPath) t.path = stripSlashes(o.path);
               tabOptions[o.tabId] = t;
-              if (sidebar && hasPath) p = sidebar.setPanel({ tabId: o.tabId, panel: panelUrl(o.path) });
+              if (sidebar && hasPath) {
+                var url = panelUrl(o.path);
+                // Recorded first: the sidebar page this puts up looks for it.
+                var remembered = rememberTabPanel(o.tabId, url);
+                p = Promise.all([remembered, sidebar.setPanel({ tabId: o.tabId, panel: url })]);
+              }
             } else {
               updatePanelState(function (s) {
                 if (typeof o.enabled === "boolean") s.enabled = o.enabled;
@@ -413,7 +623,10 @@
           };
           Promise.resolve(api.windows && api.windows.getCurrent ? api.windows.getCurrent() : null).then(function (w) {
             if (w && w.id != null) info.windowId = w.id;
-          }, noop).then(function () { announce("opened"); });
+          }, noop).then(function () {
+            announce("opened");
+            if (!hasDefaultPanel()) settleSidebar(info.windowId);
+          });
           window.addEventListener("pagehide", function () { announce("closed"); });
         });
       }

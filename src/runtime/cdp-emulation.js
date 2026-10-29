@@ -79,44 +79,6 @@
     return new Error(JSON.stringify({ code: code || -32000, message: String(message) }));
   }
 
-  // Wrap runtime.onMessage so the add-on's own listeners never see the
-  // emulation's messages, and register `internal` (if any) underneath them.
-  function hideInternalMessages(internal) {
-    namespaces.forEach(function (ns) {
-      var ev = ns.runtime && ns.runtime.onMessage;
-      if (!ev || typeof ev.addListener !== "function") return;
-      var nativeAdd = ev.addListener;
-      var nativeRemove = ev.removeListener;
-      var nativeHas = ev.hasListener;
-      if (internal) nativeAdd.call(ev, internal);
-      var wrappers = new Map();
-      function wrap(fn) {
-        var w = wrappers.get(fn);
-        if (!w) {
-          w = function (message) {
-            if (message && typeof message === "object" && message[CDP_KEY]) return undefined;
-            return fn.apply(this, arguments);
-          };
-          wrappers.set(fn, w);
-        }
-        return w;
-      }
-      function define(name, value) {
-        try { Object.defineProperty(ev, name, { value: value, configurable: true, writable: true, enumerable: true }); } catch (e) {}
-      }
-      define("addListener", function (fn) {
-        if (typeof fn !== "function") return nativeAdd.apply(ev, arguments);
-        return nativeAdd.call(ev, wrap(fn));
-      });
-      define("removeListener", function (fn) {
-        return nativeRemove.call(ev, wrappers.get(fn) || fn);
-      });
-      define("hasListener", function (fn) {
-        return nativeHas.call(ev, wrappers.get(fn) || fn);
-      });
-    });
-  }
-
   function cdpTabOf(target) {
     var t = target && typeof target === "object" ? target : {};
     if (typeof t.tabId === "number" && t.tabId >= 0) return t.tabId;
@@ -2089,7 +2051,7 @@
       });
     }
 
-    hideInternalMessages(function (message, sender) {
+    hideInternalMessages(CDP_KEY, function (message, sender) {
       if (!message || typeof message !== "object" || !message[CDP_KEY]) return undefined;
       if (message[CDP_KEY] === "report") { onReports(sender, message.reports); return undefined; }
       if (message[CDP_KEY] !== "call") return undefined;
@@ -2105,7 +2067,7 @@
 
   // ── Extension pages: forward to the background ──
   function debuggerClient() {
-    hideInternalMessages(null);
+    hideInternalMessages(CDP_KEY, null);
     var evt = makeEvent();
     var det = makeEvent();
     try {

@@ -20,6 +20,11 @@ export interface ShimConfig {
   debug?: boolean;
   /** The side panel's page: the Chrome manifest's side_panel.default_path, or the page derivePanelPage found. */
   sidePanelPath?: string;
+  /**
+   * The Chrome manifest declares no side panel: the extension shows one only on
+   * the tabs its code gives one, and the sidebar's page is the one derivePanelPage found.
+   */
+  noDefaultPanel?: boolean;
   /** Query the side panel's page is opened with (derivePanelWindowQuery or --panel-query). */
   panelQuery?: string;
   /** The extension's Chrome ID, so hardcoded chrome-extension://<id>/_favicon/ URLs are recognised. */
@@ -77,6 +82,7 @@ function shimSource(dir: string, config: ShimConfig): string {
   // line terminators inside a JS string literal; escape them.
   const json = JSON.stringify({
     sidePanelPath: (config.sidePanelPath ?? "").split(/[?#]/)[0].replace(/^\/+/, ""),
+    noDefaultPanel: config.noDefaultPanel === true,
     panelQuery: (config.panelQuery ?? "").replace(/^\?/, ""),
     extensionId: config.extensionId ?? "",
     favicon: usage.favicon,

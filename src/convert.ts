@@ -174,6 +174,8 @@ function buildAddon(
     shimFile = writeShim(stageDir, {
       debug: settings.debug === true,
       sidePanelPath: manifest.side_panel?.default_path ?? panelPage,
+      // A page found in the code means the manifest declares no panel for all tabs.
+      noDefaultPanel: panelPage !== "",
       panelQuery,
       extensionId: src.chromeId,
       debuggerEmulation,
