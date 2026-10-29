@@ -19,6 +19,7 @@
   var TIMEOUT_MS = 30000;
   var DEBUG = function () { try { return !!(typeof globalThis !== "undefined" && globalThis.__pageBridgeDebug); } catch (e) { return false; } };
   var DBG = function () { if (DEBUG()) try { console.log.apply(console, arguments); } catch (e) {} };
+  // __FRAME_VIEW__
 
   window.addEventListener(REQUEST_EVENT, function (ev) {
     var d = null;

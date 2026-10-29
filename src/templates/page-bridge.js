@@ -17,6 +17,7 @@
   var RESPONSE_EVENT = "__pageBridge:" + CHANNEL + ":response";
   var DEBUG = function () { try { return !!window.__pageBridgeDebug; } catch (e) { return false; } };
   var DBG = function () { if (DEBUG()) try { console.log.apply(console, arguments); } catch (e) {} };
+  // __FRAME_VIEW__
 
   var ns = window.chrome || {};
   var runtime = ns.runtime || {};
@@ -33,7 +34,8 @@
   if (state.channels.indexOf(CHANNEL) >= 0) return;
   state.channels.push(CHANNEL);
   // Messages for a different extension id go to the add-on that bridged the
-  // page before this one.
+  // page before this one; with none, they fail the way Chrome's do when no
+  // such extension is installed.
   var previous = typeof runtime.sendMessage === "function" ? runtime.sendMessage : null;
 
   var pending = Object.create(null);
@@ -51,7 +53,8 @@
   function sendMessage() {
     var args = Array.prototype.slice.call(arguments);
     var target = typeof args[0] === "string" ? args[0] : null;
-    if (target && CHROME_ID && target !== CHROME_ID && previous) return previous.apply(this, args);
+    var elsewhere = target !== null && CHROME_ID && target !== CHROME_ID;
+    if (elsewhere && previous) return previous.apply(this, args);
     // (extensionId, message[, options][, callback]) or (message[, callback])
     var msg = target !== null ? args[1] : args[0];
     var cb = null;
@@ -59,7 +62,7 @@
       if (typeof args[i] === "function") { cb = args[i]; break; }
     }
     var reqId = "r" + (++seq);
-    var p = new Promise(function (resolve, reject) {
+    var p = elsewhere ? Promise.reject(new Error("Could not establish connection. Receiving end does not exist.")) : new Promise(function (resolve, reject) {
       var detail;
       try {
         detail = JSON.stringify({ reqId: reqId, msg: msg });

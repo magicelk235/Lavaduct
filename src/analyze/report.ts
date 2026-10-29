@@ -40,9 +40,10 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   if (removedOptPerms.length) out.push(`Removed optional permission(s): ${quoted(removedOptPerms)}.`);
 
   // Permissions the converter grants for an emulation (chrome.debugger runs on
-  // scripting, tabs, webNavigation and webRequest), host patterns aside.
+  // scripting, tabs, webNavigation and webRequest; frames of bridged sites on
+  // blocking webRequest and a session rule), host patterns aside.
   const addedPerms = requiredAfter.filter((p) => !required.includes(p) && !toRequired.includes(p) && p !== "<all_urls>" && !p.includes("://"));
-  if (addedPerms.length) out.push(`Added permission(s) ${quoted(addedPerms)}, which the shim's emulations run on.`);
+  if (addedPerms.length) out.push(`Added permission(s) ${quoted(addedPerms)}, which the converter's emulations run on.`);
 
   for (const key of ["permissions", "host_permissions", "optional_host_permissions"] as const) {
     const beforeHosts = Array.isArray(before[key]) ? (before[key] as unknown[]).filter((p): p is string => typeof p === "string") : [];
@@ -50,7 +51,12 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     const removed = key === "permissions" ? [] : beforeHosts.filter((p) => !afterHosts.includes(p));
     if (removed.length) out.push(`Removed \`${key}\` pattern(s): ${removed.map((p) => `\`${p}\``).join(", ")}.`);
     const added = afterHosts.filter((p) => (p === "<all_urls>" || p.includes("://")) && !beforeHosts.includes(p));
-    if (added.length) out.push(`Added \`${key}\` pattern(s) ${added.map((p) => `\`${p}\``).join(", ")}: the chrome.debugger emulation needs access to every page.`);
+    if (added.length) {
+      const why = added.includes("<all_urls>")
+        ? "the chrome.debugger emulation needs access to every page"
+        : "the add-on's own pages frame these sites, and the page bridge needs access to them";
+      out.push(`Added \`${key}\` pattern(s) ${added.map((p) => `\`${p}\``).join(", ")}: ${why}.`);
+    }
   }
 
   const gecko = after.browser_specific_settings?.gecko;

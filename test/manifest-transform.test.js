@@ -111,7 +111,7 @@ test("the debugger emulation gets the APIs it runs on and access to every page, 
   assert.equal(out.optional_permissions, undefined, "tabs is granted outright now");
   assert.deepEqual(out.host_permissions, ["https://a.test/*", "<all_urls>"]);
   const lines = summarizeManifestChanges(m, out);
-  assert.ok(lines.includes("Added permission(s) `scripting`, `webNavigation`, `webRequest`, which the shim's emulations run on."), lines.join("\n"));
+  assert.ok(lines.includes("Added permission(s) `scripting`, `webNavigation`, `webRequest`, which the converter's emulations run on."), lines.join("\n"));
   assert.ok(lines.some((l) => l.startsWith("Added `host_permissions` pattern(s) `<all_urls>`")), lines.join("\n"));
 
   const mv2 = transformManifest({ manifest_version: 2, name: "Agent", version: "1", permissions: ["debugger"] }, ["debugger"], options({ debuggerEmulation: true }));

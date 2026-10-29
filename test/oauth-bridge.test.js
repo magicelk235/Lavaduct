@@ -39,7 +39,7 @@ function swManifest(extra = {}) {
   };
 }
 
-test("bridging a service-worker extension: page and relay scripts on the matched pages, receiver ahead of the worker", (t) => {
+test("bridging a service-worker extension: relay and page scripts in every frame of the matched pages, receiver ahead of the worker", (t) => {
   const dir = stage(t, { "sw.js": '"use strict";\nimportScripts("lib.js");\nchrome.runtime.onMessageExternal.addListener(() => {});\n', "lib.js": "", "cs.js": "" });
   const manifest = swManifest();
   const notes = applyOAuthBridge(dir, manifest, CHROME_ID);
@@ -51,14 +51,61 @@ test("bridging a service-worker extension: page and relay scripts on the matched
   const sw = read(dir, "sw.js");
   assert.match(sw, /^"use strict";/, "the directive must stay first or the worker loses strict mode");
   assert.ok(!/\bimportScripts\s*\(/.test(sw));
+  // Chrome gives chrome.runtime to every frame on a matched origin. The relay
+  // runs first so it can hand the page-world script what it needs.
   assert.deepEqual(manifest.content_scripts.slice(0, 2), [
-    { js: [BRIDGE_PAGE], matches: MATCHES, run_at: "document_start", all_frames: false, world: "MAIN" },
-    { js: [BRIDGE_PAGE_CS], matches: MATCHES, run_at: "document_start", all_frames: false },
+    { js: [BRIDGE_PAGE_CS], matches: MATCHES, run_at: "document_start", all_frames: true },
+    { js: [BRIDGE_PAGE], matches: MATCHES, run_at: "document_start", all_frames: true, world: "MAIN" },
   ]);
   assert.equal(manifest.content_scripts[2].js[0], "cs.js");
   assert.equal(manifest.externally_connectable, undefined, "Firefox only warns about the key");
   for (const f of [BRIDGE_PAGE, BRIDGE_PAGE_CS, BRIDGE_BACKGROUND]) assert.ok(existsSync(join(dir, f)), f);
   assert.ok(read(dir, BRIDGE_PAGE).includes(CHROME_ID));
+  assert.deepEqual(manifest.permissions, undefined, "no permissions for an add-on that frames no bridged site");
+});
+
+// Claude in Chrome's side panel is an <iframe> of claude.ai, which names the
+// extension's Chrome origin in frame-ancestors.
+const PANEL = 'const URL = "https://app.example.com/embed?surface=panel";\nrender(h("iframe", { src: URL }));\n';
+
+test("a bridged site the add-on frames in its own pages gets the permissions the frame code runs on, and the report says what is relaxed", (t) => {
+  const dir = stage(t, { "sw.js": "", "cs.js": "", "panel.js": PANEL, "panel.html": '<script src="panel.js"></script>' });
+  const manifest = swManifest({ permissions: ["storage"], host_permissions: ["https://other.example/*"] });
+  const notes = applyOAuthBridge(dir, manifest, CHROME_ID);
+  assert.equal(notes.length, 2);
+  assert.match(notes[1], /^Frames of app\.example\.com in the add-on's own pages: .*chrome-extension:\/\/abcdefghijklmnopabcdefghijklmnop.*frame-ancestors, object-src and base-uri/);
+  assert.deepEqual(manifest.permissions, ["storage", "webRequest", "webRequestBlocking", "declarativeNetRequestWithHostAccess"]);
+  assert.deepEqual(manifest.host_permissions, ["https://other.example/*", "https://app.example.com/*"]);
+});
+
+test("frames of a bridged site are only looked after with a known Chrome ID, from the add-on's own pages, on a listed site", (t) => {
+  const withoutId = swManifest();
+  const dir1 = stage(t, { "sw.js": "", "cs.js": "", "panel.js": PANEL });
+  assert.equal(applyOAuthBridge(dir1, withoutId).length, 1, "no Chrome origin to extend without the ID");
+  assert.equal(withoutId.permissions, undefined);
+
+  // A content script that frames the site runs in web pages, not the add-on's.
+  const fromContentScript = swManifest();
+  const dir2 = stage(t, { "sw.js": "", "cs.js": PANEL });
+  assert.equal(applyOAuthBridge(dir2, fromContentScript, CHROME_ID).length, 1);
+
+  // A site the extension frames but doesn't list in externally_connectable.
+  const unlisted = swManifest();
+  const dir3 = stage(t, { "sw.js": "", "cs.js": "", "panel.js": PANEL.replace("app.example.com", "elsewhere.example") });
+  assert.equal(applyOAuthBridge(dir3, unlisted, CHROME_ID).length, 1);
+
+  // A page that links to the site without framing it.
+  const linked = swManifest();
+  const dir4 = stage(t, { "sw.js": "", "cs.js": "", "panel.js": 'open("https://app.example.com/help");\n' });
+  assert.equal(applyOAuthBridge(dir4, linked, CHROME_ID).length, 1);
+});
+
+test("an add-on that already has access to the site and blocking webRequest gains nothing more", (t) => {
+  const dir = stage(t, { "sw.js": "", "cs.js": "", "panel.js": PANEL });
+  const manifest = swManifest({ permissions: ["webRequest", "webRequestBlocking", "declarativeNetRequest"], host_permissions: ["<all_urls>"] });
+  applyOAuthBridge(dir, manifest, CHROME_ID);
+  assert.deepEqual(manifest.permissions, ["webRequest", "webRequestBlocking", "declarativeNetRequest"]);
+  assert.deepEqual(manifest.host_permissions, ["<all_urls>"]);
 });
 
 test("bridging after the worker was already wired puts the receiver right after the shim", (t) => {
@@ -195,4 +242,15 @@ test("the receiver leaves the extension's own ports alone", async (t) => {
   assert.equal(port.onMessage.listeners.length, 0);
   assert.equal(disconnected, false);
   await tick();
+});
+
+test("a message for another extension fails the way Chrome's does when none is installed", async (t) => {
+  const { win, bg } = bridgeRuntime(t);
+  const seen = [];
+  bg.runtime.onMessageExternal.addListener((msg) => { seen.push(msg); });
+  const other = "ponmlkjihgfedcbaponmlkjihgfedcba";
+  const error = await new Promise((resolve) => win.chrome.runtime.sendMessage(other, { type: "ping" }, () => resolve(win.chrome.runtime.lastError?.message)));
+  assert.equal(error, "Could not establish connection. Receiving end does not exist.");
+  await assert.rejects(win.chrome.runtime.sendMessage(other, { type: "ping" }), /Receiving end does not exist/);
+  assert.deepEqual(seen, [], "the add-on never hears messages meant for another extension");
 });
