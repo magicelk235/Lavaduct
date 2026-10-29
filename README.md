@@ -117,6 +117,20 @@ keys `name`, `appName`, `addonId`, `version`, `manifestVersion`, `platforms`,
 `counts`, `autoFixed`, `shimmed`, `blocking`, `convertible`, `removedPermissions`,
 `manifestChanges` and `issues`.
 
+### What the converter relaxes
+
+Some sites let an extension embed them by naming its Chrome origin in their
+`frame-ancestors` policy; Claude in Chrome's side panel is claude.ai in a frame.
+Firefox refuses that frame, because the add-on's pages have a random
+`moz-extension://` origin. When the extension's own pages frame a site it lists in
+`externally_connectable`, and its Chrome ID is known, lavaduct lets the add-on's origin
+in wherever the site's policy names the Chrome origin, and nowhere else: not other
+pages' frames, not other add-ons', not top-level pages. Firefox only lets an add-on
+replace such a policy, not edit it, so that one frame keeps the site's
+`frame-ancestors` (plus the add-on), `object-src` and `base-uri`, and loses the rest,
+`script-src` included. The framed page also sees its parent as the Chrome origin,
+which is what such sites check. The conversion prints a line naming each site.
+
 ## Add-on IDs
 
 Firefox identifies an add-on by the ID in its manifest, and on AMO an ID belongs to
