@@ -88,7 +88,8 @@ declarativeNetRequest rules that use conditions Firefox can't evaluate are dropp
 with a warning, since Firefox would otherwise ignore them without saying so.
 `externally_connectable` doesn't exist in Firefox, so web pages listed there talk
 to the add-on through a small page bridge instead (`--no-oauth-bridge` turns that
-off).
+off). The bridge carries `runtime.sendMessage`; a port those pages open with
+`runtime.connect` never connects.
 
 The shim covers `chrome.sidePanel` (on top of Firefox's sidebar), `chrome.offscreen`
 (a hidden frame in the background page), `chrome.identity.getAuthToken` and its
@@ -99,8 +100,10 @@ screenshots, navigation, console and network events) on `scripting`, `tabs`,
 `webNavigation` and `webRequest`, which the conversion adds along with access to
 all sites. A background that was a service worker says so to code that asks
 (`ServiceWorkerGlobalScope`), `chrome://newtab` opens Firefox's new tab page, and
-the add-on's requests to the backends its CSP names carry its Chrome origin. The
-shim only fills in what Firefox lacks. `--no-shim` leaves it out.
+the add-on's requests to the backends its CSP names carry its Chrome origin.
+Chrome's declarativeNetRequest enum objects (`RuleActionType`, `HeaderOperation`
+and the like), which Firefox lacks, are there for code that builds rules from
+them. The shim only fills in what Firefox lacks. `--no-shim` leaves it out.
 
 An extension that talks to a native app (`connectNative`, `sendNativeMessage`)
 needs a Firefox host manifest naming the add-on. With `--install`, lavaduct writes or

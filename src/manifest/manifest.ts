@@ -633,7 +633,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     issues.push({
       severity: "info",
       category: "manifest",
-      message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage and connect calls.",
+      message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage calls (a port from runtime.connect never connects).",
       file: "manifest.json",
       fix: "Re-test sign-in and site integrations; --no-oauth-bridge turns the bridge off.",
       shimmed: true,
