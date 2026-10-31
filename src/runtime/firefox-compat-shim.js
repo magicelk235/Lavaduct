@@ -23,7 +23,9 @@
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
 //     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
-//   - webpack chunks of a worker bundle, listed ahead of the worker.
+//   - webpack chunks of a worker bundle, listed ahead of the worker;
+//   - runtime.onInstalled's repeated "install" for an add-on that is loaded
+//     temporarily again and again.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -1893,6 +1895,55 @@
     });
   }
 
+  // ── runtime.onInstalled for an add-on loaded temporarily ───────────────────
+  // Firefox fires onInstalled with reason "install" each time it loads a
+  // temporary add-on, so an extension loaded that way at every Firefox start
+  // would open its welcome page at every start. The background keeps the last
+  // version it was told about in localStorage, which outlasts a load when the
+  // profile keeps uninstalled add-ons' storage. A repeat of the same version
+  // becomes Chrome's "chrome_update", after which extensions redo their setup
+  // but welcome no one; a new version becomes an "update".
+  function installOnInstalledRepeats() {
+    if (!isBackground || !localStore) return;
+    var KEY = "__viaduct_installed_version__";
+    var version = "";
+    try { version = String(api.runtime.getManifest().version || ""); } catch (e) {}
+    var change = null;
+    function rewrite(details) {
+      if (!details || details.temporary !== true) return details;
+      if (change === null) {
+        var last = null;
+        try { last = localStore.getItem(KEY); } catch (e) {}
+        try { localStore.setItem(KEY, version); } catch (e) {}
+        change = last === null ? {} : last === version ? { reason: "chrome_update" } : { reason: "update", previousVersion: last };
+      }
+      if (details.reason !== "install") return details;
+      var out = {};
+      Object.keys(details).forEach(function (k) { out[k] = details[k]; });
+      Object.keys(change).forEach(function (k) { out[k] = change[k]; });
+      return out;
+    }
+    namespaces.forEach(function (ns) {
+      var ev = ns.runtime && ns.runtime.onInstalled;
+      if (!ev || typeof ev.addListener !== "function" || ev.__viaductRepeats) return;
+      var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+      var wrappers = new WeakMap();
+      function wrapperOf(fn) {
+        if (typeof fn !== "function") return fn;
+        var w = wrappers.get(fn);
+        if (!w) {
+          w = function (details) { return fn.call(this, rewrite(details)); };
+          wrappers.set(fn, w);
+        }
+        return w;
+      }
+      replaceMember(ev, "addListener", function (fn) { return add.call(ev, wrapperOf(fn)); });
+      replaceMember(ev, "removeListener", function (fn) { return remove.call(ev, wrappers.get(fn) || fn); });
+      replaceMember(ev, "hasListener", function (fn) { return has.call(ev, wrappers.get(fn) || fn); });
+      replaceMember(ev, "__viaductRepeats", true);
+    });
+  }
+
   try { installSidePanel(); } catch (e) { dbg("sidePanel shim failed:", errorMessage(e)); }
   try { installOffscreen(); } catch (e) { dbg("offscreen shim failed:", errorMessage(e)); }
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
@@ -1911,6 +1962,7 @@
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
+  try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
