@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { CHROME_STATIC_RULE_LIMIT, STATIC_RULES_PREF } from "../manifest/dnr.js";
 import { readState, writeState } from "../state.js";
 import type { SignRoute } from "../types.js";
 import { readInstalledAddons } from "./extensions-json.js";
@@ -27,7 +28,7 @@ export const DEBUGGER_SERVER_PREFS: Readonly<Record<string, boolean>> = {
  * of them and keeping the rest. Firefox reads user.js at startup, so `changed`
  * means a running Firefox needs a restart to pick them up.
  */
-function setUserPrefs(profilePath: string, prefs: Readonly<Record<string, boolean>>): { changed: boolean } {
+export function setUserPrefs(profilePath: string, prefs: Readonly<Record<string, boolean | number>>): { changed: boolean } {
   const file = join(profilePath, "user.js");
   let before = "";
   try {
@@ -73,6 +74,34 @@ export function allowUnsignedInProfile(profilePath: string): { changed: boolean 
  */
 export function enableDebuggerServerInProfile(profilePath: string): { changed: boolean } {
   return setUserPrefs(profilePath, DEBUGGER_SERVER_PREFS);
+}
+
+/** A numeric pref as the profile's user.js or prefs.js sets it, user.js first. */
+function numericPref(profilePath: string, name: string): number | undefined {
+  for (const file of ["user.js", "prefs.js"]) {
+    let text: string;
+    try {
+      text = readFileSync(join(profilePath, file), "utf-8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split(/\r?\n/)) {
+      if (PREF_LINE_RE.exec(line)?.[1] !== name) continue;
+      const value = /,\s*(-?\d+)\s*\)/.exec(line)?.[1];
+      if (value !== undefined) return Number(value);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Give add-ons in the profile Chrome's room for static declarativeNetRequest
+ * rules, through its user.js. A higher value the profile already has stays.
+ */
+export function raiseStaticRuleLimitInProfile(profilePath: string): { changed: boolean } {
+  const current = numericPref(profilePath, STATIC_RULES_PREF);
+  if (current !== undefined && current >= CHROME_STATIC_RULE_LIMIT) return { changed: false };
+  return setUserPrefs(profilePath, { [STATIC_RULES_PREF]: CHROME_STATIC_RULE_LIMIT });
 }
 
 /**

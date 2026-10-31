@@ -7,6 +7,7 @@ import { ENV_PREFIX } from "../dist/name.js";
 import {
   allowUnsignedInProfile,
   enableDebuggerServerInProfile,
+  raiseStaticRuleLimitInProfile,
   recordInstall,
   recordedInstalls,
   removeInstallRecord,
@@ -75,6 +76,22 @@ test("enableDebuggerServerInProfile turns on the devtools server without a conne
         'user_pref("devtools.debugger.force-local", true);\r\n',
     );
     assert.deepEqual(enableDebuggerServerInProfile(profile), { changed: false });
+  });
+});
+
+test("raiseStaticRuleLimitInProfile gives add-ons Chrome's static rule room, and never lowers what the profile has", async () => {
+  await withDir("lavaduct-userjs-", (profile) => {
+    const userJs = join(profile, "user.js");
+    writeFileSync(userJs, 'user_pref("extensions.dnr.guaranteed_minimum_static_rules", 50000);\n');
+    assert.deepEqual(raiseStaticRuleLimitInProfile(profile), { changed: true });
+    assert.equal(readFileSync(userJs, "utf-8"), 'user_pref("extensions.dnr.guaranteed_minimum_static_rules", 330000);\n');
+    assert.deepEqual(raiseStaticRuleLimitInProfile(profile), { changed: false });
+  });
+  await withDir("lavaduct-userjs-", (profile) => {
+    // Set higher in about:config, which Firefox keeps in prefs.js.
+    writeFileSync(join(profile, "prefs.js"), 'user_pref("extensions.dnr.guaranteed_minimum_static_rules", 500000);\n');
+    assert.deepEqual(raiseStaticRuleLimitInProfile(profile), { changed: false });
+    assert.equal(existsSync(join(profile, "user.js")), false);
   });
 });
 

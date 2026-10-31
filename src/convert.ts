@@ -18,7 +18,7 @@ import {
   writeManifest,
 } from "./manifest/manifest.js";
 import { compareFirefoxVersions } from "./manifest/compat-data.js";
-import { applyDnr } from "./manifest/dnr.js";
+import { applyDnr, GUARANTEED_MINIMUM_STATIC_RULES, STATIC_RULES_PREF, CHROME_STATIC_RULE_LIMIT } from "./manifest/dnr.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { countBlocking, printIssues, summarizeManifestChanges, writeReportFile, type ReportMeta } from "./analyze/report.js";
 import { backendHosts, derivePanelPage, derivePanelWindowQuery, injectShimIntoHtmlPages, usesDebugger, wireBackground, writeShim } from "./runtime/shim.js";
@@ -35,6 +35,7 @@ import {
   allowUnsignedInProfile,
   DEBUGGER_SERVER_PREFS,
   enableDebuggerServerInProfile,
+  raiseStaticRuleLimitInProfile,
   recordInstall,
   waitForAddon,
 } from "./firefox/install.js";
@@ -145,15 +146,16 @@ type BuildSettings = Pick<
 /**
  * Stage the extension and turn it into a Firefox add-on: source rewrites, the shim,
  * the Firefox manifest, DNR rules, the page bridge, the background scripts and
- * placeholder icons. Writes the final manifest.json and returns it. --analyze runs
- * this on a scratch copy, so its preview is exactly what a conversion produces.
+ * placeholder icons. Writes the final manifest.json and returns it, with the number
+ * of static DNR rules the add-on carries. --analyze runs this on a scratch copy, so
+ * its preview is exactly what a conversion produces.
  */
 function buildAddon(
   src: { extPath: string; manifest: Manifest; permissionsToRemove: string[]; name: string; chromeId?: string; addonId: string },
   stageDir: string,
   settings: BuildSettings,
   log: Log,
-): Manifest {
+): { manifest: Manifest; staticRules: number } {
   const { manifest } = src;
   for (const asset of stageExtension(src.extPath, stageDir, collectReferencedPaths(manifest))) {
     log.warn(`Manifest-referenced asset not staged (broken/external symlink or copy error): ${asset}. It will 404 in Firefox.`);
@@ -212,7 +214,8 @@ function buildAddon(
     );
   }
 
-  for (const note of applyDnr(stageDir, out)) log.warn(note);
+  const dnr = applyDnr(stageDir, out);
+  for (const note of dnr.notes) log.warn(note);
   if (settings.oauthBridge !== false) {
     for (const note of applyOAuthBridge(stageDir, out, src.chromeId)) log.ok(note);
   }
@@ -226,7 +229,7 @@ function buildAddon(
   if (maps > 0) log.ok(`Stripped dangling sourcemap refs from ${maps} script(s)`);
 
   writeManifest(stageDir, out);
-  return out;
+  return { manifest: out, staticRules: dnr.staticRules };
 }
 
 /** Extract an input and read its manifest and identity. */
@@ -269,7 +272,7 @@ export function analyzeExtension(opts: AnalyzeOptions): Analysis {
     const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, src.minFirefox);
     const addonId = opts.addonId ?? deriveAddonId({ chromeId: src.chromeId, name: src.name });
     const quiet: Log = { ok() {}, warn() {} };
-    const built = buildAddon({ ...src, permissionsToRemove, addonId }, join(scratch.path, STAGE_DIR), opts, quiet);
+    const { manifest: built } = buildAddon({ ...src, permissionsToRemove, addonId }, join(scratch.path, STAGE_DIR), opts, quiet);
     return {
       name: src.name,
       appName: deriveAppName(src.name),
@@ -354,6 +357,22 @@ function sandboxProblem(install: FirefoxInstall, path: string): string | undefin
 type InstallOutcome = "installed" | "skipped" | "failed";
 
 /**
+ * Give the profile Chrome's room for static DNR rules when the add-on carries
+ * more than Firefox allows one by default; Firefox reads the pref when it
+ * starts. True when the profile's user.js changed.
+ */
+function raiseRuleLimit(profilePath: string, staticRules: number): boolean {
+  if (staticRules <= GUARANTEED_MINIMUM_STATIC_RULES || !raiseStaticRuleLimitInProfile(profilePath).changed) return false;
+  ok(
+    `The add-on has ${staticRules} static DNR rules, past Firefox's default of ${GUARANTEED_MINIMUM_STATIC_RULES} per add-on: ` +
+      `set ${STATIC_RULES_PREF} to Chrome's ${CHROME_STATIC_RULE_LIMIT} in ${join(profilePath, "user.js")}`,
+  );
+  return true;
+}
+
+const RULE_LIMIT_RESTART = "Firefox has the profile open and reads the rule limit when it starts; restart it for all of the add-on's rules to load.";
+
+/**
  * The temporary route: Firefox loads the staged folder in place through its
  * devtools server, the way web-ext run does. Unlike WebDriver, that server
  * leaves navigator.webdriver false, so sign-in pages don't take Firefox for a bot.
@@ -362,15 +381,17 @@ async function installTemporarily(
   { install, profile }: InstallTarget,
   stageDir: string,
   addonId: string,
+  staticRules: number,
   opts: ConvertOptions,
 ): Promise<InstallOutcome> {
-  if (opts.headless) return installHeadless({ install, profile }, stageDir, addonId);
+  if (opts.headless) return installHeadless({ install, profile }, stageDir, addonId, staticRules);
   // A Firefox that an earlier temporary install started still has its devtools
   // server: load this add-on next to the others rather than restart it,
   // which would drop them.
   let session = await RdpSession.attach(profile.path);
   if (session) {
     info(`Using the Firefox that already has ${profile.path} open with remote debugging on`);
+    if (raiseRuleLimit(profile.path, staticRules)) warn(RULE_LIMIT_RESTART);
   } else {
     if (profileInUse(profile.path)) {
       if (!opts.firefoxRestart) {
@@ -390,6 +411,7 @@ async function installTemporarily(
       const prefs = Object.entries(DEBUGGER_SERVER_PREFS).map(([name, value]) => `${name} = ${value}`);
       ok(`Turned on remote debugging in ${join(profile.path, "user.js")} (${prefs.join(", ")})`);
     }
+    raiseRuleLimit(profile.path, staticRules);
     session = await RdpSession.start(install, profile.path);
   }
   let id: string;
@@ -409,11 +431,12 @@ async function installTemporarily(
  * quits again. BiDi can close Firefox cleanly, and nobody browses in that
  * Firefox, so the navigator.webdriver it sets doesn't matter there.
  */
-async function installHeadless({ install, profile }: InstallTarget, stageDir: string, addonId: string): Promise<InstallOutcome> {
+async function installHeadless({ install, profile }: InstallTarget, stageDir: string, addonId: string, staticRules: number): Promise<InstallOutcome> {
   if (profileInUse(profile.path)) {
     fail(`Firefox has the profile at ${profile.path} open. --headless needs a profile no Firefox has open; quit it, or pass another --profile.`);
     return "failed";
   }
+  raiseRuleLimit(profile.path, staticRules);
   const session = await BidiSession.start(install, profile.path);
   let id: string;
   try {
@@ -434,6 +457,7 @@ async function installByPrompt(
   { install, profile }: InstallTarget,
   route: SignRoute,
   xpi: string,
+  staticRules: number,
   opts: ConvertOptions,
 ): Promise<InstallOutcome> {
   if (route === "unsigned") {
@@ -456,6 +480,7 @@ async function installByPrompt(
       }
     }
   }
+  if (raiseRuleLimit(profile.path, staticRules) && profileInUse(profile.path)) warn(RULE_LIMIT_RESTART);
   if (!opts.launch) {
     info(`Not starting Firefox (--no-launch). Open ${xpi} in Firefox with the profile at ${profile.path} to install it.`);
     return "skipped";
@@ -526,7 +551,7 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     // Kept in the output directory: a temporary install loads it in place.
     const stageDir = join(outputDir, STAGE_DIR);
     info("Staging clean extension assets …");
-    const built = buildAddon({ ...src, permissionsToRemove, addonId }, stageDir, opts, { ok, warn });
+    const { manifest: built, staticRules } = buildAddon({ ...src, permissionsToRemove, addonId }, stageDir, opts, { ok, warn });
     const version = built.version ?? "";
     result.stagedPath = stageDir;
     result.version = version;
@@ -619,8 +644,8 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
       try {
         outcome =
           route === "temporary"
-            ? await installTemporarily(plan.target, stageDir, addonId, opts)
-            : await installByPrompt(plan.target, route, installable, opts);
+            ? await installTemporarily(plan.target, stageDir, addonId, staticRules, opts)
+            : await installByPrompt(plan.target, route, installable, staticRules, opts);
       } catch (err) {
         fail((err as Error).message);
         outcome = "failed";

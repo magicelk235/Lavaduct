@@ -26,7 +26,7 @@ test("a rule conditioned on response headers is removed and named", () => {
     "rules.json": [block(1), block(2, { responseHeaders: [{ header: "content-type", values: ["text/html"] }] }), block(3)],
   });
   try {
-    const notes = applyDnr(dir, manifestWith(["main", "rules.json"]));
+    const { notes } = applyDnr(dir, manifestWith(["main", "rules.json"]));
     assert.deepEqual(readRules(dir, "rules.json").map((r) => r.id), [1, 3]);
     const note = notes.find((n) => n.includes('"main"'));
     assert.ok(note, "a note names the ruleset");
@@ -46,7 +46,7 @@ test("resource types Firefox never sees are taken out of rules, and a rule left 
     ],
   });
   try {
-    const notes = applyDnr(dir, manifestWith(["main", "rules.json"]));
+    const { notes } = applyDnr(dir, manifestWith(["main", "rules.json"]));
     assert.deepEqual(readRules(dir, "rules.json"), [
       block(1, { resourceTypes: ["script"] }),
       // Still every type, main_frame included, like the Chrome rule.
@@ -66,7 +66,7 @@ test("a regexFilter only RE2 understands is removed instead of silently skipped"
   ];
   const dir = stage({ "rules.json": rules });
   try {
-    const notes = applyDnr(dir, manifestWith(["main", "rules.json"]));
+    const { notes } = applyDnr(dir, manifestWith(["main", "rules.json"]));
     assert.deepEqual(readRules(dir, "rules.json"), [rules[1]]);
     assert.ok(notes.some((n) => /rule 1 \(regexFilter/.test(n)));
   } finally {
@@ -82,7 +82,7 @@ test("the deprecated domains conditions are renamed so the rule keeps its scope"
     ],
   });
   try {
-    const notes = applyDnr(dir, manifestWith(["main", "rules.json"]));
+    const { notes } = applyDnr(dir, manifestWith(["main", "rules.json"]));
     const rules = readRules(dir, "rules.json");
     // Left alone, Firefox would ignore the unknown keys and block "ads" on every site.
     assert.deepEqual(rules, [block(1, { initiatorDomains: ["news.example"], excludedInitiatorDomains: ["shop.news.example"] })]);
@@ -113,7 +113,7 @@ test("enabled rulesets past Firefox's twenty are named", () => {
   resources.push(["off", "r1.json", false]);
   const dir = stage(files);
   try {
-    const notes = applyDnr(dir, manifestWith(...resources));
+    const { notes } = applyDnr(dir, manifestWith(...resources));
     const note = notes.find((n) => n.includes("20"));
     assert.ok(note);
     assert.match(note, /"set21", "set22"/);
@@ -127,7 +127,8 @@ test("a ruleset that would overflow the static rule quota is named; later ones s
   const rules = (n, start = 1) => Array.from({ length: n }, (_, i) => block(start + i));
   const dir = stage({ "a.json": rules(20000), "b.json": rules(15000), "c.json": rules(5000) });
   try {
-    const notes = applyDnr(dir, manifestWith(["a", "a.json"], ["b", "b.json"], ["c", "c.json"]));
+    const { notes, staticRules } = applyDnr(dir, manifestWith(["a", "a.json"], ["b", "b.json"], ["c", "c.json"]));
+    assert.equal(staticRules, 40000, "every ruleset counts, enabled or not, since the add-on can enable them later");
     const quota = notes.filter((n) => n.includes("30000"));
     assert.equal(quota.length, 1);
     assert.match(quota[0], /"b"/);
@@ -141,7 +142,7 @@ test("a ruleset that would overflow the regex quota is named", () => {
   const regexRules = Array.from({ length: 1001 }, (_, i) => ({ id: i + 1, priority: 1, action: { type: "block" }, condition: { regexFilter: `^https://ads${i}\\.` } }));
   const dir = stage({ "re.json": regexRules });
   try {
-    const notes = applyDnr(dir, manifestWith(["regex", "re.json"]));
+    const { notes } = applyDnr(dir, manifestWith(["regex", "re.json"]));
     assert.ok(notes.some((n) => n.includes('"regex"') && n.includes("1000")));
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -156,7 +157,7 @@ test("a ruleset path outside the extension is never written", () => {
   const original = JSON.stringify([block(1, { responseHeaders: [{ header: "x" }] })]);
   writeFileSync(victim, original);
   try {
-    const notes = applyDnr(dir, manifestWith(["evil", "../victim.json"]));
+    const { notes } = applyDnr(dir, manifestWith(["evil", "../victim.json"]));
     assert.equal(readFileSync(victim, "utf-8"), original);
     assert.ok(notes.some((n) => n.includes("evil")));
   } finally {
@@ -170,6 +171,47 @@ test("a leading slash in the ruleset path means the extension root", () => {
     applyDnr(dir, manifestWith(["main", "/rules/a.json"]));
     assert.deepEqual(readRules(dir, "rules/a.json").map((r) => r.id), [2]);
     assert.equal(existsSync("/rules/a.json"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a redirect to a data: URL points at a web-accessible file with the same bytes", () => {
+  const redirect = (id, url) => ({ id, priority: 1, action: { type: "redirect", redirect: { url } }, condition: { urlFilter: "ads" } });
+  const script = "data:application/javascript,window.ads%3D1";
+  const png = "data:image/png;base64,iVBORw0KGgo=";
+  const dir = stage({
+    "a.json": [redirect(1, script), redirect(2, png), block(3)],
+    "b.json": [redirect(1, script), redirect(2, "https://example.com/x.js")],
+  });
+  try {
+    const manifest = { ...manifestWith(["a", "a.json"], ["b", "b.json"]), web_accessible_resources: [{ resources: ["x.css"], matches: ["<all_urls>"] }] };
+    const { notes } = applyDnr(dir, manifest);
+    const a = readRules(dir, "a.json");
+    const b = readRules(dir, "b.json");
+    const scriptPath = a[0].action.redirect.extensionPath;
+    assert.match(scriptPath, /^\/lavaduct-dnr-redirects\/[0-9a-f]{16}\.js$/, "a script stand-in keeps a .js name, so Firefox serves it as JavaScript");
+    assert.equal(readFileSync(join(dir, scriptPath), "utf-8"), "window.ads=1");
+    assert.match(a[1].action.redirect.extensionPath, /\.png$/);
+    assert.deepEqual(readFileSync(join(dir, a[1].action.redirect.extensionPath)), Buffer.from("iVBORw0KGgo=", "base64"));
+    assert.deepEqual(a[2], block(3));
+    assert.equal(b[0].action.redirect.extensionPath, scriptPath, "the same URL in another ruleset shares the file");
+    assert.deepEqual(b[1].action.redirect, { url: "https://example.com/x.js" });
+    assert.deepEqual(manifest.web_accessible_resources, [
+      { resources: ["x.css"], matches: ["<all_urls>"] },
+      { resources: ["lavaduct-dnr-redirects/*"], matches: ["<all_urls>"] },
+    ]);
+    assert.ok(notes.some((n) => /^3 DNR rule\(s\) in 2 ruleset\(s\) redirect to data: URLs/.test(n)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an IPv6 address in a static rule's domains gets the brackets Firefox wants", () => {
+  const dir = stage({ "rules.json": [block(1, { requestDomains: ["::1", "example.com"], excludedInitiatorDomains: ["[::2]"] })] });
+  try {
+    applyDnr(dir, manifestWith(["main", "rules.json"]));
+    assert.deepEqual(readRules(dir, "rules.json")[0].condition, { urlFilter: "ads", requestDomains: ["[::1]", "example.com"], excludedInitiatorDomains: ["[::2]"] });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

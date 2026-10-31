@@ -90,7 +90,9 @@ asks for `webRequest` also gets `webRequestBlocking`, which Chrome keeps from st
 extensions but Firefox grants, since code written for Firefox expects it.
 
 declarativeNetRequest rules that use conditions Firefox can't evaluate are dropped
-with a warning, since Firefox would otherwise ignore them without saying so.
+with a warning, since Firefox would otherwise ignore them without saying so. Rules
+that redirect to a `data:` URL, which Firefox refuses, redirect to a file in the
+add-on with the same content instead.
 `externally_connectable` doesn't exist in Firefox, so web pages listed there talk
 to the add-on through a small page bridge instead (`--no-oauth-bridge` turns that
 off). The bridge carries `runtime.sendMessage`; a port those pages open with
@@ -221,6 +223,16 @@ can be loaded side by side.
 `--headless` loads the add-on into a Firefox without a window, over WebDriver, and
 quits it again, which checks that Firefox accepts the add-on. It is meant for CI and
 needs Firefox 138 or newer.
+
+### Ad blockers and the rule limit
+
+Firefox lets an add-on enable 30,000 static declarativeNetRequest rules, where Chrome
+lets an extension borrow up to 300,000 more from a shared pool. Ad blockers' default
+filter lists need more than 30,000. When the add-on's rulesets hold more than that,
+every install route sets `extensions.dnr.guaranteed_minimum_static_rules` to 330,000
+in the profile's `user.js` and says so. That raises the limit for every add-on in the
+profile, and a higher value you set yourself stays. Firefox only reads it when it
+starts, and lavaduct tells you when a Firefox that's already open needs a restart for it.
 
 ### Checking the install
 
