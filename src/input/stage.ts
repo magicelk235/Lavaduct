@@ -554,6 +554,55 @@ function rewriteBackgroundContextChecks(stageDir: string, manifest: Manifest): n
   return modified;
 }
 
+// A worker gives itself a window with `self.window = self`. In the event page that
+// replaces it, window is a getter-only accessor, and the assignment throws in
+// strict code, ending the script there. window already is the global in a page.
+const WINDOW_SELF_ALIAS_RE = /(^|[^.\w$])(?:self|globalThis)\s*\.\s*window\s*=\s*(self|globalThis)\b(?!\s*[.[(=])/g;
+
+function rewriteWorkerWindowAlias(stageDir: string, manifest: Manifest): number {
+  if (typeof manifest.background?.service_worker !== "string") return 0;
+  let modified = 0;
+  for (const file of backgroundScriptPaths(stageDir, manifest)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    const next = content.replace(WINDOW_SELF_ALIAS_RE, "$1$2");
+    if (next !== content) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
+// lodash and webpack find the global object with `freeGlobal || freeSelf ||
+// Function("return this")()`. In a Firefox content script `self` is an Xray to
+// the page's window (self.Object !== Object), so the lookup falls through to
+// Function(), which the content-script CSP refuses; Chrome's isolated world
+// passes the `self` test. The call can only return its realm's global.
+const FUNCTION_RETURN_THIS_RE = /(?<![\w$.])(?:new\s+)?Function\s*\(\s*(["'])return this;?\1\s*\)\s*\(\s*\)/g;
+
+function rewriteFunctionGlobalLookups(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    const next = content.replace(FUNCTION_RETURN_THIS_RE, "globalThis");
+    if (next !== content) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
 /**
  * Run every source rewrite over the staged scripts, in dependency order: the
  * runtime.id rewrites and the self-page rewrite need to see `chrome-extension://`
@@ -569,6 +618,8 @@ export function applySourceRewrites(stageDir: string, manifest: Manifest): Array
     { name: "Rewrote self-page chrome-extension: URLs to runtime.getURL", count: rewriteSelfPageExtensionUrls(stageDir) },
     { name: "Rewrote @@extension_id placeholder URLs", count: rewriteExtensionIdPlaceholderUrls(stageDir) },
     { name: "Corrected the background-context check", count: rewriteBackgroundContextChecks(stageDir, manifest) },
+    { name: "Dropped the worker's self.window alias, which an event page refuses", count: rewriteWorkerWindowAlias(stageDir, manifest) },
     { name: "Guarded location.ancestorOrigins[0] reads", count: guardAncestorOriginsAccess(stageDir) },
+    { name: 'Replaced Function("return this")() global lookups with globalThis', count: rewriteFunctionGlobalLookups(stageDir) },
   ];
 }

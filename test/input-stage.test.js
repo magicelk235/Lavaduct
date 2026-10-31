@@ -56,6 +56,14 @@ test("the background's own window check answers 'background'", () => {
   assert.equal(run("popup.js"), "content");
 });
 
+test("a worker's self.window alias goes, since an event page's window can't be assigned", () => {
+  const code = '"use strict";var a=self.window||0;self.window=self;start(),globalThis.window = globalThis;x.self.window=self;';
+  const dir = stageWith({ "sw.js": code, "page.js": code });
+  applySourceRewrites(dir, { manifest_version: 3, name: "T", version: "1", background: { service_worker: "sw.js" } });
+  assert.equal(readFileSync(join(dir, "sw.js"), "utf-8"), '"use strict";var a=self.window||0;self;start(),globalThis;x.self.window=self;');
+  assert.equal(readFileSync(join(dir, "page.js"), "utf-8"), code, "only the background's own scripts change");
+});
+
 test("staging drops dev cruft and symlinks but keeps manifest-referenced files", () => {
   const src = stageWith({
     "manifest.json": "{}",
@@ -73,4 +81,11 @@ test("staging drops dev cruft and symlinks but keeps manifest-referenced files",
   assert.ok(!existsSync(join(stage, "README.md")));
   assert.ok(!existsSync(join(stage, "node_modules")));
   assert.ok(!existsSync(join(stage, "hosts")));
+});
+
+test('Function("return this")() global lookups become globalThis, which content-script CSP allows', () => {
+  const code = 'var a=f||s||Function("return this")();var b=new Function(\'return this;\')();var c=w.Function("return this")();var d=Function("return this");';
+  const dir = stageWith({ "lib.js": code });
+  applySourceRewrites(dir, { manifest_version: 3, name: "T", version: "1" });
+  assert.equal(readFileSync(join(dir, "lib.js"), "utf-8"), 'var a=f||s||globalThis;var b=globalThis;var c=w.Function("return this")();var d=Function("return this");');
 });
