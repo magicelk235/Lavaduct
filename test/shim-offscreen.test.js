@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { buildShim, fakeBrowser, runInContext, plain, tick, EXT_ORIGIN } from "./shim-sandbox.js";
 
 // Firefox has no offscreen API, but its event page is a real document, so an
@@ -79,14 +80,26 @@ test("callback style resolves too", async () => {
   assert.equal(await new Promise((r) => browser.offscreen.hasDocument(r)), true);
 });
 
-test("clients.matchAll() reports the offscreen document, as it does in a service worker", async () => {
-  const { browser, document, ctx } = background();
+test("clients.matchAll() in a background that was a service worker reports the offscreen document", async () => {
+  const browser = fakeBrowser();
+  const document = fakeDocument();
+  const views = [];
+  browser.extension.getViews = () => views;
+  const ctx = runInContext(buildShim({ serviceWorker: true, serviceWorkerScript: "sw.js" }, USES_OFFSCREEN), {
+    browser,
+    globals: { document, setInterval: () => 0, clearInterval: () => {} },
+  });
   assert.deepEqual(plain(await ctx.clients.matchAll()), []);
   const p = browser.offscreen.createDocument({ url: "offscreen.html", reasons: ["AUDIO_PLAYBACK"], justification: "x" });
   document.appended[0].fire("load");
   await p;
-  const urls = plain((await ctx.clients.matchAll()).map((c) => c.url));
-  assert.deepEqual(urls, [EXT_ORIGIN + "/offscreen.html"]);
+  // Firefox lists the iframe among the add-on's views.
+  const backgroundWindow = vm.runInContext("globalThis", ctx);
+  const frameWindow = { location: { href: EXT_ORIGIN + "/offscreen.html" }, top: backgroundWindow };
+  views.push(backgroundWindow, frameWindow);
+  const found = await ctx.clients.matchAll();
+  assert.deepEqual(plain(found.map((c) => c.url)), [EXT_ORIGIN + "/offscreen.html"]);
+  assert.equal(found[0].visibilityState, "hidden", "a frame of the event page is never on screen");
 });
 
 test("while a document is open the event page is kept from going idle", async () => {

@@ -106,11 +106,19 @@ extensions drive tabs with (evaluation, clicks and typing as synthetic page even
 screenshots, navigation, console and network events) on `scripting`, `tabs`,
 `webNavigation` and `webRequest`, which the conversion adds along with access to
 all sites. A background that was a service worker says so to code that asks
-(`ServiceWorkerGlobalScope`), `chrome://newtab` opens Firefox's new tab page, and
-the add-on's requests to the backends its CSP names carry its Chrome origin.
-Chrome's declarativeNetRequest enum objects (`RuleActionType`, `HeaderOperation`
-and the like), which Firefox lacks, are there for code that builds rules from
-them. The shim only fills in what Firefox lacks. `--no-shim` leaves it out.
+(`ServiceWorkerGlobalScope`), and its pages still reach it through
+`navigator.serviceWorker` while it reaches them through `clients`, both carried
+over `postMessage` to the event page. `chrome://newtab` opens Firefox's new tab
+page, and the add-on's requests to the backends its CSP names carry its Chrome
+origin.
+Chrome's enum objects that Firefox lacks (declarativeNetRequest's `RuleActionType`,
+`HeaderOperation` and the like, `identity.AccountStatus`, `storage.AccessLevel`) are
+there for code that builds arguments from them. Rules the code adds at runtime get
+the same fixes as the static ones, so one rule Firefox can't take doesn't sink the
+whole call. `runtime.getContexts` knows about the offscreen document,
+`storage.session.setAccessLevel` answers, `storage.managed.get()` answers like an
+empty area when no policy is set, as Chrome's does, and content scripts find the API on `window.chrome`
+too. The shim only fills in what Firefox lacks. `--no-shim` leaves it out.
 
 An extension that talks to a native app (`connectNative`, `sendNativeMessage`)
 needs a Firefox host manifest naming the add-on. With `--install`, lavaduct writes or

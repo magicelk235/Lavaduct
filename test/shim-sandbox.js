@@ -129,7 +129,8 @@ export function runInContext(source, { browser, chrome, href = EXT_ORIGIN + "/_g
     ...((chrome || browser) ? { chrome: chrome || browser } : {}),
     ...globals,
   };
-  sandbox.window = sandbox;
+  // A content script's `window` is an Xray to the page's window, not its global.
+  if (!("window" in globals)) sandbox.window = sandbox;
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
   if (!("top" in globals)) sandbox.top = sandbox;

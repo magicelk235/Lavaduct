@@ -21,7 +21,16 @@ import { compareFirefoxVersions } from "./manifest/compat-data.js";
 import { applyDnr, GUARANTEED_MINIMUM_STATIC_RULES, STATIC_RULES_PREF, CHROME_STATIC_RULE_LIMIT } from "./manifest/dnr.js";
 import { scanExtension } from "./analyze/analyze.js";
 import { countBlocking, printIssues, summarizeManifestChanges, writeReportFile, type ReportMeta } from "./analyze/report.js";
-import { backendHosts, derivePanelPage, derivePanelWindowQuery, injectShimIntoHtmlPages, usesDebugger, wireBackground, writeShim } from "./runtime/shim.js";
+import {
+  backendHosts,
+  derivePanelPage,
+  derivePanelWindowQuery,
+  injectShimIntoHtmlPages,
+  usesDebugger,
+  wireBackground,
+  workerChunkGlobal,
+  writeShim,
+} from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { deriveAddonId } from "./sign/addon-id.js";
 import { signWithAmo } from "./sign/amo.js";
@@ -182,7 +191,10 @@ function buildAddon(
       extensionId: src.chromeId,
       debuggerEmulation,
       serviceWorker: typeof bg?.service_worker === "string" && !Array.isArray(bg.scripts) && !bg.page,
+      serviceWorkerScript: typeof bg?.service_worker === "string" ? bg.service_worker : "",
       backendHosts: backendHosts(manifest),
+      userScripts: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].includes("userScripts"),
+      webpackChunkGlobal: workerChunkGlobal(stageDir, manifest),
     });
     if (settings.debug) {
       log.ok(`Debug build: shim tracing on, kept in storage.local under ${DEBUG_LOG_KEY} (read it with ${NAME} --logs). Don't ship this build.`);

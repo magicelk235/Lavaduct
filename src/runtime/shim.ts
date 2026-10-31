@@ -33,30 +33,53 @@ export interface ShimConfig {
   debuggerEmulation?: boolean;
   /** The Chrome background was a service worker; it now runs as an event page. */
   serviceWorker?: boolean;
+  /** That worker's script, root-relative: the Chrome manifest's background.service_worker. */
+  serviceWorkerScript?: string;
   /** Hosts whose requests from the add-on carry its Chrome origin (see backendHosts). */
   backendHosts?: string[];
+  /** The worker's webpack chunk-loading global, when its chunks load ahead of it (see wireBackground). */
+  webpackChunkGlobal?: string;
+  /** The Chrome manifest asks for userScripts, which Firefox only grants at runtime. */
+  userScripts?: boolean;
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
 // emitted for an add-on that needs them: favicon support wraps fetch and watches
-// <img> elements, the offscreen emulation adds a `clients` global to the
-// background page, which code testing for a service worker would notice, the
-// new tab fix wraps tabs.create, and a background that claims to be a service
-// worker changes what code testing for one does.
+// <img> elements, the new tab fix wraps tabs.create, a background that claims
+// to be a service worker changes what code testing for one does, and so do the
+// service worker's `clients` and `registration` in the background and
+// navigator.serviceWorker in the extension's pages; the background's Web Lock
+// names are translated only for code that takes locks.
 const FAVICON_REF_RE = /chrome:\/\/favicon|(?:^|[^\w$])_favicon\//m;
 const OFFSCREEN_REF_RE = /\.\s*offscreen\b|\[\s*["']offscreen["']\s*\]/;
 const NEW_TAB_REF_RE = /["'`]chrome:\/\/new-?tab(?:-page)?\/?["'`]/i;
 const SW_SCOPE_REF_RE = /\bServiceWorkerGlobalScope\b/;
+// The worker's clients (`self.clients`, `clients.matchAll(`, `const { clients } = self`),
+// and its pages' navigator.serviceWorker: the two ends of one channel.
+const SW_CLIENTS_REF_RE = /\b(?:self|globalThis)\s*\.\s*clients\b|\bclients\s*\.\s*(?:matchAll|get|openWindow|claim)\s*\(|\{[^{}]*\bclients\b[^{}]*\}\s*=\s*(?:self|globalThis)\b|\bnavigator\s*\.\s*serviceWorker\b/;
+// The worker's own registration, read for members the stand-in provides. A bundle
+// that reaches for pushManager picks web push when it finds a registration, and
+// Firefox gives add-ons no Push API, so it must keep finding none.
+const SW_REGISTRATION_REF_RE = /\b(?:self|globalThis)\s*\.\s*registration\s*(?:\?\.|\.)\s*(?:active|installing|waiting|scope|addEventListener|update|unregister)\b/;
+const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
+const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
 
 interface Usage {
   favicon: boolean;
   offscreen: boolean;
   newTab: boolean;
   serviceWorkerScope: boolean;
+  serviceWorkerClients: boolean;
+  serviceWorkerRegistration: boolean;
+  pushManager: boolean;
+  locks: boolean;
 }
 
 function scanUsage(dir: string): Usage {
-  const found: Usage = { favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false };
+  const found: Usage = {
+    favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
+    serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false,
+  };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
     let src: string;
@@ -70,6 +93,10 @@ function scanUsage(dir: string): Usage {
       if (!found.offscreen) found.offscreen = OFFSCREEN_REF_RE.test(src);
       if (!found.newTab) found.newTab = NEW_TAB_REF_RE.test(src);
       if (!found.serviceWorkerScope) found.serviceWorkerScope = SW_SCOPE_REF_RE.test(src);
+      if (!found.serviceWorkerClients) found.serviceWorkerClients = SW_CLIENTS_REF_RE.test(src);
+      if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
+      if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
+      if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
     }
   }
   return found;
@@ -89,7 +116,13 @@ function shimSource(dir: string, config: ShimConfig): string {
     offscreen: usage.offscreen,
     newTab: usage.newTab,
     serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
+    serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
+    serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
+    serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
+    serviceWorkerLocks: config.serviceWorker === true && usage.locks,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
+    userScriptEvents: config.userScripts === true,
+    webpackChunkGlobal: config.webpackChunkGlobal ?? "",
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
@@ -324,9 +357,12 @@ export function injectShimIntoHtmlPages(dir: string, shimFile: string): number {
  *
  * - A classic worker's static importScripts targets are listed ahead of it and
  *   every call is neutralised. When a call has a computed argument (webpack's
- *   chunk loader), the bundle's async chunks are listed after the worker, so each
- *   one registers through the runtime's chunk-loading global before anything asks
- *   for it.
+ *   chunk loader), the bundle's async chunks are listed too: ahead of the worker
+ *   when the shim is there, which hands their queued registrations to the
+ *   runtime the moment it takes over the chunk array, so code the worker runs at
+ *   startup finds them, as it does in Chrome where importScripts loads a chunk
+ *   synchronously. Without the shim nothing would replay them, so they go after
+ *   the worker and register through the runtime's push.
  * - A module worker keeps `type: "module"` and nothing is hoisted: static imports
  *   work in module background scripts, and a module worker can't call
  *   importScripts at all.
@@ -360,7 +396,8 @@ export function wireBackground(dir: string, manifest: Manifest, shimFile?: strin
     if (hoist.dynamic) chunks = collectWebpackChunks(dir, sw, new Set(hoisted));
   }
   const scripts: string[] = [];
-  for (const s of [...(shimFile ? [shimFile] : []), ...hoisted, sw, ...chunks]) {
+  const order = shimFile ? [shimFile, ...hoisted, ...chunks, sw] : [...hoisted, sw, ...chunks];
+  for (const s of order) {
     if (!scripts.includes(s)) scripts.push(s);
   }
   manifest.background = isModule ? { scripts, type: "module" } : { scripts };
@@ -719,9 +756,8 @@ const CHUNK_SUFFIX_RE = /^(?:\s|;|\/\/[#@][^\n]*(?:\n|$)|\/\*[#@][\s\S]*?\*\/)*$
  * webpack's runtime/startup callback, which the wrapped push EXECUTES, so loading
  * such a file would boot a foreign entry point inside the background. Registration
  * pushes only define modules; nothing runs until the worker require()s them.
- * They load after the worker because older webpack worker runtimes only install
- * chunks pushed once the runtime is set up. Returns root-relative paths, sorted
- * for a deterministic manifest.
+ * They load ahead of the worker with the shim (see wireBackground), after it
+ * without. Returns root-relative paths, sorted for a deterministic manifest.
  */
 function collectWebpackChunks(dir: string, swPath: string, hoisted: Set<string>): string[] {
   let swSrc: string;
@@ -730,9 +766,7 @@ function collectWebpackChunks(dir: string, swPath: string, hoisted: Set<string>)
   } catch {
     return [];
   }
-  // The chunk-loading global, dot or bracket form: globalThis.webpackChunkfoo = ...
-  const gm = /(?:globalThis|self|window)\s*(?:\.\s*(webpackChunk[$\w]*)|\[\s*["'](webpackChunk[^"'\\]*)["']\s*\])\s*=(?!=)/.exec(swSrc);
-  const name = gm && (gm[1] || gm[2]);
+  const name = chunkLoadingGlobal(swSrc);
   if (!name) return [];
   const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const ref = `(?:globalThis|self|window)\\s*(?:\\.\\s*${esc}|\\[\\s*["']${esc}["']\\s*\\])`;
@@ -761,6 +795,32 @@ function collectWebpackChunks(dir: string, swPath: string, hoisted: Set<string>)
     chunks.push(rel);
   }
   return chunks.sort();
+}
+
+// The chunk-loading global a webpack bundle declares, dot or bracket form:
+// globalThis.webpackChunkfoo = ...
+function chunkLoadingGlobal(src: string): string {
+  const gm = /(?:globalThis|self|window)\s*(?:\.\s*(webpackChunk[$\w]*)|\[\s*["'](webpackChunk[^"'\\]*)["']\s*\])\s*=(?!=)/.exec(src);
+  return (gm && (gm[1] || gm[2])) || "";
+}
+
+/**
+ * The chunk-loading global of a classic worker that loads webpack chunks with
+ * importScripts, for the shim to replay the chunks listed ahead of it. Empty
+ * when there is none. Read before wireBackground neutralises the call.
+ */
+export function workerChunkGlobal(dir: string, manifest: Manifest): string {
+  const bg = manifest.background;
+  if (!bg || typeof bg !== "object" || Array.isArray(bg.scripts) || bg.type === "module") return "";
+  const sw = typeof bg.service_worker === "string" ? bg.service_worker.replace(/^(?:\.?\/)+/, "") : "";
+  if (!sw) return "";
+  let src: string;
+  try {
+    src = readFileSync(join(dir, sw), "utf-8");
+  } catch {
+    return "";
+  }
+  return /\bimportScripts\s*\(/.test(src) ? chunkLoadingGlobal(src) : "";
 }
 
 /**

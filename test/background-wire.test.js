@@ -92,8 +92,8 @@ const SW_WEBPACK =
   "var t=globalThis.webpackChunk=globalThis.webpackChunk||[],n=t.push.bind(t);" +
   "t.push=t=>{var[i,s,a]=t;for(var o in s)r.m[o]=s[o];for(a&&a(r);i.length;)e[i.pop()]=1;n(t)};";
 
-test("a webpack worker's async chunks are listed after the worker so its chunk loader registers them", (t) => {
-  const dir = stage(t, {
+test("a webpack worker's async chunks are listed ahead of it, for the shim to hand to its chunk loader", (t) => {
+  const files = {
     "sw.js": SW_WEBPACK,
     "123.abc.js": '"use strict";(globalThis.webpackChunk=globalThis.webpackChunk||[]).push([[123],{1(e,t,r){}}]);',
     "456.def.js": "/*! license */(globalThis.webpackChunk=globalThis.webpackChunk||[]).push([[456],{2(e,t,r){}}]);\n//# sourceMappingURL=456.def.js.map",
@@ -103,12 +103,19 @@ test("a webpack worker's async chunks are listed after the worker so its chunk l
     "ui.js": "(globalThis.webpackChunkui=globalThis.webpackChunkui||[]).push([[7],{4(e){}}]);",
     // real code ahead of the push makes it an entry script
     "boot.js": 'console.log("hi");(globalThis.webpackChunk=globalThis.webpackChunk||[]).push([[8],{5(e){}}]);',
-  });
+  };
+  const dir = stage(t, files);
   const manifest = { manifest_version: 3, background: { service_worker: "sw.js" } };
   const res = wireBackground(dir, manifest, SHIM_FILENAME);
-  assert.deepEqual(manifest.background.scripts, [SHIM_FILENAME, "sw.js", "123.abc.js", "456.def.js"]);
+  // Startup code can require a chunk a microtask after asking for it, as importScripts allows.
+  assert.deepEqual(manifest.background.scripts, [SHIM_FILENAME, "123.abc.js", "456.def.js", "sw.js"]);
   assert.deepEqual(res.hoisted, []);
   assert.ok(!callsImportScripts(read(dir, "sw.js")), "the dynamic call is neutralised as well");
+
+  // Without the shim nothing replays chunks queued before the runtime, so they go after it.
+  const bare = { manifest_version: 3, background: { service_worker: "sw.js" } };
+  wireBackground(stage(t, files), bare);
+  assert.deepEqual(bare.background.scripts, ["sw.js", "123.abc.js", "456.def.js"]);
 });
 
 test("existing background scripts get the shim prepended once", (t) => {

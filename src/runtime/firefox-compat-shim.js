@@ -9,13 +9,26 @@
 //   - chrome://favicon/ and /_favicon/ URLs, for fetch() and <img>;
 //   - chrome.debugger, spliced in for add-ons that use it (cdp-emulation.js);
 //   - ServiceWorkerGlobalScope in a background that was a service worker;
+//   - the service worker's messaging: navigator.serviceWorker in the
+//     extension's pages, and `clients`, `registration` and the `message` event
+//     in the background, over window.postMessage;
 //   - chrome://newtab URLs, which tabs.create and windows.create refuse;
 //   - the add-on's Chrome origin on requests to its own backends;
-//   - Chrome's enum objects that Firefox's declarativeNetRequest lacks.
+//   - Chrome's enum objects that Firefox's declarativeNetRequest, identity and
+//     storage lack;
+//   - declarativeNetRequest rules added at runtime that Firefox would refuse;
+//   - OFFSCREEN_DOCUMENT in runtime.getContexts, for the offscreen emulation;
+//   - storage.session.setAccessLevel, which code waits on;
+//   - window.chrome in content scripts;
+//   - storage.managed.get() without a policy, which Chrome answers as an empty area;
+//   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
+//     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
+//   - webpack chunks of a worker bundle, listed ahead of the worker.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
-// refuses, or to keep the shim's internal messages from the add-on's listeners.
+// refuses, an answer Chrome gives and Firefox doesn't, or to keep the shim's
+// internal messages from the add-on's listeners.
 //
 // The shim shares its script evaluation with the extension's own background
 // code, so nothing may throw out of it.
@@ -646,7 +659,6 @@
   function installOffscreen() {
     if (!CONFIG.offscreen || !isBackground || !hasDocument || typeof document.createElement !== "function") return;
     var frame = null;
-    var frameUrl = "";
     var keepAlive = null;
     var Reason = {};
     OFFSCREEN_REASONS.forEach(function (r) { Reason[r] = r; });
@@ -654,10 +666,22 @@
     function removeFrame() {
       var f = frame;
       frame = null;
-      frameUrl = "";
       if (keepAlive !== null) { clearInterval(keepAlive); keepAlive = null; }
       try { if (f && f.parentNode) f.parentNode.removeChild(f); } catch (e) {}
+      recordOffscreen(null);
     }
+
+    // For runtime.getContexts in the add-on's other pages. A new event page has
+    // no frame, whatever the last one had.
+    function recordOffscreen(url) {
+      try {
+        var o = {};
+        o[OFFSCREEN_STATE_KEY] = url;
+        var r = url ? api.storage.session.set(o) : api.storage.session.remove(OFFSCREEN_STATE_KEY);
+        if (r && typeof r.catch === "function") r.catch(noop);
+      } catch (e) {}
+    }
+    recordOffscreen(null);
 
     function create(params) {
       return new Promise(function (resolve) {
@@ -682,7 +706,7 @@
         f.src = abs;
         (document.body || document.documentElement).appendChild(f);
         frame = f;
-        frameUrl = abs;
+        recordOffscreen(abs);
         // Chrome keeps an offscreen document until it is closed, but Firefox
         // suspends an idle event page after 30 s, iframe included (cutting off
         // audio it is playing, say). An extension API call from the background
@@ -707,36 +731,6 @@
         },
         hasDocument: function (cb) { return respond(ns, Promise.resolve(!!frame), cb); },
       });
-    });
-
-    // A service worker finds its offscreen document with clients.matchAll(). An
-    // event page has no `clients`, so this one knows about the iframe.
-    function offscreenClient() {
-      if (!frame) return null;
-      var f = frame;
-      return {
-        id: "offscreen-document", type: "window", frameType: "nested", url: frameUrl,
-        focused: false, visibilityState: "hidden",
-        postMessage: function (data) {
-          // A document reads its service worker's messages from
-          // navigator.serviceWorker.
-          try {
-            var w = f.contentWindow;
-            w.navigator.serviceWorker.dispatchEvent(new w.MessageEvent("message", { data: data }));
-          } catch (e) {}
-        },
-      };
-    }
-    defineMissing(G, "clients", {
-      matchAll: function () {
-        var c = offscreenClient();
-        return Promise.resolve(c ? [c] : []);
-      },
-      get: function (id) {
-        var c = offscreenClient();
-        return Promise.resolve(c && c.id === id ? c : undefined);
-      },
-      claim: function () { return Promise.resolve(); },
     });
   }
 
@@ -1085,6 +1079,373 @@
     defineMissing(G, "skipWaiting", function () { return Promise.resolve(); });
   }
 
+  // ── Service worker messaging ────────────────────────────────────────────────
+  // A Chrome extension's pages reach its service worker through
+  // navigator.serviceWorker (ready, controller, getRegistration), and the worker
+  // reaches its pages through `clients` and the `message` event on its global.
+  // Firefox runs no service worker for an add-on: its pages have no
+  // navigator.serviceWorker, and the converted background is an event page with
+  // no `clients`. Both ends are emulated on window.postMessage between the
+  // add-on's pages and the event page, which share a process in Firefox:
+  //   - postMessage to the worker wakes the event page when it is suspended and
+  //     fires `message` on its global, the ports transferred and a WindowClient
+  //     for the page as the source;
+  //   - Client.postMessage fires `message` on the page's navigator.serviceWorker,
+  //     queued until the page starts its messages, as in Chrome.
+  // The event page can't answer the pages' requests the way a worker's fetch
+  // handler does, so no page is controlled: `controller` is null and `ready`
+  // gives the worker, as for a page Chrome loaded without its worker. Code that
+  // reads `controller` as "my requests went through the worker" then asks the
+  // worker instead. For the same reason clients.matchAll() lists every page of
+  // the add-on whatever includeUncontrolled says.
+  var SW_ENVELOPE = "__lavaductServiceWorkerMessage";
+
+  function swScriptUrl() {
+    return extensionUrl(CONFIG.serviceWorkerScript || "");
+  }
+
+  // postMessage(message, transfer) and postMessage(message, { transfer }).
+  function transferList(arg) {
+    if (Array.isArray(arg)) return arg;
+    if (arg && typeof arg === "object" && Array.isArray(arg.transfer)) return arg.transfer;
+    return [];
+  }
+
+  function envelope(direction, message) {
+    var e = {};
+    e[SW_ENVELOPE] = direction;
+    e.message = message;
+    return e;
+  }
+
+  function unwrapEnvelope(e, direction) {
+    var d = null;
+    try { d = e.origin === ORIGIN ? e.data : null; } catch (x) {}
+    return d && typeof d === "object" && d[SW_ENVELOPE] === direction ? d : null;
+  }
+
+  // onfoo properties that add and remove one listener, like an EventTarget's own.
+  function handlerProps(target, types, onSet) {
+    types.forEach(function (type) {
+      var current = null;
+      function call(e) { return current && current.call(target, e); }
+      Object.defineProperty(target, "on" + type, {
+        configurable: true, enumerable: true,
+        get: function () { return current; },
+        set: function (fn) {
+          target.removeEventListener(type, call);
+          current = typeof fn === "function" ? fn : null;
+          if (!current) return;
+          target.addEventListener(type, call);
+          if (onSet) onSet(type);
+        },
+      });
+    });
+  }
+
+  // The worker and its registration, as Chrome gives them to the worker
+  // (self.serviceWorker, self.registration) and to its pages (registration.active).
+  function makeServiceWorker(post) {
+    var worker = new EventTarget();
+    handlerProps(worker, ["statechange", "error"]);
+    Object.defineProperties(worker, {
+      scriptURL: { value: swScriptUrl(), enumerable: true },
+      state: { value: "activated", enumerable: true },
+      postMessage: { value: post, writable: true, configurable: true },
+    });
+    return worker;
+  }
+
+  function makeRegistration(worker) {
+    var reg = new EventTarget();
+    handlerProps(reg, ["updatefound"]);
+    Object.defineProperties(reg, {
+      scope: { value: ORIGIN + "/", enumerable: true },
+      installing: { value: null, enumerable: true },
+      waiting: { value: null, enumerable: true },
+      active: { value: worker, enumerable: true },
+      updateViaCache: { value: "imports", enumerable: true },
+      update: { value: function () { return Promise.resolve(reg); }, writable: true, configurable: true },
+      unregister: { value: function () { return Promise.resolve(false); }, writable: true, configurable: true },
+    });
+    return reg;
+  }
+
+  // ExtendableEvent.waitUntil: Chrome keeps the worker alive until the promise
+  // settles. Firefox suspends an event page that has made no extension API call
+  // for 30 s, so one is made every 20 s meanwhile.
+  function keepAliveUntil(promise) {
+    var timer = setInterval(function () {
+      try {
+        var r = api.runtime.getPlatformInfo();
+        if (r && typeof r.catch === "function") r.catch(noop);
+      } catch (e) {}
+    }, 20000);
+    function stop() { clearInterval(timer); }
+    Promise.resolve(promise).then(stop, stop);
+  }
+
+  function installServiceWorkerContainer() {
+    if (!CONFIG.serviceWorkerClients || !isExtensionPage || isBackground || !hasDocument) return;
+    try { if (typeof navigator === "undefined" || "serviceWorker" in navigator) return; } catch (e) { return; }
+    if (typeof EventTarget !== "function" || typeof MessageEvent !== "function") return;
+
+    // To the event page, in order. A suspended one is woken first; the message is
+    // copied at the call, as postMessage does, so what it transfers is detached.
+    var waking = null;
+    function postToWorker(message, transfer) {
+      var options = { targetOrigin: ORIGIN, transfer: transferList(transfer) };
+      var bg = null;
+      if (!waking) { try { bg = api.extension.getBackgroundPage(); } catch (e) {} }
+      if (bg) {
+        bg.postMessage(envelope("toWorker", message), options);
+        return;
+      }
+      var copy = structuredClone({ m: message, t: options.transfer }, { transfer: options.transfer });
+      var p = (waking || Promise.resolve()).then(function () {
+        return api.runtime.getBackgroundPage();
+      }).then(function (w) {
+        if (w) w.postMessage(envelope("toWorker", copy.m), { targetOrigin: ORIGIN, transfer: copy.t });
+      }).catch(function (e) {
+        dbg("message to the service worker lost:", errorMessage(e));
+      });
+      waking = p;
+      p.then(function () { if (waking === p) waking = null; });
+    }
+
+    var worker = makeServiceWorker(function postMessage(message, transfer) { postToWorker(message, transfer); });
+    var registration = makeRegistration(worker);
+    var container = new EventTarget();
+    var queued = [];
+    function startMessages() {
+      var q = queued;
+      queued = null;
+      if (q) q.forEach(function (e) { container.dispatchEvent(e); });
+    }
+    handlerProps(container, ["message", "messageerror", "controllerchange"], function (type) {
+      if (type === "message") startMessages();
+    });
+    function inScope(url) {
+      return url === undefined || String(url).indexOf(ORIGIN + "/") === 0 || !/^[a-z][a-z0-9+.-]*:/i.test(String(url));
+    }
+    Object.defineProperties(container, {
+      controller: { value: null, enumerable: true },
+      ready: { value: Promise.resolve(registration), enumerable: true },
+      getRegistration: { value: function (url) { return Promise.resolve(inScope(url) ? registration : undefined); }, writable: true, configurable: true },
+      getRegistrations: { value: function () { return Promise.resolve([registration]); }, writable: true, configurable: true },
+      // The add-on's worker is registered already; anything else can't be.
+      register: {
+        value: function (url) {
+          var href = "";
+          try { href = new URL(String(url), loc.href).href.split(/[?#]/)[0]; } catch (e) {}
+          if (href && href === swScriptUrl()) return Promise.resolve(registration);
+          return Promise.reject(new TypeError("Firefox runs no service worker for an add-on's page: " + String(url)));
+        },
+        writable: true, configurable: true,
+      },
+      startMessages: { value: startMessages, writable: true, configurable: true },
+    });
+    // A document's messages start on their own once it has been parsed.
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", startMessages);
+    else startMessages();
+
+    window.addEventListener("message", function (e) {
+      var d = unwrapEnvelope(e, "fromWorker");
+      if (!d) return;
+      e.stopImmediatePropagation();
+      var evt = new MessageEvent("message", { data: d.message, origin: ORIGIN, ports: Array.prototype.slice.call(e.ports || []) });
+      try { Object.defineProperty(evt, "source", { value: worker, enumerable: true, configurable: true }); } catch (x) {}
+      if (queued) queued.push(evt);
+      else container.dispatchEvent(evt);
+    }, true);
+
+    try {
+      Object.defineProperty(navigator, "serviceWorker", { value: container, enumerable: true, configurable: true });
+    } catch (e) {}
+  }
+
+  function installServiceWorkerClients() {
+    if (!CONFIG.serviceWorkerClients || !isBackground || typeof WeakMap !== "function") return;
+    var known = new WeakMap();
+
+    function windowClient(win) {
+      var client = known.get(win);
+      if (client) return client;
+      var id = "";
+      try { id = crypto.randomUUID(); } catch (e) { id = String(Math.random()).slice(2); }
+      client = {
+        id: id,
+        type: "window",
+        postMessage: function (message, transfer) {
+          var closed = true;
+          try { closed = win.closed; } catch (e) {}
+          if (!closed) win.postMessage(envelope("fromWorker", message), { targetOrigin: ORIGIN, transfer: transferList(transfer) });
+        },
+        // Brings the page's tab and window to the front.
+        focus: function () {
+          var tabs = null;
+          try { tabs = win.browser.tabs; } catch (e) {}
+          return Promise.resolve(tabs && tabs.getCurrent()).then(function (tab) {
+            if (!tab) { win.focus(); return client; }
+            return Promise.all([
+              api.tabs.update(tab.id, { active: true }),
+              api.windows && api.windows.update(tab.windowId, { focused: true }),
+            ]).then(function () { return client; });
+          });
+        },
+        navigate: function (url) {
+          try { win.location.href = extensionUrl(url); } catch (e) { return Promise.reject(new TypeError(errorMessage(e))); }
+          return Promise.resolve(client);
+        },
+      };
+      // A frame of the event page (the offscreen document) is never on screen,
+      // though its document says it is visible like the event page's own.
+      function shown() { try { return win.top !== G; } catch (e) { return false; } }
+      Object.defineProperties(client, {
+        url: { enumerable: true, get: function () { try { return win.location.href; } catch (e) { return ""; } } },
+        frameType: { enumerable: true, get: function () { try { return win.top === win ? "top-level" : "nested"; } catch (e) { return "none"; } } },
+        focused: { enumerable: true, get: function () { try { return shown() && win.document.hasFocus(); } catch (e) { return false; } } },
+        visibilityState: { enumerable: true, get: function () { try { return shown() ? win.document.visibilityState : "hidden"; } catch (e) { return "hidden"; } } },
+      });
+      known.set(win, client);
+      return client;
+    }
+
+    // Every page of the add-on in this process, frames included (the offscreen
+    // emulation's iframe among them), but not the event page itself.
+    function windowClients() {
+      var views = [];
+      try { views = api.extension.getViews() || []; } catch (e) {}
+      var out = [];
+      for (var i = 0; i < views.length; i++) if (views[i] !== G) out.push(windowClient(views[i]));
+      return out;
+    }
+
+    function findClient(id) {
+      var list = windowClients();
+      for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+      return undefined;
+    }
+
+    // Resolves with the new page's client once it has loaded, null for a page
+    // that isn't the add-on's, as Chrome does.
+    function openWindow(url) {
+      var href = extensionUrl(url);
+      return Promise.resolve(api.tabs.create({ url: href })).then(function (tab) {
+        if (href.indexOf(ORIGIN + "/") !== 0 || !tab) return null;
+        return new Promise(function (resolve) {
+          var tries = 0;
+          (function poll() {
+            var views = [];
+            try { views = api.extension.getViews({ tabId: tab.id }) || []; } catch (e) {}
+            var w = views[0];
+            var ready = false;
+            try { ready = !!w && w.document.readyState === "complete"; } catch (e) {}
+            if (ready) resolve(windowClient(w));
+            else if (++tries > 200) resolve(null);
+            else setTimeout(poll, 50);
+          })();
+        });
+      });
+    }
+
+    defineMissing(G, "clients", {
+      matchAll: function (options) {
+        var type = (options && options.type) || "window";
+        return Promise.resolve(type === "window" || type === "all" ? windowClients() : []);
+      },
+      get: function (id) { return Promise.resolve(findClient(id)); },
+      openWindow: openWindow,
+      claim: function () { return Promise.resolve(); },
+    });
+
+    // The pages' messages to the worker, as the worker gets them: the message
+    // itself, the page as a WindowClient, and waitUntil. Chrome runs a worker's
+    // script before it gets any event; a page that finds the event page still
+    // loading its scripts has its messages held until they have all run.
+    var held = hasDocument && document.readyState === "loading" ? [] : null;
+    if (held) {
+      document.addEventListener("DOMContentLoaded", function () {
+        var q = held;
+        held = null;
+        q.forEach(function (e) { G.dispatchEvent(e); });
+      });
+    }
+    G.addEventListener("message", function (e) {
+      var d = unwrapEnvelope(e, "toWorker");
+      if (!d) return;
+      var source = null;
+      try { if (e.source) source = windowClient(e.source); } catch (x) {}
+      var evt = e;
+      if (held) {
+        e.stopImmediatePropagation();
+        evt = new MessageEvent("message", { data: null, origin: ORIGIN, ports: Array.prototype.slice.call(e.ports || []) });
+        held.push(evt);
+      }
+      try {
+        Object.defineProperty(evt, "data", { value: d.message, enumerable: true, configurable: true });
+        Object.defineProperty(evt, "source", { value: source, enumerable: true, configurable: true });
+        Object.defineProperty(evt, "waitUntil", { value: keepAliveUntil, writable: true, configurable: true });
+      } catch (x) {}
+    }, true);
+  }
+
+  // ── self.registration / self.serviceWorker ──────────────────────────────────
+  // A worker reads its own registration and state:
+  //   self.registration.addEventListener("updatefound", …)
+  //   if (self.serviceWorker?.state === "activated") queue.activate();
+  // An event page has neither, so the first throws and the second never runs.
+  // The background stands in for a worker that is already active: the state a
+  // Chrome worker restarted after its install is in. No update ever arrives, so
+  // the registration's events never fire. Its postMessage reaches the worker
+  // itself, with the worker as the source, as in Chrome. Only emitted for a
+  // bundle that reads them.
+  function installServiceWorkerRegistration() {
+    if (!CONFIG.serviceWorkerRegistration || !isBackground || typeof EventTarget !== "function") return;
+    var worker = makeServiceWorker(function postMessage(message, transfer) {
+      var list = transferList(transfer);
+      var copy = structuredClone({ m: message, t: list }, { transfer: list });
+      setTimeout(function () {
+        var ports = copy.t.filter(function (x) { return typeof MessagePort === "function" && x instanceof MessagePort; });
+        var evt = new MessageEvent("message", { data: copy.m, origin: ORIGIN, ports: ports });
+        try {
+          Object.defineProperty(evt, "source", { value: worker, enumerable: true, configurable: true });
+          Object.defineProperty(evt, "waitUntil", { value: keepAliveUntil, writable: true, configurable: true });
+        } catch (e) {}
+        G.dispatchEvent(evt);
+      }, 0);
+    });
+    defineMissing(G, "serviceWorker", worker);
+    defineMissing(G, "registration", makeRegistration(worker));
+  }
+
+  // ── The worker's location in Web Lock names ────────────────────────────────
+  // In Chrome the background's `location` is its script's (/sw.js); the event
+  // page's is /_generated_background_page.html. A worker that holds a lock named
+  // after its own location for as long as it runs:
+  //   navigator.locks.request(location.pathname, () => new Promise(() => {}))
+  // lets its pages tell when it has stopped, by waiting on that lock under the
+  // script's path. The event page would hold it under the generated page's name,
+  // which no page waits on, so the pages' requests would go to a background that
+  // Firefox has suspended. A lock named after the event page is taken under the
+  // script's name instead, path or full URL alike.
+  function installServiceWorkerLocks() {
+    if (!CONFIG.serviceWorkerLocks || !isBackground || !CONFIG.serviceWorkerScript) return;
+    var locks = null;
+    try { locks = navigator.locks; } catch (e) {}
+    if (!locks || typeof locks.request !== "function") return;
+    var native = locks.request;
+    var script = "/" + stripSlashes(CONFIG.serviceWorkerScript);
+    var names = {};
+    names[loc.pathname] = script;
+    names[ORIGIN + loc.pathname] = ORIGIN + script;
+    replaceMember(locks, "request", function (name) {
+      var args = Array.prototype.slice.call(arguments);
+      if (typeof name === "string" && Object.prototype.hasOwnProperty.call(names, name)) args[0] = names[name];
+      return native.apply(locks, args);
+    });
+  }
+
   // ── chrome://newtab ─────────────────────────────────────────────────────────
   // tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox
   // ("Illegal URL"). A bundle that opens Chrome's new tab page gets Firefox's,
@@ -1148,6 +1509,128 @@
     });
   }
 
+  // ── declarativeNetRequest rules added at runtime ───────────────────────────
+  // The converter adapts the static rulesets; rules the code adds get the same
+  // treatment here. Firefox refuses the whole updateDynamicRules or
+  // updateSessionRules call over one rule it can't take, so the rules it can't
+  // evaluate the way Chrome does are left out and the rest still apply: rules on
+  // response headers or top domains, a regexFilter only RE2 compiles, and a
+  // redirect to a data: URL. Chrome's old domains/excludedDomains names are
+  // renamed, IPv6 addresses in domain lists get the brackets Firefox wants, and
+  // the webbundle/webtransport request types, which Firefox never makes, are
+  // taken out of a rule's types.
+  var DNR_MISSING_CONDITIONS = ["responseHeaders", "excludedResponseHeaders", "topDomains", "excludedTopDomains"];
+  var DNR_RENAMED_CONDITIONS = [["domains", "initiatorDomains"], ["excludedDomains", "excludedInitiatorDomains"]];
+  var DNR_DOMAIN_CONDITIONS = ["requestDomains", "excludedRequestDomains", "initiatorDomains", "excludedInitiatorDomains"];
+  var DNR_MISSING_TYPES = { webbundle: true, webtransport: true };
+
+  function firefoxDomain(d) {
+    if (typeof d !== "string" || d.indexOf(":") < 0 || d.charAt(0) === "[") return d;
+    try { return new URL("http://[" + d + "]/").hostname; } catch (e) { return d; }
+  }
+
+  // The rule as Firefox takes it, or null when it can't.
+  function firefoxRule(rule) {
+    if (!rule || typeof rule !== "object") return rule;
+    var out = rule;
+    var c = rule.condition;
+    if (c && typeof c === "object") {
+      for (var i = 0; i < DNR_MISSING_CONDITIONS.length; i++) if (DNR_MISSING_CONDITIONS[i] in c) return null;
+      var cond = {};
+      var keys = Object.keys(c);
+      for (var k = 0; k < keys.length; k++) {
+        var key = keys[k];
+        var value = c[key];
+        DNR_RENAMED_CONDITIONS.forEach(function (pair) { if (key === pair[0] && !(pair[1] in c)) key = pair[1]; });
+        if ((key === "resourceTypes" || key === "excludedResourceTypes") && Array.isArray(value)) {
+          var left = value.filter(function (t) { return DNR_MISSING_TYPES[t] !== true; });
+          // Emptied, the list would match every type, while the rule only ever
+          // targeted requests Firefox doesn't make.
+          if (key === "resourceTypes" && value.length && !left.length) return null;
+          value = left;
+        }
+        if (DNR_DOMAIN_CONDITIONS.indexOf(key) >= 0 && Array.isArray(value)) value = value.map(firefoxDomain);
+        cond[key] = value;
+      }
+      if (typeof cond.regexFilter === "string") {
+        try { new RegExp(cond.regexFilter, cond.isUrlFilterCaseSensitive === true ? "" : "i"); } catch (e) { return null; }
+      }
+      out = Object.assign({}, rule, { condition: cond });
+    }
+    var redirect = out.action && out.action.redirect;
+    if (redirect && typeof redirect.url === "string" && /^data:/i.test(redirect.url)) return null;
+    return out;
+  }
+
+  function installRuleFilter() {
+    namespaces.forEach(function (ns) {
+      var dnr = null;
+      try { dnr = ns.declarativeNetRequest; } catch (e) {}
+      if (!dnr || typeof dnr !== "object") return;
+      ["updateDynamicRules", "updateSessionRules"].forEach(function (name) {
+        var native = dnr[name];
+        if (typeof native !== "function") return;
+        replaceMember(dnr, name, function (options) {
+          var args = Array.prototype.slice.call(arguments);
+          if (options && typeof options === "object" && Array.isArray(options.addRules)) {
+            var rules = [];
+            options.addRules.forEach(function (r) {
+              var adapted = firefoxRule(r);
+              if (adapted) rules.push(adapted);
+              else dbg("declarativeNetRequest." + name + ": left out a rule Firefox can't take:", r && r.id);
+            });
+            args[0] = Object.assign({}, options, { addRules: rules });
+          }
+          return native.apply(dnr, args);
+        });
+      });
+    });
+  }
+
+  // ── runtime.getContexts ─────────────────────────────────────────────────────
+  // Firefox's ContextType has no OFFSCREEN_DOCUMENT and refuses a filter naming
+  // it. Code asks for that type to learn whether its offscreen document exists,
+  // which the offscreen emulation records in storage.session.
+  var OFFSCREEN_STATE_KEY = "__lavaductOffscreenDocument";
+
+  function installGetContexts() {
+    if (!CONFIG.offscreen) return;
+    var nativeRuntime = api.runtime;
+    var native = nativeRuntime && nativeRuntime.getContexts;
+    if (typeof native !== "function") return;
+    namespaces.forEach(function (ns) {
+      var rt = null;
+      try { rt = ns.runtime; } catch (e) {}
+      if (!rt || typeof rt.getContexts !== "function") return;
+      replaceMember(rt, "getContexts", function (filter, cb) {
+        var types = filter && Array.isArray(filter.contextTypes) ? filter.contextTypes : null;
+        var wantsOffscreen = !types || types.indexOf("OFFSCREEN_DOCUMENT") >= 0;
+        var rest = types ? types.filter(function (t) { return t !== "OFFSCREEN_DOCUMENT"; }) : null;
+        var nativeFilter = types ? Object.assign({}, filter, { contextTypes: rest }) : filter || {};
+        var found = types && !rest.length ? Promise.resolve([]) : native.call(nativeRuntime, nativeFilter);
+        var offscreen = !wantsOffscreen ? Promise.resolve(null) : api.storage.session.get(OFFSCREEN_STATE_KEY).then(function (got) {
+          return (got && got[OFFSCREEN_STATE_KEY]) || null;
+        }, function () { return null; });
+        var p = Promise.all([found, offscreen]).then(function (r) {
+          var list = r[0] || [];
+          var url = r[1];
+          if (!url) return list;
+          var ctx = {
+            contextType: "OFFSCREEN_DOCUMENT", contextId: "offscreen-document", tabId: -1, windowId: -1,
+            frameId: -1, documentId: "offscreen-document", documentUrl: url, documentOrigin: ORIGIN, incognito: false,
+          };
+          var matches = !filter || Object.keys(filter).every(function (key) {
+            if (key === "contextTypes") return true;
+            var want = filter[key];
+            return !Array.isArray(want) || want.indexOf(ctx[key.replace(/s$/, "")]) >= 0;
+          });
+          return matches ? list.concat([ctx]) : list;
+        });
+        return respond(ns, p, cb);
+      });
+    });
+  }
+
   // ── Chrome's enum objects ───────────────────────────────────────────────────
   // Chrome gives each enum type in its API an object of the values, keyed in
   // upper snake case, and extensions build their arguments from it:
@@ -1167,6 +1650,12 @@
       RequestMethod: ["connect", "delete", "get", "head", "options", "patch", "post", "put", "other"],
       RuleActionType: ["block", "redirect", "allow", "upgradeScheme", "modifyHeaders", "allowAllRequests"],
       UnsupportedRegexReason: ["syntaxError", "memoryLimitExceeded"],
+    },
+    identity: {
+      AccountStatus: ["SYNC", "ANY"],
+    },
+    storage: {
+      AccessLevel: ["TRUSTED_AND_UNTRUSTED_CONTEXTS", "TRUSTED_CONTEXTS"],
     },
   };
 
@@ -1198,13 +1687,230 @@
     });
   }
 
+  // ── storage.session.setAccessLevel ──────────────────────────────────────────
+  // Firefox's session area has no setAccessLevel and is never open to content
+  // scripts. Code waiting on the call's callback would wait forever, so the call
+  // settles here. Content scripts still get no storage.session, which Chrome code
+  // has to handle anyway where the access level was never raised.
+  var ACCESS_LEVELS = ["TRUSTED_AND_UNTRUSTED_CONTEXTS", "TRUSTED_CONTEXTS"];
+
+  function installSessionAccessLevel() {
+    namespaces.forEach(function (ns) {
+      var session = null;
+      try { session = ns.storage && ns.storage.session; } catch (e) {}
+      if (!session) return;
+      defineMissing(session, "setAccessLevel", function (details, cb) {
+        var level = details && details.accessLevel;
+        var p = ACCESS_LEVELS.indexOf(level) >= 0 ? Promise.resolve() : Promise.reject(new Error("Invalid access level: " + level));
+        return respond(ns, p, cb);
+      });
+    });
+  }
+
+  // ── window.chrome in content scripts ────────────────────────────────────────
+  // A Firefox content script's globals live in a sandbox whose `window` is an
+  // Xray to the page's window, so `chrome` resolves and `window.chrome` doesn't.
+  // A property set on the Xray is seen by this add-on's content scripts only,
+  // never by the page.
+  function installWindowChrome() {
+    if (isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    var ns = api;
+    try { if (typeof chrome === "object" && chrome) ns = chrome; } catch (e) {}
+    defineMissing(window, "chrome", ns);
+  }
+
+  // ── webpack chunks of a worker bundle ──────────────────────────────────────
+  // A webpack service worker loads an async chunk with importScripts, which runs
+  // it synchronously, so startup code can require the chunk a microtask later.
+  // The converter lists the chunks ahead of the worker instead, and each queues
+  // its registration in the chunk array before webpack's runtime exists. That
+  // runtime only installs chunks pushed after it takes over the array's push,
+  // so the queued ones are handed to its push the moment it does.
+  function installWorkerChunks() {
+    var name = CONFIG.webpackChunkGlobal;
+    if (!isBackground || typeof name !== "string" || !name) return;
+    var queue = G[name];
+    if (queue === undefined) G[name] = queue = [];
+    if (!Array.isArray(queue)) return;
+    var push = queue.push;
+    Object.defineProperty(queue, "push", {
+      configurable: true,
+      get: function () { return push; },
+      set: function (fn) {
+        push = fn;
+        if (typeof fn !== "function") return;
+        queue.splice(0, queue.length).forEach(function (entry) { invoke(fn, [entry]); });
+      },
+    });
+  }
+
+  // ── USER_SCRIPT world ──────────────────────────────────────────────────────
+  // With messaging on, Chrome's USER_SCRIPT world gets chrome.runtime with id
+  // (a template property on every runtime object), lastError, sendMessage,
+  // connect, onMessage and onConnect. Firefox gives it sendMessage and connect
+  // only, so a script reading chrome.runtime.id gets undefined and one adding an
+  // onMessage listener throws. Every USER_SCRIPT registration gets a first code
+  // entry that fills in id and inert onMessage/onConnect events (Firefox never
+  // delivers tabs.sendMessage to that world). It runs in the same world ahead of
+  // the scripts, and changes nothing where messaging is off (no chrome.runtime).
+  function userScriptWorldPrelude() {
+    var id = JSON.stringify(String(api.runtime.id));
+    return "(function(){try{var c=typeof chrome==='object'&&chrome||typeof browser==='object'&&browser;var r=c&&c.runtime;if(!r)return;" +
+      "if(r.id==null)Object.defineProperty(r,'id',{value:" + id + ",enumerable:true,configurable:true});" +
+      "var ev=function(){var l=[];return{addListener:function(f){if(l.indexOf(f)<0)l.push(f)},removeListener:function(f){var i=l.indexOf(f);if(i>=0)l.splice(i,1)},hasListener:function(f){return l.indexOf(f)>=0},hasListeners:function(){return l.length>0}}};" +
+      "if(r.onMessage==null)r.onMessage=ev();if(r.onConnect==null)r.onConnect=ev();if(!('lastError' in r))r.lastError=undefined;}catch(e){}})();";
+  }
+
+  function withPrelude(script) {
+    if (!script || typeof script !== "object" || script.world === "MAIN" || !Array.isArray(script.js)) return script;
+    var copy = {};
+    for (var k in script) copy[k] = script[k];
+    copy.js = [{ code: userScriptWorldPrelude() }].concat(script.js);
+    return copy;
+  }
+
+  var wrappedUserScripts = typeof WeakSet === "function" ? new WeakSet() : null;
+  function wrapUserScripts(ns) {
+    var us;
+    try { us = ns.userScripts; } catch (e) { return; }
+    if (!us || !wrappedUserScripts || wrappedUserScripts.has(us)) return;
+    wrappedUserScripts.add(us);
+    ["register", "update"].forEach(function (name) {
+      var orig = us[name];
+      if (typeof orig !== "function") return;
+      replaceMember(us, name, function (scripts) {
+        var args = Array.prototype.slice.call(arguments);
+        if (Array.isArray(scripts)) args[0] = scripts.map(withPrelude);
+        return orig.apply(us, args);
+      });
+    });
+    var exec = us.execute;
+    if (typeof exec === "function") {
+      replaceMember(us, "execute", function (injection) {
+        var args = Array.prototype.slice.call(arguments);
+        args[0] = withPrelude(injection);
+        return exec.apply(us, args);
+      });
+    }
+    // getScripts reports what was registered, without the prelude.
+    var get = us.getScripts;
+    if (typeof get === "function") {
+      replaceMember(us, "getScripts", function () {
+        var p = get.apply(us, arguments);
+        var strip = function (list) {
+          return Array.isArray(list) ? list.map(function (s) {
+            if (s && Array.isArray(s.js) && s.js.length && s.js[0] && s.js[0].code === userScriptWorldPrelude()) {
+              var c = {}; for (var k in s) c[k] = s[k]; c.js = s.js.slice(1); return c;
+            }
+            return s;
+          }) : list;
+        };
+        return p && typeof p.then === "function" ? p.then(strip) : p;
+      });
+    }
+  }
+
+  // ── runtime.onUserScriptMessage / onUserScriptConnect ──────────────────────
+  // Chrome grants "userScripts" at install, so these events are there from the
+  // background's first line; the user only switches chrome.userScripts on.
+  // Firefox grants the permission only at runtime (about:addons, or
+  // permissions.request) and defines the events then, so a background that adds
+  // its listeners at startup misses them for the whole session, and its user
+  // scripts can't message it. Until the grant, stand-ins keep the listeners, and
+  // they move onto Firefox's events when it defines them. Only emitted for an
+  // add-on whose Chrome manifest requires the permission.
+  var USER_SCRIPT_EVENTS = ["onUserScriptMessage", "onUserScriptConnect"];
+
+  function installUserScriptEvents() {
+    if (!CONFIG.userScriptEvents || !isExtensionPage || !api.permissions || !api.runtime) return;
+    namespaces.forEach(wrapUserScripts);
+    var pending = [];
+    namespaces.forEach(function (ns) {
+      USER_SCRIPT_EVENTS.forEach(function (name) {
+        var rt = ns.runtime;
+        try { if (!rt || rt[name] != null) return; } catch (e) { return; }
+        var listeners = [];
+        var standIn = {
+          addListener: function (fn) { if (listeners.indexOf(fn) < 0) listeners.push(fn); },
+          removeListener: function (fn) { var i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); },
+          hasListener: function (fn) { return listeners.indexOf(fn) >= 0; },
+          hasListeners: function () { return listeners.length > 0; },
+        };
+        if (defineMissing(rt, name, standIn)) pending.push({ rt: rt, name: name, standIn: standIn, listeners: listeners });
+      });
+    });
+
+    // Firefox replaces the stand-in with its own event when it grants the
+    // permission, before permissions.onAdded fires.
+    function adopt() {
+      pending = pending.filter(function (p) {
+        var real;
+        try { real = p.rt[p.name]; } catch (e) { return true; }
+        if (!real || real === p.standIn || typeof real.addListener !== "function") return true;
+        p.listeners.forEach(function (fn) { try { real.addListener(fn); } catch (e) {} });
+        dbg("userScripts: moved", p.listeners.length, "listener(s) onto runtime." + p.name);
+        return false;
+      });
+      return pending.length === 0;
+    }
+    try {
+      api.permissions.onAdded.addListener(function onAdded(perms) {
+        if (!perms || !Array.isArray(perms.permissions) || perms.permissions.indexOf("userScripts") < 0) return;
+        namespaces.forEach(wrapUserScripts);
+        if (!adopt()) setTimeout(function () { namespaces.forEach(wrapUserScripts); adopt(); }, 0);
+      });
+    } catch (e) {}
+  }
+
+  // ── storage.managed without a policy ───────────────────────────────────────
+  // With no enterprise policy for the add-on, Chrome answers storage.managed.get()
+  // as an empty area does: {}, or the defaults it was given. Firefox rejects it
+  // ("Managed storage manifest not found"), and code reading an optional managed
+  // setting then takes its error path, or retries.
+  function installManagedStorage() {
+    var nativeManaged = null;
+    try { nativeManaged = api.storage && api.storage.managed; } catch (e) {}
+    if (!nativeManaged || typeof nativeManaged.get !== "function") return;
+    var nativeGet = nativeManaged.get;
+    namespaces.forEach(function (ns) {
+      var managed = null;
+      try { managed = ns.storage && ns.storage.managed; } catch (e) {}
+      if (!managed || typeof managed.get !== "function") return;
+      replaceMember(managed, "get", function (keys, cb) {
+        if (typeof keys === "function") { cb = keys; keys = undefined; }
+        var p = Promise.resolve()
+          .then(function () { return keys == null ? nativeGet.call(nativeManaged) : nativeGet.call(nativeManaged, keys); })
+          .catch(function (e) {
+            if (!/managed storage manifest not found/i.test(errorMessage(e))) throw e;
+            var defaults = {};
+            if (keys && typeof keys === "object" && !Array.isArray(keys)) {
+              Object.keys(keys).forEach(function (k) { defaults[k] = keys[k]; });
+            }
+            return defaults;
+          });
+        return respond(ns, p, cb);
+      });
+    });
+  }
+
   try { installSidePanel(); } catch (e) { dbg("sidePanel shim failed:", errorMessage(e)); }
   try { installOffscreen(); } catch (e) { dbg("offscreen shim failed:", errorMessage(e)); }
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
   try { installFavicon(); } catch (e) { dbg("favicon shim failed:", errorMessage(e)); }
   try { installServiceWorkerScope(); } catch (e) { dbg("ServiceWorkerGlobalScope shim failed:", errorMessage(e)); }
+  try { installServiceWorkerRegistration(); } catch (e) { dbg("registration shim failed:", errorMessage(e)); }
+  try { installServiceWorkerClients(); } catch (e) { dbg("clients shim failed:", errorMessage(e)); }
+  try { installServiceWorkerContainer(); } catch (e) { dbg("navigator.serviceWorker shim failed:", errorMessage(e)); }
+  try { installServiceWorkerLocks(); } catch (e) { dbg("Web Locks shim failed:", errorMessage(e)); }
   try { installNewTabUrls(); } catch (e) { dbg("new tab URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
   try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
+  try { installRuleFilter(); } catch (e) { dbg("declarativeNetRequest rule filter failed:", errorMessage(e)); }
+  try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
+  try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
+  try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
+  try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
+  try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
