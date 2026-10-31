@@ -352,4 +352,7 @@ failed.
 ## License
 
 Licensed under the [PolyForm Shield License 1.0.0](LICENSE). Copyright (c) 2026
-Yehonatan Cohen (magicelk235).
+Yehonatan Cohen (magicelk235). You may freely use, modify, and share it, but you
+may not use lavaduct to build a product that competes with it.
+
+lavaduct collects no data; see the [privacy policy](PRIVACY.md).
