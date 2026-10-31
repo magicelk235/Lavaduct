@@ -235,6 +235,28 @@ function matchPatternError(pattern: string): string | null {
   return null;
 }
 
+// web_accessible_resources match patterns Firefox refuses, such as Chrome's own
+// chrome-extension://<id>/* origins.
+function invalidResourceMatches(m: Manifest): string[] {
+  const out: string[] = [];
+  for (const entry of Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []) {
+    if (typeof entry !== "object" || entry === null || !("matches" in entry)) continue;
+    for (const p of strings(entry.matches)) if (matchPatternError(p) !== null) out.push(p);
+  }
+  return out;
+}
+
+// A search engine icon given as a web address, which Firefox's Manifest V3 refuses
+// (favicon_url is a strictRelativeUrl there).
+function remoteSearchFavicon(m: Manifest): string | null {
+  if ((m.manifest_version ?? 2) < 3) return null;
+  const overrides = m.chrome_settings_overrides;
+  const provider = typeof overrides === "object" && overrides !== null && "search_provider" in overrides ? overrides.search_provider : undefined;
+  const icon = typeof provider === "object" && provider !== null && "favicon_url" in provider ? provider.favicon_url : undefined;
+  if (typeof icon !== "string") return null;
+  return icon.startsWith("//") || URL.canParse(icon) ? icon : null;
+}
+
 // Firefox accepts a port in a pattern but compares it as part of the host name, so a
 // pattern with a port never matches anything.
 function portIssue(pattern: string, where: string, category: string): Issue | null {
@@ -628,6 +650,40 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     });
   }
 
+  const badMatches = [...new Set(invalidResourceMatches(m))];
+  if (badMatches.length) {
+    issues.push({
+      severity: "info",
+      category: "resources",
+      message: `web_accessible_resources matches ${badMatches.join(", ")}, which Firefox refuses along with the whole manifest; the pattern is removed, and an entry left matching nothing goes with it.`,
+      file: "manifest.json",
+      fix: "The add-on's own pages load its files without being listed, and Firefox has no way to name another extension by its Chrome ID.",
+      autoFixed: true,
+    });
+  }
+
+  const favicon = remoteSearchFavicon(m);
+  if (favicon !== null) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `chrome_settings_overrides.search_provider.favicon_url is a web address (${favicon}); Firefox's Manifest V3 only takes a file in the add-on there and refuses the whole manifest otherwise, so it is removed.`,
+      file: "manifest.json",
+      fix: "Firefox shows the add-on's icon for the search engine instead.",
+      autoFixed: true,
+    });
+  }
+
+  if (typeof m.author === "object" && m.author !== null) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: 'author is an object ({"email": …}), which Chrome accepts and Firefox doesn\'t; it becomes the plain string Firefox expects.',
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
   const ec = m.externally_connectable;
   if (strings(ec?.matches).length > 0) {
     issues.push({
@@ -816,6 +872,15 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] !== true),
     ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] === true && !optional.includes(p)),
   ];
+  // Chrome leaves blocking webRequest to policy-installed MV3 extensions, so store
+  // manifests never declare webRequestBlocking. Code on a Firefox path (often keyed
+  // on a moz-extension:// origin) still registers "blocking" listeners, which
+  // Firefox refuses with an exception that stops the whole script. Firefox grants
+  // it to MV3 add-ons along with webRequest, without a prompt.
+  if ((out.manifest_version ?? 2) >= 3 && !permissions.includes("webRequestBlocking") && !optionalPermissions.includes("webRequestBlocking")) {
+    if (permissions.includes("webRequest")) permissions.push("webRequestBlocking");
+    else if (optionalPermissions.includes("webRequest")) optionalPermissions.push("webRequestBlocking");
+  }
   // Chrome's debugger reaches every tab on its own permission. Its emulation runs
   // on these APIs, which need site access to every page as well.
   const allSites = opts.debuggerEmulation === true;
@@ -886,9 +951,31 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   if (out.incognito === "split") delete out.incognito;
 
   if (Array.isArray(out.web_accessible_resources)) {
-    for (const entry of out.web_accessible_resources) {
-      if (typeof entry === "object" && entry !== null) Reflect.deleteProperty(entry, "use_dynamic_url");
-    }
+    out.web_accessible_resources = out.web_accessible_resources.filter((entry: unknown) => {
+      if (typeof entry !== "object" || entry === null) return true;
+      Reflect.deleteProperty(entry, "use_dynamic_url");
+      if (!("matches" in entry) || !Array.isArray(entry.matches)) return true;
+      const kept = entry.matches.filter((p: unknown) => typeof p === "string" && matchPatternError(p) === null);
+      if (kept.length === entry.matches.length) return true;
+      if (kept.length) {
+        entry.matches = kept;
+        return true;
+      }
+      Reflect.deleteProperty(entry, "matches");
+      return "extension_ids" in entry && strings(entry.extension_ids).length > 0;
+    });
+  }
+
+  const overrides = out.chrome_settings_overrides;
+  if (remoteSearchFavicon(out) !== null && typeof overrides === "object" && overrides !== null && "search_provider" in overrides) {
+    const provider = overrides.search_provider;
+    if (typeof provider === "object" && provider !== null) Reflect.deleteProperty(provider, "favicon_url");
+  }
+
+  if (typeof out.author === "object" && out.author !== null) {
+    const email = "email" in out.author ? out.author.email : undefined;
+    if (typeof email === "string" && email) out.author = email;
+    else delete out.author;
   }
 
   // A shortcut Firefox can't parse makes it refuse the manifest. Drop just that chord;

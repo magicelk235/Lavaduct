@@ -83,6 +83,11 @@ closed until the user opens it; an extension that sets its panel page only throu
 `chrome.sidePanel.setOptions` gets a sidebar for that page too. Chrome-only keys
 (`key`, `update_url`, `minimum_chrome_version`) and permissions Firefox doesn't know
 are removed, and `chrome-extension://` URLs in the sources become `moz-extension://`.
+Manifest values Firefox would refuse the whole add-on over are fixed or dropped:
+`chrome-extension://` patterns in `web_accessible_resources`, a search engine icon
+given as a web address, and an `author` written as an object. An MV3 extension that
+asks for `webRequest` also gets `webRequestBlocking`, which Chrome keeps from store
+extensions but Firefox grants, since code written for Firefox expects it.
 
 declarativeNetRequest rules that use conditions Firefox can't evaluate are dropped
 with a warning, since Firefox would otherwise ignore them without saying so.

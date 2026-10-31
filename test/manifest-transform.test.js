@@ -193,6 +193,56 @@ test("use_dynamic_url is dropped from web_accessible_resources", () => {
   ]);
 });
 
+test("web_accessible_resources patterns Firefox refuses go, and so does an entry left matching nothing", () => {
+  const m = {
+    manifest_version: 3,
+    name: "X",
+    version: "1",
+    web_accessible_resources: [
+      { resources: ["a.css"], matches: ["<all_urls>"] },
+      { resources: ["b.css"], matches: ["https://example.com/*", "chrome-extension://abcdefghijklmnopabcdefghijklmnop/*"] },
+      { resources: ["own.css"], matches: ["chrome-extension://abcdefghijklmnopabcdefghijklmnop/*"] },
+      { resources: ["peer.css"], matches: ["chrome-extension://abcdefghijklmnopabcdefghijklmnop/*"], extension_ids: ["peer@example.com"] },
+    ],
+  };
+  assert.deepEqual(transformManifest(m, [], options()).web_accessible_resources, [
+    { resources: ["a.css"], matches: ["<all_urls>"] },
+    { resources: ["b.css"], matches: ["https://example.com/*"] },
+    { resources: ["peer.css"], extension_ids: ["peer@example.com"] },
+  ]);
+});
+
+test("an MV3 search engine's remote icon is removed, a packaged one and MV2's stay", () => {
+  const engine = (favicon_url) => ({ search_provider: { name: "S", search_url: "https://s.example/?q={searchTerms}", favicon_url } });
+  const mv3 = (favicon) => ({ manifest_version: 3, name: "X", version: "1", chrome_settings_overrides: engine(favicon) });
+  assert.equal("favicon_url" in transformManifest(mv3("https://s.example/favicon.ico"), [], options()).chrome_settings_overrides.search_provider, false);
+  assert.equal("favicon_url" in transformManifest(mv3("//s.example/favicon.ico"), [], options()).chrome_settings_overrides.search_provider, false);
+  assert.equal(transformManifest(mv3("icons/s.png"), [], options()).chrome_settings_overrides.search_provider.favicon_url, "icons/s.png");
+  const mv2 = { ...mv3("https://s.example/favicon.ico"), manifest_version: 2 };
+  assert.equal(transformManifest(mv2, [], options()).chrome_settings_overrides.search_provider.favicon_url, "https://s.example/favicon.ico");
+});
+
+test("an author object becomes the string Firefox reads", () => {
+  const m = (author) => ({ manifest_version: 3, name: "X", version: "1", author });
+  assert.equal(transformManifest(m({ email: "dev@example.com" }), [], options()).author, "dev@example.com");
+  assert.equal("author" in transformManifest(m({}), [], options()), false);
+  assert.equal(transformManifest(m("Dev"), [], options()).author, "Dev");
+});
+
+test("MV3 webRequest comes with webRequestBlocking, in the list webRequest is in", () => {
+  const m = (over) => ({ manifest_version: 3, name: "X", version: "1", ...over });
+  assert.deepEqual(transformManifest(m({ permissions: ["webRequest", "webRequestAuthProvider"] }), [], options()).permissions, [
+    "webRequest",
+    "webRequestAuthProvider",
+    "webRequestBlocking",
+  ]);
+  const optional = transformManifest(m({ permissions: ["storage"], optional_permissions: ["webRequest"] }), [], options());
+  assert.deepEqual(optional.permissions, ["storage"]);
+  assert.deepEqual(optional.optional_permissions, ["webRequest", "webRequestBlocking"]);
+  assert.deepEqual(transformManifest(m({ permissions: ["storage"] }), [], options()).permissions, ["storage"]);
+  assert.deepEqual(transformManifest({ ...m({ permissions: ["webRequest"] }), manifest_version: 2 }, [], options()).permissions, ["webRequest"]);
+});
+
 test("permissions land where Firefox accepts them", () => {
   const m = {
     manifest_version: 3,
