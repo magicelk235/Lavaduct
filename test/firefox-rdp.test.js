@@ -5,7 +5,7 @@ import net from "node:net";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { RdpSession } from "../dist/firefox/rdp.js";
+import { RdpError, RdpSession } from "../dist/firefox/rdp.js";
 
 const ADDONS_ACTOR = "server1.conn0.addonsActor2";
 
@@ -127,6 +127,41 @@ test("something other than a devtools server on the address is refused, not wait
   closed.close();
   await once(closed, "close");
   await assert.rejects(RdpSession.connect({ port: gone }), /Can't connect to Firefox's devtools server/);
+});
+
+test("a watched event is handed over whether it arrives before or after the reply that names it", async (t) => {
+  for (const eventFirst of [false, true]) {
+    const { address } = await fakeServer(t, {
+      script(packet, send) {
+        if (packet.type !== "evaluateJSAsync") return;
+        const reply = { from: packet.to, resultID: "r1" };
+        const event = { from: packet.to, type: "evaluationResult", resultID: "r1", result: "done" };
+        send(...(eventFirst ? [event, reply] : [reply, event]));
+      },
+    });
+    const session = await RdpSession.connect(address);
+    try {
+      session.watchEvents("evaluationResult");
+      const { resultID } = await session.request("console1", "evaluateJSAsync", { text: "1" });
+      const event = await session.takeEvent("evaluationResult", (e) => e.resultID === resultID);
+      assert.equal(event.result, "done");
+      await assert.rejects(session.takeEvent("tabListChanged", () => true), /aren't watched/);
+    } finally {
+      session.end();
+    }
+  }
+});
+
+test("an error reply rejects the request with Firefox's message, and the end of the connection is announced", async (t) => {
+  const { address } = await fakeServer(t, {
+    script(packet, send) {
+      send({ from: packet.to, error: "noSuchActor", message: "No such actor for ID: nope" });
+    },
+  });
+  const session = await RdpSession.connect(address);
+  await assert.rejects(session.request("nope", "anything"), (err) => err instanceof RdpError && /No such actor/.test(err.message));
+  session.end();
+  await session.disconnected;
 });
 
 test(

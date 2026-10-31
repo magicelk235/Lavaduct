@@ -12,16 +12,19 @@ const QUIT_TIMEOUT_MS = 30_000;
 
 /**
  * Start Firefox. A visible Firefox is detached so it outlives this process; a
- * headless one stays attached, so stopping this process stops it too.
+ * headless one stays attached, so stopping this process stops it too. With
+ * `background`, a Firefox that the command line is handed to stays where it is
+ * instead of coming to the front.
  */
 export function launchFirefox(
   install: FirefoxInstall,
   args: string[],
-  opts: { headless?: boolean } = {},
+  opts: { headless?: boolean; background?: boolean } = {},
 ): ChildProcess {
   if (!existsSync(install.binary)) throw new Error(`Firefox isn't at ${install.binary} any more.`);
   const headless = opts.headless === true;
-  const child = spawn(install.binary, [...(headless ? ["--headless"] : platform.visibleLaunchArgs()), ...args], {
+  const extra = headless ? ["--headless"] : opts.background ? [] : platform.visibleLaunchArgs();
+  const child = spawn(install.binary, [...extra, ...args], {
     detached: !headless,
     stdio: "ignore",
   });
@@ -44,6 +47,20 @@ function holderOf(install: FirefoxInstall, profilePath: string): LockHolder | un
 }
 
 /**
+ * Wait until the Firefox that has the profile open is old enough to take
+ * requests (platform.quitMinAgeMs); a younger one may drop them. Returns the
+ * lock holder, or undefined when it can't be told.
+ */
+export async function waitForSettledFirefox(install: FirefoxInstall, profilePath: string): Promise<LockHolder | undefined> {
+  const holder = holderOf(install, profilePath);
+  if (holder && platform.quitMinAgeMs > 0) {
+    const age = processAgeMs(holder.pid);
+    if (age !== undefined && age < platform.quitMinAgeMs) await sleep(platform.quitMinAgeMs - age);
+  }
+  return holder;
+}
+
+/**
  * Quit the Firefox that has the profile open, the way the user would, and wait
  * up to 30 s for it to let go of the profile. True when the profile is free
  * (including when nothing had it open); false when the quit couldn't be
@@ -51,12 +68,8 @@ function holderOf(install: FirefoxInstall, profilePath: string): LockHolder | un
  */
 export async function quitFirefoxForProfile(install: FirefoxInstall, profilePath: string): Promise<boolean> {
   if (!profileInUse(profilePath)) return true;
-  const holder = holderOf(install, profilePath);
+  const holder = await waitForSettledFirefox(install, profilePath);
   if (!holder) return false;
-  if (platform.quitMinAgeMs > 0) {
-    const age = processAgeMs(holder.pid);
-    if (age !== undefined && age < platform.quitMinAgeMs) await sleep(platform.quitMinAgeMs - age);
-  }
   if (!platform.requestQuit(holder.pid)) return false;
 
   const deadline = Date.now() + QUIT_TIMEOUT_MS;
@@ -98,7 +111,12 @@ export function openXpiInFirefox(install: FirefoxInstall, profile: FirefoxProfil
  * install has it registered, so a running Firefox that has it open takes the
  * request over, else by path.
  */
-export function openProfileInFirefox(install: FirefoxInstall, profile: FirefoxProfile, args: string[] = []): void {
+export function openProfileInFirefox(
+  install: FirefoxInstall,
+  profile: FirefoxProfile,
+  args: string[] = [],
+  opts: { background?: boolean } = {},
+): void {
   const own = profilesFor(install);
   const key = pathKey(profile.path);
   const registered = own.find((p) => pathKey(p.path) === key);
@@ -106,5 +124,5 @@ export function openProfileInFirefox(install: FirefoxInstall, profile: FirefoxPr
   // -P picks the first profile with that name.
   const byName = name !== undefined && own.find((p) => p.name === name) === registered;
   const profileArgs = byName ? ["-P", name] : ["--profile", resolve(profile.path)];
-  launchFirefox(install, [...profileArgs, ...args]);
+  launchFirefox(install, [...profileArgs, ...args], opts);
 }

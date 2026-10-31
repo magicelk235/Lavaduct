@@ -25,14 +25,15 @@ const MAX_HEADER_DIGITS = 20;
 /** Where a Firefox devtools server listens: a Unix socket, or a loopback TCP port on Windows. */
 export type DebuggerAddress = { path: string } | { port: number };
 
-type Packet = Record<string, unknown>;
+/** A devtools protocol packet: a JSON object. */
+export type Packet = Record<string, unknown>;
 
 function isObject(value: unknown): value is Packet {
   return typeof value === "object" && value !== null;
 }
 
 /** An error reply from a devtools actor, e.g. Firefox refusing an add-on. */
-class RdpError extends Error {}
+export class RdpError extends Error {}
 
 /**
  * Splits the byte stream from a devtools server into packets, each a decimal
@@ -78,7 +79,7 @@ function readServerFile(profile: string): DebuggerAddress | undefined {
 }
 
 /** Clear what a Firefox that has quit left behind of its devtools server. */
-function forgetServer(profile: string): void {
+export function forgetServer(profile: string): void {
   const address = readServerFile(profile);
   // Only a socket in a folder start() made, whatever else the file names.
   if (address && "path" in address) {
@@ -132,10 +133,35 @@ async function newAddress(install: FirefoxInstall, profile: string): Promise<Deb
   return { path };
 }
 
+/**
+ * A fresh address for a devtools server on the profile, after clearing what
+ * an earlier server left, recorded in the profile so attach() finds it.
+ */
+export async function claimServerAddress(install: FirefoxInstall, profilePath: string): Promise<DebuggerAddress> {
+  const profile = resolve(profilePath);
+  forgetServer(profile);
+  const address = await newAddress(install, profile);
+  writeFileSync(join(profile, SERVER_FILE), JSON.stringify(address));
+  return address;
+}
+
+/** The address as --start-debugger-server takes it: a socket path or a port. */
+export function serverArgument(address: DebuggerAddress): string {
+  return "path" in address ? address.path : String(address.port);
+}
+
 interface Pending {
   /** The actor whose reply settles this. */
   actor: string;
   resolve(reply: Packet): void;
+  reject(err: Error): void;
+  timer: NodeJS.Timeout;
+}
+
+interface EventWaiter {
+  type: string;
+  match(event: Packet): boolean;
+  resolve(event: Packet): void;
   reject(err: Error): void;
   timer: NodeJS.Timeout;
 }
@@ -156,6 +182,12 @@ export class RdpSession {
   private failure: Error | undefined;
   private connected = false;
   private addonsActor: string | undefined;
+  // Watched event types, and the events of them nobody has taken yet.
+  private readonly events = new Map<string, Packet[]>();
+  private readonly eventWaiters = new Set<EventWaiter>();
+  private readonly ended = Promise.withResolvers<void>();
+  /** Resolves when the connection ends, whichever side ends it. */
+  readonly disconnected: Promise<void> = this.ended.promise;
 
   private constructor(
     private readonly socket: Socket,
@@ -174,7 +206,10 @@ export class RdpSession {
         ),
       );
     });
-    socket.on("close", () => this.fail(new Error("Firefox closed its devtools connection.")));
+    socket.on("close", () => {
+      this.fail(new Error("Firefox closed its devtools connection."));
+      this.ended.resolve();
+    });
   }
 
   /** Connect to the devtools server at `address` and wait for its greeting. */
@@ -195,23 +230,13 @@ export class RdpSession {
    * Launch Firefox on the profile with its devtools server on a fresh address,
    * and connect. The profile's prefs must allow the server; see
    * enableDebuggerServerInProfile. Fails when a running Firefox already has the
-   * profile open: that Firefox would take over the launch without starting the
-   * server, which Firefox only does when it starts.
+   * profile open. A headless Firefox stays tied to this process.
    */
-  static async start(install: FirefoxInstall, profilePath: string): Promise<RdpSession> {
+  static async start(install: FirefoxInstall, profilePath: string, { headless = false } = {}): Promise<RdpSession> {
     const profile = resolve(profilePath);
-    if (profileInUse(profile)) {
-      throw new Error(
-        `Firefox already has the profile at ${profile} open. Quit it first: ` +
-          "Firefox only starts its devtools server when it starts.",
-      );
-    }
-    forgetServer(profile);
-    const address = await newAddress(install, profile);
-    writeFileSync(join(profile, SERVER_FILE), JSON.stringify(address));
-
-    const where = "path" in address ? address.path : String(address.port);
-    const child = launchFirefox(install, ["--start-debugger-server", where, "--profile", profile]);
+    if (profileInUse(profile)) throw new Error(`Firefox already has the profile at ${profile} open. Quit it first.`);
+    const address = await claimServerAddress(install, profile);
+    const child = launchFirefox(install, ["--start-debugger-server", serverArgument(address), "--profile", profile], { headless });
     let failure: string | undefined;
     child.once("error", (err) => {
       failure = err.message;
@@ -273,12 +298,43 @@ export class RdpSession {
     return id;
   }
 
+  /**
+   * Keep events of `type` from now on, for takeEvent(). Firefox may send an
+   * event ahead of the reply that announces it, so watch before the request.
+   */
+  watchEvents(type: string): void {
+    if (!this.events.has(type)) this.events.set(type, []);
+  }
+
+  /** The first watched event of `type` that `match` accepts, kept or still to come. */
+  takeEvent(type: string, match: (event: Packet) => boolean, timeoutMs = COMMAND_TIMEOUT_MS): Promise<Packet> {
+    const kept = this.events.get(type);
+    if (!kept) return Promise.reject(new Error(`Events of type ${type} aren't watched.`));
+    const at = kept.findIndex(match);
+    if (at >= 0) return Promise.resolve(kept.splice(at, 1)[0]);
+    if (this.failure) return Promise.reject(this.failure);
+    const { promise, resolve, reject } = Promise.withResolvers<Packet>();
+    const waiter = {
+      type,
+      match,
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        this.eventWaiters.delete(waiter);
+        reject(new Error(`Firefox sent no ${type} within ${timeoutMs / 1000} s.`));
+      }, timeoutMs),
+    };
+    this.eventWaiters.add(waiter);
+    return promise;
+  }
+
   /** Disconnect. Firefox keeps running, and its devtools server keeps listening for the next run. */
   end(): void {
     this.fail(new Error("The connection to Firefox is closed."));
   }
 
-  private request(to: string, type: string, params: Packet = {}): Promise<Packet> {
+  /** Send a request to an actor and wait for its reply. An error reply rejects with RdpError. */
+  request(to: string, type: string, params: Packet = {}): Promise<Packet> {
     const send = (): Promise<Packet> => {
       if (this.failure) return Promise.reject(this.failure);
       const reply = this.expectReply(to, COMMAND_TIMEOUT_MS, `Firefox didn't answer ${type} within ${COMMAND_TIMEOUT_MS / 1000} s.`);
@@ -309,8 +365,21 @@ export class RdpSession {
       return;
     }
     for (const packet of packets) {
-      // Events carry a type and replies don't; this client subscribes to no events.
-      if (!isObject(packet) || "type" in packet) continue;
+      if (!isObject(packet)) continue;
+      // Events carry a type and replies don't. Only watched event types are kept.
+      if ("type" in packet) {
+        const kept = typeof packet.type === "string" ? this.events.get(packet.type) : undefined;
+        if (!kept) continue;
+        const waiter = [...this.eventWaiters].find((w) => w.type === packet.type && w.match(packet));
+        if (waiter) {
+          this.eventWaiters.delete(waiter);
+          clearTimeout(waiter.timer);
+          waiter.resolve(packet);
+        } else {
+          kept.push(packet);
+        }
+        continue;
+      }
       const pending = this.pending;
       if (!pending || packet.from !== pending.actor) continue;
       this.pending = undefined;
@@ -332,6 +401,11 @@ export class RdpSession {
       clearTimeout(pending.timer);
       pending.reject(err);
     }
+    for (const waiter of this.eventWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(err);
+    }
+    this.eventWaiters.clear();
     this.socket.destroy();
   }
 }
