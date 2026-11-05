@@ -69,7 +69,7 @@ flowchart LR
 8. Pick and run a signing route.
 9. Install into a profile and optionally verify.
 
-Progress lines stay stable so the Viaduct app can map them to phases the way it does for viaduct-cli today. The lines that mark phase changes are `Packing .xpi`, `Signing (amo|unsigned|temporary)` and `Installed →`.
+Progress lines stay stable so the Viaduct app can map them to phases the way it does for viaduct-cli today. The lines the Viaduct app maps to phases are listed under Used by the Viaduct app.
 
 ## Manifest transform
 
