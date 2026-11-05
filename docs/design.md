@@ -1,6 +1,6 @@
 # Chrome-to-Firefox converter design
 
-This is a command-line tool that converts a Chrome extension into a Firefox add-on and installs it. It is the Firefox counterpart of viaduct-cli, which does the same for Safari, and it aims for feature parity with that CLI. The Viaduct Mac app may bundle it later, so it keeps viaduct-cli's process contract.
+This is a command-line tool that converts a Chrome extension into a Firefox add-on and installs it. It is the Firefox counterpart of aqueduct (formerly viaduct-cli), which does the same for Safari, and it aims for feature parity with that CLI. The Viaduct Mac app runs it through `@magicelk235/viaduct --browser firefox` and bundles part of it in its persist helper; see Used by the Viaduct app.
 
 The tool is called lavaduct. Every identifier that carries the name comes from `src/name.ts`; see Naming below.
 
@@ -298,7 +298,22 @@ An opt-in AMO test runs when `AMO_TEST_KEY` and `AMO_TEST_SECRET` are set. It si
 
 A GitHub Release triggers a workflow, copied from viaduct-cli, that publishes to npm through OIDC trusted publishing. The README covers install, usage, each signing route, and the AMO policy risk.
 
-For the Viaduct app, the stable contract is the `--analyze --json` schema (the same as viaduct-cli's), the phase progress lines listed under Pipeline, AMO credentials passed through environment variables, and the exit codes above.
+## Used by the Viaduct app
+
+The Viaduct Mac app relies on the parts of lavaduct below, so they change only on purpose.
+
+1. **The CLI process contract.** The app reads it through the `viaduct` umbrella, which strips `--browser firefox` and runs `dist/cli.js` with the remaining arguments. The stable parts are:
+   - The `--analyze --json` report, alone on stdout: `issues[{severity, category, message, autoFixed}]` plus `shimmed`.
+   - The progress lines the app turns into phases: `Extracting ` (unpacking), and `Loaded "` or `Staging clean` (converting). The app sets the install phase itself and parses no other line.
+   - `✗`-prefixed errors on stderr.
+   - Exit codes 0, 1 and 2.
+   - After `-o <dir>`, `<dir>/staged_extension/manifest.json` exists exactly when the conversion succeeded.
+2. **What persist relies on across versions.** The app's persist helper bundles a pinned lavaduct, while conversions use whatever lavaduct the latest `viaduct` carries, so these must not change without a persist release:
+   - The `staged_extension/` layout (`STAGE_DIR` in `src/convert.ts`) and the gecko add-on ID in its `manifest.json`, `<chromeId>.<salt>@lavaduct` (`ADDON_ID_SUFFIX` in `src/name.ts`).
+   - The state directory from `stateDir()` in `src/state.ts` (`~/Library/Application Support/lavaduct` on macOS, `LAVADUCT_STATE_DIR` override): `addon-id-salt.json`, `installs.json`, and persist's own `persistent.json` beside them.
+   - Behaviour that ships inside the converted add-on, mainly the shim turning a repeated `runtime.onInstalled` `install` into `chrome_update` (`src/runtime/firefox-compat-shim.js`, "runtime.onInstalled for an add-on loaded temporarily").
+3. **Modules persist imports from `dist/`.** From persist 0.2.0, these are the modules it imports, and their exported names and signatures are part of the contract: `firefox/install.js`, `firefox/launch.js`, `firefox/locate.js` (`findFirefoxInstalls`, `selectFirefox`), `firefox/native-hosts.js`, `firefox/platform/index.js`, `firefox/platform/shared.js`, `firefox/profiles.js`, `firefox/rdp.js`, `manifest/manifest.js`, `name.js`, `state.js`, `util.js`. Its tests also import `firefox/platform/win32.js` (`splitCommandLine`) and `firefox/cityhash.js` (`installHash`). Persist 0.2.0 deliberately doesn't import `convert.js`: it pulls in `paths.js`, which reads `templates/` and `runtime/` relative to itself, and those don't exist beside the bundled `persist.mjs`. Keep these 12 modules free of imports from `convert.js` and `paths.js`.
+4. **The guard.** The app's `release.sh` runs persist's tests against the lavaduct `latest` on npm. A lavaduct release that changes anything above says so under `### Changed` in its notes.
 
 ## Sources
 

@@ -1,7 +1,7 @@
 {
   "name": "@magicelk235/lavaduct",
   "version": "0.1.0",
-  "private": true,
+  "publishConfig": { "access": "public" },
   "description": "Convert a Chrome extension into a Firefox add-on and install it.",
   "repository": { "type": "git", "url": "git+https://github.com/magicelk235/Lavaduct.git" },
   "bugs": { "url": "https://github.com/magicelk235/Lavaduct/issues" },

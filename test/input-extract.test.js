@@ -7,7 +7,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { extractExtension } from "../dist/input/extract.js";
 import { zipDirectory } from "../dist/zip/write.js";
 
-const CORPUS = "/Users/magicelk235/Desktop/Projects/viaduct-cli/test extensions";
+const CORPUS = "/Users/magicelk235/Desktop/Projects/aqueduct/test extensions";
 const tmp = (p = "input-extract-") => mkdtempSync(join(tmpdir(), p));
 
 for (const file of ["dark reader.crx", "Lighthouse.zip"]) {

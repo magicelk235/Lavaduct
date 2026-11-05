@@ -7,8 +7,10 @@ result as an `.xpi`. It then gets the add-on into Firefox in one of three ways:
 signed by Mozilla through addons.mozilla.org (AMO), installed unsigned into a Firefox
 build that allows it, or loaded temporarily.
 
-It is the Firefox counterpart of [viaduct](https://github.com/magicelk235/Viaduct-CLI),
-which does the same for Safari, and takes the same inputs and most of the same flags.
+It is the Firefox engine of [viaduct](https://github.com/magicelk235/Viaduct-CLI), which runs
+it when you pass `--browser firefox`. The Safari engine is
+[aqueduct](https://github.com/magicelk235/Aqueduct). lavaduct takes the same inputs and most
+of the same flags.
 
 ## Requirements
 
