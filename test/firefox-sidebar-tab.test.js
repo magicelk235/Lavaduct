@@ -109,6 +109,18 @@ test(
       await showFromFirefoxUi();
       const opened = await settle(`/panel.html?tabId=${tabs.one}`);
       assert.equal(opened.url, `/panel.html?tabId=${tabs.one}`, "the panel opened from Firefox's UI belongs to the selected tab");
+      // The page pins itself for the whole window once it has looked up its tab's
+      // record; a tab switch before that still gets Firefox's default page. On a
+      // loaded CI runner the switch below came first.
+      for (let i = 0; i < 100; i++) {
+        const pinned = await ff.chrome(`(() => {
+          const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
+          const action = ExtensionParent.apiManager.global.sidebarAction.for(WebExtensionPolicy.getByID(${JSON.stringify(id)}).extension);
+          return action.getProperty(Services.wm.getMostRecentWindow("navigator:browser"), "panel").replace(/^moz-extension:\\/\\/[^/]+/, "");
+        })()`);
+        if (pinned === opened.url) break;
+        await sleep(100);
+      }
 
       await select("two");
       await sleep(1500);
