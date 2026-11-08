@@ -55,67 +55,73 @@ test(
     const profile = join(scratch, "profile");
     mkdirSync(profile);
     const ff = await startPrivilegedFirefox(firefox, profile);
-    t.after(() => ff.close());
-    const id = await ff.installAddon(result.stagedPath);
-    const widget = JSON.stringify(id.toLowerCase().replace(/[^a-z0-9_-]/g, "_") + "-sidebar-action");
-    // Two tabs, by their add-on tab IDs.
-    const tabs = JSON.parse(await ff.chrome(`(async () => {
-      const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
-      const win = Services.wm.getMostRecentWindow("navigator:browser");
-      const principal = Services.scriptSecurityManager.getSystemPrincipal();
-      const one = win.gBrowser.addTab(${JSON.stringify(`${site}/one`)}, { triggeringPrincipal: principal });
-      const two = win.gBrowser.addTab(${JSON.stringify(`${site}/two`)}, { triggeringPrincipal: principal });
-      const ids = ExtensionParent.apiManager.global.tabTracker;
-      return JSON.stringify({ one: ids.getId(one), two: ids.getId(two) });
-    })()`));
-    // Selecting a tab does nothing while the new profile's onboarding dialog
-    // is up, which can come up late; it goes first.
-    const select = async (which) => {
-      for (let i = 0; i < 50; i++) {
-        const selected = await ff.chrome(`(() => {
-          const win = Services.wm.getMostRecentWindow("navigator:browser");
-          if (win.gDialogBox?.isOpen) win.gDialogBox.dialog?.close();
-          const tab = win.gBrowser.tabs.find((t) => t.linkedBrowser.currentURI.spec.endsWith("/${which}"));
-          if (tab) win.gBrowser.selectedTab = tab;
-          return win.gBrowser.selectedTab === tab;
-        })()`);
-        if (selected) return;
-        await sleep(100);
-      }
-      assert.fail(`couldn't select the tab at /${which}`);
-    };
-    await select("one");
-    // The page in the sidebar, and which document it is.
-    const sidebar = async () => JSON.parse(await ff.chrome(`(() => {
-      const win = Services.wm.getMostRecentWindow("navigator:browser");
-      const panel = win.document.getElementById("sidebar")?.contentDocument?.getElementById("webext-panels-browser");
-      const global = panel?.browsingContext?.currentWindowGlobal;
-      return JSON.stringify({ open: win.SidebarController.isOpen, url: panel ? panel.currentURI.spec.replace(/^moz-extension:\\/\\/[^/]+/, "") : "", doc: global ? global.innerWindowId : 0 });
-    })()`));
-    const settle = async (url) => {
-      let now = await sidebar();
-      for (let i = 0; i < 100 && now.url !== url; i++) {
-        await sleep(100);
-        now = await sidebar();
-      }
-      return now;
-    };
-    const showFromFirefoxUi = () => ff.chrome(`Services.wm.getMostRecentWindow("navigator:browser").SidebarController.show(${widget})`);
+    // Closed in a finally rather than an after hook: hooks run in the order they
+    // were added, so the scratch folder would go first, which Windows refuses
+    // while Firefox has the profile open, and the hooks after it never run.
+    try {
+      const id = await ff.installAddon(result.stagedPath);
+      const widget = JSON.stringify(id.toLowerCase().replace(/[^a-z0-9_-]/g, "_") + "-sidebar-action");
+      // Two tabs, by their add-on tab IDs.
+      const tabs = JSON.parse(await ff.chrome(`(async () => {
+        const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
+        const win = Services.wm.getMostRecentWindow("navigator:browser");
+        const principal = Services.scriptSecurityManager.getSystemPrincipal();
+        const one = win.gBrowser.addTab(${JSON.stringify(`${site}/one`)}, { triggeringPrincipal: principal });
+        const two = win.gBrowser.addTab(${JSON.stringify(`${site}/two`)}, { triggeringPrincipal: principal });
+        const ids = ExtensionParent.apiManager.global.tabTracker;
+        return JSON.stringify({ one: ids.getId(one), two: ids.getId(two) });
+      })()`));
+      // Selecting a tab does nothing while the new profile's onboarding dialog
+      // is up, which can come up late; it goes first.
+      const select = async (which) => {
+        for (let i = 0; i < 50; i++) {
+          const selected = await ff.chrome(`(() => {
+            const win = Services.wm.getMostRecentWindow("navigator:browser");
+            if (win.gDialogBox?.isOpen) win.gDialogBox.dialog?.close();
+            const tab = win.gBrowser.tabs.find((t) => t.linkedBrowser.currentURI.spec.endsWith("/${which}"));
+            if (tab) win.gBrowser.selectedTab = tab;
+            return win.gBrowser.selectedTab === tab;
+          })()`);
+          if (selected) return;
+          await sleep(100);
+        }
+        assert.fail(`couldn't select the tab at /${which}`);
+      };
+      await select("one");
+      // The page in the sidebar, and which document it is.
+      const sidebar = async () => JSON.parse(await ff.chrome(`(() => {
+        const win = Services.wm.getMostRecentWindow("navigator:browser");
+        const panel = win.document.getElementById("sidebar")?.contentDocument?.getElementById("webext-panels-browser");
+        const global = panel?.browsingContext?.currentWindowGlobal;
+        return JSON.stringify({ open: win.SidebarController.isOpen, url: panel ? panel.currentURI.spec.replace(/^moz-extension:\\/\\/[^/]+/, "") : "", doc: global ? global.innerWindowId : 0 });
+      })()`));
+      const settle = async (url) => {
+        let now = await sidebar();
+        for (let i = 0; i < 100 && now.url !== url; i++) {
+          await sleep(100);
+          now = await sidebar();
+        }
+        return now;
+      };
+      const showFromFirefoxUi = () => ff.chrome(`Services.wm.getMostRecentWindow("navigator:browser").SidebarController.show(${widget})`);
 
-    // Opened from Firefox's sidebar menu, where Chrome has only the toolbar button.
-    await showFromFirefoxUi();
-    const opened = await settle(`/panel.html?tabId=${tabs.one}`);
-    assert.equal(opened.url, `/panel.html?tabId=${tabs.one}`, "the panel opened from Firefox's UI belongs to the selected tab");
+      // Opened from Firefox's sidebar menu, where Chrome has only the toolbar button.
+      await showFromFirefoxUi();
+      const opened = await settle(`/panel.html?tabId=${tabs.one}`);
+      assert.equal(opened.url, `/panel.html?tabId=${tabs.one}`, "the panel opened from Firefox's UI belongs to the selected tab");
 
-    await select("two");
-    await sleep(1500);
-    const switched = await sidebar();
-    assert.equal(switched.url, opened.url, "a tab switch doesn't swap in a page without a tab");
-    assert.equal(switched.doc, opened.doc, "the panel isn't reloaded on a tab switch");
+      await select("two");
+      await sleep(1500);
+      const switched = await sidebar();
+      assert.equal(switched.url, opened.url, "a tab switch doesn't swap in a page without a tab");
+      assert.equal(switched.doc, opened.doc, "the panel isn't reloaded on a tab switch");
 
-    await ff.chrome(`Services.wm.getMostRecentWindow("navigator:browser").SidebarController.hide()`);
-    await showFromFirefoxUi();
-    const reopened = await settle(`/panel.html?tabId=${tabs.two}`);
-    assert.equal(reopened.url, `/panel.html?tabId=${tabs.two}`, "reopened on another tab, the panel belongs to that tab");
+      await ff.chrome(`Services.wm.getMostRecentWindow("navigator:browser").SidebarController.hide()`);
+      await showFromFirefoxUi();
+      const reopened = await settle(`/panel.html?tabId=${tabs.two}`);
+      assert.equal(reopened.url, `/panel.html?tabId=${tabs.two}`, "reopened on another tab, the panel belongs to that tab");
+    } finally {
+      await ff.close();
+    }
   },
 );

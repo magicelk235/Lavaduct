@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { launchFirefox } from "../dist/firefox/launch.js";
 import { enableDebuggerServerInProfile } from "../dist/firefox/install.js";
+import { profileInUse } from "../dist/firefox/profiles.js";
 
 const START_TIMEOUT_MS = 30_000;
 const REPLY_TIMEOUT_MS = 60_000;
@@ -183,6 +184,9 @@ export async function startPrivilegedFirefox(install, profile) {
       await Promise.race([exited, sleep(10_000, undefined, { ref: false })]);
       child.kill();
       client.socket.destroy();
+      // On Windows the child is Firefox's launcher, and the browser it waits on
+      // may still hold the profile for a moment after it exits.
+      for (let i = 0; i < 100 && profileInUse(profile); i++) await sleep(100);
       if (socketDir) rmSync(socketDir, { recursive: true, force: true });
     },
   };
