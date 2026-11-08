@@ -187,6 +187,9 @@ test(
         own.kill();
         await once(own, "exit");
       }
+      // On Windows the process we started is Firefox's launcher, and the
+      // browser it waits on may still hold the profile for a moment after it.
+      await stopFirefox(profile);
     }
   },
 );
