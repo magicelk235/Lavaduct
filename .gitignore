@@ -10,7 +10,11 @@ staged_extension/
 # Local real-extension corpus (large binaries)
 test extensions/
 
+# GitHub wiki clone (its own repo, pushed separately)
+wiki/
+
 # Agent and editor files
 .omp/
 .claude/
 .vscode/
+/AGENTS.md
