@@ -17,9 +17,12 @@ const SCTAG_OBJECT_OBJECT = 0xffff0008;
 const SCTAG_BACK_REFERENCE_OBJECT = 0xffff000d;
 const SCTAG_END_OF_KEYS = 0xffff0013;
 
-// Old IndexedDB clones carry scope 0; current ones SameProcess (1) through
-// DifferentProcessForIndexedDB (3).
+// The header's data is the scope in the low 16 bits and, since Firefox 162
+// (bug 2061903), the format version in the high 16. Old IndexedDB clones carry
+// scope 0; current ones SameProcess (1) through DifferentProcessForIndexedDB (3).
+// Clones written before the version was stored read as version 0.
 const MAX_SCOPE = 3;
+const MAX_VERSION = 9;
 
 const STRING_LENGTH_MASK = 0x3fffffff;
 const STRING_LATIN1 = 0x80000000;
@@ -38,7 +41,10 @@ class CloneReader {
   read(): unknown {
     // Clones written before the header existed start straight with the value.
     if (this.buf.length >= 8 && this.buf.readUInt32LE(4) === SCTAG_HEADER) {
-      const [, scope] = this.pair();
+      const [, data] = this.pair();
+      const scope = data & 0xffff;
+      const version = data >>> 16;
+      if (version > MAX_VERSION) throw new Error(`Structured clone is in format version ${version}, newer than this reader knows`);
       if (scope > MAX_SCOPE) throw new Error(`Structured clone has an invalid scope (${scope})`);
     }
     return this.value();

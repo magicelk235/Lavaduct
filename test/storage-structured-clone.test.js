@@ -51,6 +51,22 @@ test("a clone without the scope header still decodes", () => {
   assert.deepEqual(readStructuredClone(clone.subarray(8)), storedValue());
 });
 
+// Firefox 162 (bug 2061903) writes the format version in the header's high 16
+// bits, next to the scope; older clones leave them zero.
+function withHeaderVersion(version) {
+  const copy = Buffer.from(clone);
+  copy.writeUInt32LE(((version << 16) | copy.readUInt16LE(0)) >>> 0, 0);
+  return copy;
+}
+
+test("a clone whose header carries the format version, as Firefox 162 writes it, decodes", () => {
+  assert.deepEqual(readStructuredClone(withHeaderVersion(9)), storedValue());
+});
+
+test("a clone in a format version newer than the reader knows is refused", () => {
+  assert.throws(() => readStructuredClone(withHeaderVersion(10)), /version 10/);
+});
+
 test("a type the decoder doesn't handle is reported by its tag", () => {
   // A Date, which storage.local can hold but the debug log never does.
   assert.throws(
