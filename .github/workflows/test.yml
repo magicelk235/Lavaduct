@@ -12,6 +12,9 @@ jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # A Firefox left running keeps a test file from exiting, and a stuck job
+    # otherwise runs for GitHub's six-hour limit.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
