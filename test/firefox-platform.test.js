@@ -214,7 +214,7 @@ test("Linux: each kind of install reads its own profile root", () => {
   withTree((home) => {
     // Firefox 147+ with no ~/.mozilla yet: XDG config dir.
     assert.equal(linuxProfileRoot(undefined, home, {}), join(home, ".config/mozilla/firefox"));
-    assert.equal(linuxProfileRoot(undefined, home, { XDG_CONFIG_HOME: "/cfg" }), "/cfg/mozilla/firefox");
+    assert.equal(linuxProfileRoot(undefined, home, { XDG_CONFIG_HOME: "/cfg" }), join("/cfg", "mozilla/firefox"));
     // A relative XDG_CONFIG_HOME is invalid by the XDG spec and ignored.
     assert.equal(linuxProfileRoot(undefined, home, { XDG_CONFIG_HOME: "cfg" }), join(home, ".config/mozilla/firefox"));
     assert.equal(linuxProfileRoot(undefined, home, { MOZ_LEGACY_HOME: "1" }), join(home, ".mozilla/firefox"));
