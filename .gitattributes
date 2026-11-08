@@ -1,0 +1,4 @@
+# The shim and bridge templates are spliced together at marker lines that end
+# in "\n", and get shipped inside every converted add-on. A Windows checkout
+# with CRLF line endings breaks the splices, so check out LF everywhere.
+* text=auto eol=lf
