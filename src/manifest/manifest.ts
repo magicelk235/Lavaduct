@@ -227,12 +227,16 @@ function matchPatternError(pattern: string): string | null {
   if (host === "*") return null;
   const body = host.startsWith("*.") ? host.slice(2) : host;
   if (body === "") return "empty host after '*.'";
-  if (body.includes("*")) {
-    return host.endsWith(":*")
-      ? "Firefox has no port wildcard; a pattern without a port already matches every port"
-      : `host "${host}" may only use '*' as the whole host or a leading '*.'`;
-  }
+  if (body.includes("*")) return `host "${host}" may only use '*' as the whole host or a leading '*.'`;
   return null;
+}
+
+// Chrome's port wildcard (host:*) isn't in Firefox's grammar, and a Firefox pattern
+// without a port already matches every port, so dropping it keeps the pattern's
+// meaning. Patterns are checked and written in this form.
+const PORT_WILDCARD_RE = /^([^:/]*:\/\/[^/]*?):\*(?=\/)/;
+export function withoutPortWildcard<T>(pattern: T): T {
+  return (typeof pattern === "string" ? pattern.replace(PORT_WILDCARD_RE, "$1") : pattern) as T;
 }
 
 // web_accessible_resources match patterns Firefox refuses, such as Chrome's own
@@ -241,7 +245,7 @@ function invalidResourceMatches(m: Manifest): string[] {
   const out: string[] = [];
   for (const entry of Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []) {
     if (typeof entry !== "object" || entry === null || !("matches" in entry)) continue;
-    for (const p of strings(entry.matches)) if (matchPatternError(p) !== null) out.push(p);
+    for (const p of strings(entry.matches)) if (matchPatternError(withoutPortWildcard(p)) !== null) out.push(p);
   }
   return out;
 }
@@ -385,6 +389,14 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   const mv = m.manifest_version ?? 2;
   const required = strings(m.permissions);
   const optional = strings(m.optional_permissions);
+  // Port-wildcard patterns that become valid without the wildcard.
+  const portWildcards = new Set<string>();
+  const patternError = (pattern: string): string | null => {
+    const fixed = withoutPortWildcard(pattern);
+    const err = matchPatternError(fixed);
+    if (err === null && fixed !== pattern) portWildcards.add(pattern);
+    return err;
+  };
 
   // Firefox validates content-script patterns strictly: one it can't parse makes it
   // refuse the whole manifest.
@@ -397,9 +409,9 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     ];
     for (const [key, list] of lists) {
       for (const pat of strings(list)) {
-        const err = matchPatternError(pat);
+        const err = patternError(pat);
         if (err === null) {
-          const port = portIssue(pat, `content_scripts[${i}].${key}`, "content_scripts");
+          const port = portIssue(withoutPortWildcard(pat), `content_scripts[${i}].${key}`, "content_scripts");
           if (port) issues.push(port);
           continue;
         }
@@ -427,9 +439,9 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   // them so the manifest says what Firefox actually grants.
   for (const key of ["host_permissions", "optional_host_permissions"] as const) {
     for (const pat of strings(m[key])) {
-      const err = matchPatternError(pat);
+      const err = patternError(pat);
       if (err === null) {
-        const port = portIssue(pat, key, "permission");
+        const port = portIssue(withoutPortWildcard(pat), key, "permission");
         if (port) issues.push(port);
         continue;
       }
@@ -501,7 +513,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   for (const key of ["permissions", "optional_permissions"] as const) {
     for (const perm of strings(m[key])) {
       if (perm !== "<all_urls>" && !perm.includes("://")) continue;
-      const err = matchPatternError(perm);
+      const err = patternError(perm);
       if (err !== null) {
         const favicon = perm.startsWith("chrome://favicon");
         issues.push({
@@ -522,10 +534,22 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
           fix: 'Move it into "host_permissions" (MV3 requires URL patterns there).',
         });
       } else {
-        const port = portIssue(perm, key, "permission");
+        const port = portIssue(withoutPortWildcard(perm), key, "permission");
         if (port) issues.push(port);
       }
     }
+  }
+  for (const entry of Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []) {
+    if (typeof entry === "object" && entry !== null && "matches" in entry) for (const p of strings(entry.matches)) patternError(p);
+  }
+  if (portWildcards.size) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `${[...portWildcards].join(", ")} use${portWildcards.size > 1 ? "" : "s"} a port wildcard, which Firefox doesn't have: it refuses a manifest whose content scripts use one and grants nothing through such a host permission. A Firefox pattern without a port matches every port, so the wildcard is dropped.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
   }
 
   for (const gate of KEY_GATES) {
@@ -894,8 +918,8 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   const removed = new Set(permissionsToRemove);
   const keep = (p: unknown): p is string =>
     typeof p === "string" && !removed.has(p) && (!p.includes("://") || matchPatternError(p) === null);
-  const required = Array.isArray(out.permissions) ? out.permissions.filter(keep) : [];
-  const optional = Array.isArray(out.optional_permissions) ? out.optional_permissions.filter(keep) : [];
+  const required = Array.isArray(out.permissions) ? out.permissions.map(withoutPortWildcard).filter(keep) : [];
+  const optional = Array.isArray(out.optional_permissions) ? out.optional_permissions.map(withoutPortWildcard).filter(keep) : [];
   const permissions = [
     ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] !== true),
     ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] === true && !required.includes(p)),
@@ -930,7 +954,7 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   for (const key of ["host_permissions", "optional_host_permissions"] as const) {
     const list = out[key];
     if (!Array.isArray(list)) continue;
-    const kept = list.filter((p) => typeof p === "string" && matchPatternError(p) === null);
+    const kept = list.map(withoutPortWildcard).filter((p) => typeof p === "string" && matchPatternError(p) === null);
     if (kept.length) out[key] = kept;
     else delete out[key];
   }
@@ -1002,9 +1026,8 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
       // manifest over an entry with neither matches nor extension_ids.
       if (!("matches" in entry)) return "extension_ids" in entry;
       if (!Array.isArray(entry.matches)) return true;
-      const kept = entry.matches.filter((p: unknown) => typeof p === "string" && matchPatternError(p) === null);
-      if (kept.length === entry.matches.length) return true;
-      if (kept.length) {
+      const kept = entry.matches.map(withoutPortWildcard).filter((p: unknown) => typeof p === "string" && matchPatternError(p) === null);
+      if (kept.length || entry.matches.length === 0) {
         entry.matches = kept;
         return true;
       }
@@ -1046,13 +1069,16 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     }
   }
 
-  // Chrome accepts an empty exclude_matches; Firefox wants at least one pattern and
-  // refuses the whole manifest otherwise. An empty list excludes nothing either way.
+  // Content-script patterns lose a port wildcard. Chrome accepts an empty
+  // exclude_matches; Firefox wants at least one pattern and refuses the whole
+  // manifest otherwise. An empty list excludes nothing either way.
   if (Array.isArray(out.content_scripts)) {
     for (const cs of out.content_scripts) {
-      if (cs && typeof cs === "object" && "exclude_matches" in cs && Array.isArray(cs.exclude_matches) && cs.exclude_matches.length === 0) {
-        Reflect.deleteProperty(cs, "exclude_matches");
-      }
+      if (!cs || typeof cs !== "object") continue;
+      if (Array.isArray(cs.matches)) cs.matches = cs.matches.map(withoutPortWildcard);
+      if (!("exclude_matches" in cs) || !Array.isArray(cs.exclude_matches)) continue;
+      if (cs.exclude_matches.length === 0) Reflect.deleteProperty(cs, "exclude_matches");
+      else cs.exclude_matches = cs.exclude_matches.map(withoutPortWildcard);
     }
   }
 
