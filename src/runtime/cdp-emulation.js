@@ -1987,8 +1987,9 @@
       var p = params && typeof params === "object" ? params : {};
       dbg("debugger:", method, "tab", tabId);
       if (Object.prototype.hasOwnProperty.call(COMMANDS, method)) return COMMANDS[method](tabId, s, p);
-      if (CDP_NOOP_RE.test(method)) return {};
+      // Unsupported first: Fetch.enable would otherwise pass as a no-op enable.
       if (Object.prototype.hasOwnProperty.call(CDP_UNSUPPORTED, method)) throw protocolError(method + " isn't available in Firefox: " + CDP_UNSUPPORTED[method]);
+      if (CDP_NOOP_RE.test(method)) return {};
       throw protocolError("'" + method + "' wasn't found", -32601);
     }
     function attach(target, version) {
