@@ -1908,6 +1908,175 @@
     } catch (e) {}
   }
 
+  // ── Messages Chrome would send as JSON ─────────────────────────────────────
+  // Chrome serializes extension messages as JSON: a URL goes as its string, a
+  // function is dropped. Firefox structured-clones them and fails on both:
+  // runtime.sendMessage and tabs.sendMessage reject with a DataCloneError (or
+  // call back with it as lastError), Port.postMessage throws it, and an answer
+  // through sendResponse or a listener's promise fails silently, telling the
+  // sender "Receiving end does not exist." What Firefox can clone keeps
+  // Firefox's clone; what it can't is sent again as its JSON copy, the value
+  // Chrome would have delivered. An answer is checked before it goes, since
+  // Firefox reports nothing to retry on. Only emitted for a bundle that
+  // messages.
+  function isCloneError(e) {
+    try { return !!e && (e.name === "DataCloneError" || /could not be cloned/i.test(String(e.message || e))); } catch (x) { return false; }
+  }
+
+  function jsonCopy(value) {
+    if (value === undefined) return undefined;
+    var s = JSON.stringify(value);
+    return s === undefined ? undefined : JSON.parse(s);
+  }
+
+  // Arguments with the message (and the extension ID or options, which JSON
+  // leaves as they are) as JSON; a callback stays.
+  function jsonArgs(args) {
+    return args.map(function (a) { return typeof a === "function" ? a : jsonCopy(a); });
+  }
+
+  // An answer as Chrome would deliver it.
+  function sendable(value) {
+    if (value === null || (typeof value !== "object" && typeof value !== "function") || typeof structuredClone !== "function") return value;
+    try {
+      structuredClone(value);
+      return value;
+    } catch (e) {
+      if (!isCloneError(e)) return value;
+      try { return jsonCopy(value); } catch (x) { return value; }
+    }
+  }
+
+  function installMessageJsonFallback() {
+    if (!CONFIG.messageJson) return;
+    var patchedPorts = typeof WeakSet === "function" ? new WeakSet() : null;
+    function patchPort(port) {
+      if (!patchedPorts || !port || typeof port !== "object" || typeof port.postMessage !== "function" || patchedPorts.has(port)) return port;
+      patchedPorts.add(port);
+      var post = port.postMessage;
+      replaceMember(port, "postMessage", function (message) {
+        try {
+          return post.apply(port, arguments);
+        } catch (e) {
+          if (!isCloneError(e)) throw e;
+          var copy;
+          try { copy = jsonCopy(message); } catch (x) { throw e; }
+          return post.call(port, copy);
+        }
+      });
+      return port;
+    }
+
+    function wrapSend(ns, obj, name) {
+      var original = obj && obj[name];
+      if (typeof original !== "function") return;
+      replaceMember(obj, name, function () {
+        var args = Array.prototype.slice.call(arguments);
+        var last = args.length - 1;
+        if (last >= 0 && typeof args[last] === "function") {
+          var cb = args[last];
+          args[last] = function () {
+            var err = null;
+            try { err = ns.runtime.lastError; } catch (e) {}
+            if (err && isCloneError(err)) {
+              var retry = null;
+              try { retry = jsonArgs(args.slice(0, last)); } catch (e) {}
+              if (retry) return original.apply(obj, retry.concat([cb]));
+            }
+            return cb.apply(this, arguments);
+          };
+          return original.apply(obj, args);
+        }
+        var retryAsJson = function (e) {
+          if (!isCloneError(e)) throw e;
+          var retry;
+          try { retry = jsonArgs(args); } catch (x) { throw e; }
+          return original.apply(obj, retry);
+        };
+        var result;
+        try { result = original.apply(obj, args); } catch (e) { return retryAsJson(e); }
+        return result && typeof result.then === "function" ? result.then(null, retryAsJson) : result;
+      });
+    }
+
+    function wrapConnect(obj, name) {
+      var original = obj && obj[name];
+      if (typeof original !== "function") return;
+      replaceMember(obj, name, function () { return patchPort(original.apply(obj, arguments)); });
+    }
+
+    // Listener wrappers, keyed by the add-on's function so removeListener and
+    // hasListener work with the function it holds.
+    function wrapListeners(ev, wrap) {
+      if (!ev || typeof ev.addListener !== "function" || typeof WeakMap !== "function") return;
+      var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+      var wrappers = new WeakMap();
+      function wrapperOf(fn) {
+        var w = wrappers.get(fn);
+        if (!w) { w = wrap(fn); wrappers.set(fn, w); }
+        return w;
+      }
+      replaceMember(ev, "addListener", function (fn) {
+        if (typeof fn !== "function") return add.apply(ev, arguments);
+        var args = Array.prototype.slice.call(arguments);
+        args[0] = wrapperOf(fn);
+        return add.apply(ev, args);
+      });
+      if (typeof remove === "function") {
+        replaceMember(ev, "removeListener", function (fn) {
+          return remove.call(ev, (typeof fn === "function" && wrappers.get(fn)) || fn);
+        });
+      }
+      if (typeof has === "function") {
+        replaceMember(ev, "hasListener", function (fn) {
+          return has.call(ev, (typeof fn === "function" && wrappers.get(fn)) || fn);
+        });
+      }
+    }
+
+    function answering(fn) {
+      return function (message, sender, sendResponse) {
+        var args = Array.prototype.slice.call(arguments);
+        if (typeof sendResponse === "function") {
+          args[2] = function (response) { return sendResponse.call(this, sendable(response)); };
+        }
+        var result = fn.apply(this, args);
+        return result && typeof result === "object" && typeof result.then === "function" ? result.then(sendable) : result;
+      };
+    }
+
+    function connecting(fn) {
+      return function (port) {
+        patchPort(port);
+        return fn.apply(this, arguments);
+      };
+    }
+
+    namespaces.forEach(function (ns) {
+      var rt = null, tabs = null;
+      try { rt = ns.runtime; } catch (e) {}
+      try { tabs = ns.tabs; } catch (e) {}
+      if (rt) {
+        wrapSend(ns, rt, "sendMessage");
+        wrapConnect(rt, "connect");
+        ["onMessage", "onMessageExternal"].forEach(function (name) {
+          var ev = null;
+          try { ev = rt[name]; } catch (e) {}
+          wrapListeners(ev, answering);
+        });
+        ["onConnect", "onConnectExternal"].forEach(function (name) {
+          var ev = null;
+          try { ev = rt[name]; } catch (e) {}
+          wrapListeners(ev, connecting);
+        });
+      }
+      if (tabs) {
+        wrapSend(ns, tabs, "sendMessage");
+        wrapConnect(tabs, "connect");
+      }
+    });
+  }
+
   // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
   // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
   // such as Cookie or Referer; Firefox shows every header without it, has no
@@ -2122,5 +2291,6 @@
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
+  try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
