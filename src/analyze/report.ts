@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Issue, Manifest, Severity } from "../types.js";
-import { cspWildcardHostPaths, withoutPortWildcard } from "../manifest/manifest.js";
+import { cspLocalhostSources, cspWildcardHostPaths, withoutPortWildcard } from "../manifest/manifest.js";
 import { color } from "../util.js";
 
 /**
@@ -107,6 +107,13 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   };
   const cspPorted = [...new Set(cspSources(before))].filter((s) => !cspSources(after).includes(s));
   if (cspPorted.length) out.push(`Wrote the default port after the wildcard host in CSP source(s) ${quoted(cspPorted)} (Firefox drops a wildcard host followed by a path).`);
+
+  const pagesCsp = (m: Manifest): string => {
+    const csp = m.content_security_policy;
+    return (m.manifest_version ?? 2) >= 3 && typeof csp === "object" && typeof csp.extension_pages === "string" ? csp.extension_pages : "";
+  };
+  const localhost = cspLocalhostSources(pagesCsp(before)).filter((s) => !cspLocalhostSources(pagesCsp(after)).includes(s));
+  if (localhost.length) out.push(`Removed the local development server source(s) ${quoted(localhost)} from \`content_security_policy.extension_pages\` (Firefox drops the whole policy over them on install).`);
 
   const overridesBefore = before.chrome_url_overrides;
   if (overridesBefore && typeof overridesBefore === "object") {

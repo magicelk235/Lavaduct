@@ -421,6 +421,40 @@ export function withWildcardHostPorts(csp: string): string {
     `${lead}${origin}:${CSP_DEFAULT_PORTS[scheme.toLowerCase()]}${path}`);
 }
 
+// Chrome lets an MV3 extension_pages policy name a local dev server in script-src
+// (React DevTools' standalone http://localhost:8097), and a packed extension's
+// pages never load from it. Firefox checks script-src and worker-src and takes a
+// localhost source there only from a temporarily loaded add-on: a signed or
+// unsigned install drops the whole policy, 'wasm-unsafe-eval' with it.
+const LOCALHOST_CSP_SOURCE = /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::(?:\d+|\*))?(?:\/\S*)?$/i;
+const LOCALHOST_CHECKED_DIRECTIVE = /^(?:script-src|worker-src)$/i;
+
+function splitLocalhostSources(csp: string): { policy: string; removed: string[] } {
+  const removed: string[] = [];
+  const policy = csp
+    .split(";")
+    .map((directive) => {
+      const tokens = directive.trim().split(/\s+/);
+      if (!LOCALHOST_CHECKED_DIRECTIVE.test(tokens[0])) return directive;
+      const kept = tokens.filter((t, i) => i === 0 || !LOCALHOST_CSP_SOURCE.test(t));
+      if (kept.length === tokens.length) return directive;
+      removed.push(...tokens.filter((t) => !kept.includes(t)));
+      return /^\s*/.exec(directive)?.[0] + kept.join(" ");
+    })
+    .join(";");
+  return { policy, removed };
+}
+
+/** The localhost sources Firefox refuses in an MV3 extension_pages policy. */
+export function cspLocalhostSources(csp: string): string[] {
+  return splitLocalhostSources(csp).removed;
+}
+
+function extensionPagesCsp(m: Manifest): string | undefined {
+  const csp = m.content_security_policy;
+  return (m.manifest_version ?? 2) >= 3 && typeof csp === "object" && csp !== null && typeof csp.extension_pages === "string" ? csp.extension_pages : undefined;
+}
+
 // Manifest keys Firefox added after its first Manifest V3 release, and what an older
 // Firefox does when it meets them.
 const KEY_GATES: Array<{ since: string; applies: (m: Manifest) => boolean; message: string; category: string }> = [
@@ -689,9 +723,12 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   // rules on purpose. A bare string is the MV2 form.
   const cspObj = m.content_security_policy;
   const csp = typeof cspObj === "string" ? cspObj : typeof cspObj?.extension_pages === "string" ? cspObj.extension_pages : "";
+  const pages = extensionPagesCsp(m);
+  const localhostSrc = new Set(pages === undefined ? [] : cspLocalhostSources(pages));
   const remoteSrc = new Set<string>();
   for (const dm of csp.matchAll(/(?:^|;)\s*script-src(?:-elem)?\s+([^;]+)/gi)) {
     for (const token of dm[1].trim().split(/\s+/)) {
+      if (localhostSrc.has(token)) continue;
       if (token === "*" || /^(https?:|\/\/|wss?:|\*:)/i.test(token) || /^(?:\*\.)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?$/i.test(token)) {
         remoteSrc.add(token);
       }
@@ -704,6 +741,15 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       message: `CSP script-src allows remote origin(s) (${[...remoteSrc].join(", ")}); Firefox refuses remote scripts in Manifest V3, and AMO's policies forbid loading remote code.`,
       file: "manifest.json",
       fix: "Bundle the script into the extension and load it locally.",
+    });
+  }
+  if (localhostSrc.size > 0) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `CSP extension_pages names a local development server (${[...localhostSrc].join(", ")}); Firefox takes that only from a temporarily loaded add-on and drops the whole policy on install, so the source is removed. A packed Chrome extension never loads from it either.`,
+      file: "manifest.json",
+      autoFixed: true,
     });
   }
 
@@ -1121,6 +1167,9 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   }
 
   mapManifestCsps(out, withWildcardHostPorts);
+  if (extensionPagesCsp(out) !== undefined) {
+    mapManifestCsps(out, (policy, where) => (where === "extension_pages" ? splitLocalhostSources(policy).policy : policy));
+  }
 
   // An extension that only adds rules at runtime may declare rule_resources: [],
   // which Chrome accepts. Firefox wants at least one ruleset there and refuses the
