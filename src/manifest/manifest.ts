@@ -639,11 +639,15 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   }
 
   const war: unknown[] = Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : [];
-  if (war.some((e) => typeof e === "object" && e !== null && "use_dynamic_url" in e)) {
+  const dynamic = war.filter((e): e is object => typeof e === "object" && e !== null && "use_dynamic_url" in e);
+  if (dynamic.length) {
+    const bare = dynamic.some((e) => !("matches" in e) && !("extension_ids" in e));
     issues.push({
       severity: "info",
       category: "resources",
-      message: "web_accessible_resources use_dynamic_url is Chrome-only; it is removed, and the resources load from their regular moz-extension:// URL.",
+      message:
+        "web_accessible_resources use_dynamic_url is Chrome-only; it is removed, and the resources load from their regular moz-extension:// URL." +
+        (bare ? " An entry left with neither matches nor extension_ids, which Firefox refuses the whole manifest over, goes with it; it opened its files to no web page." : ""),
       file: "manifest.json",
       fix: "Firefox already gives every install its own random moz-extension:// host.",
       autoFixed: true,
@@ -955,7 +959,11 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     out.web_accessible_resources = out.web_accessible_resources.filter((entry: unknown) => {
       if (typeof entry !== "object" || entry === null) return true;
       Reflect.deleteProperty(entry, "use_dynamic_url");
-      if (!("matches" in entry) || !Array.isArray(entry.matches)) return true;
+      // Chrome takes use_dynamic_url as an entry's only key besides resources, and
+      // such an entry opens its files to no web page. Firefox refuses the whole
+      // manifest over an entry with neither matches nor extension_ids.
+      if (!("matches" in entry)) return "extension_ids" in entry;
+      if (!Array.isArray(entry.matches)) return true;
       const kept = entry.matches.filter((p: unknown) => typeof p === "string" && matchPatternError(p) === null);
       if (kept.length === entry.matches.length) return true;
       if (kept.length) {
