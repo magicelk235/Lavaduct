@@ -62,6 +62,16 @@ const CONFIG_KEYS: Record<string, "string" | "boolean"> = {
 // user typed the short form.
 const CONFIG_SHORT_ALIAS: Record<string, string> = { output: "o" };
 
+// Config keys that give way to another typed flag: their opposite switch, or a
+// flag they can't be combined with. Otherwise the config would contradict the
+// flag the user typed and fail the run.
+const CONFIG_OVERRIDDEN_BY: Record<string, string> = {
+  "native-hosts": "no-native-hosts",
+  "no-native-hosts": "native-hosts",
+  debug: "no-shim",
+  "no-shim": "debug",
+};
+
 interface LoadedConfig {
   path: string | null;
   applied: Set<string>;
@@ -107,14 +117,16 @@ function applyConfig(values: Record<string, unknown>, explicitPath: string | und
     }
     // The short alias appears bare (-o dir), attached (-odir) or grouped behind
     // boolean shorts (-qo dir); parseArgs accepts all of them.
-    const short = CONFIG_SHORT_ALIAS[key];
-    if (
-      argv.includes(`--${key}`) ||
-      argv.some((a) => a.startsWith(`--${key}=`)) ||
-      (short !== undefined && argv.some((a) => new RegExp(`^-(?!-)[A-Za-z]*${short}`).test(a)))
-    ) {
-      continue;
-    }
+    const typed = (flag: string) => {
+      const short = CONFIG_SHORT_ALIAS[flag];
+      return (
+        argv.includes(`--${flag}`) ||
+        argv.some((a) => a.startsWith(`--${flag}=`)) ||
+        (short !== undefined && argv.some((a) => new RegExp(`^-(?!-)[A-Za-z]*${short}`).test(a)))
+      );
+    };
+    const opposite = Object.hasOwn(CONFIG_OVERRIDDEN_BY, key) ? CONFIG_OVERRIDDEN_BY[key] : undefined;
+    if (typed(key) || (opposite !== undefined && typed(opposite))) continue;
     values[key] = val;
     applied.add(key);
   }
