@@ -144,11 +144,28 @@ export function extensionContext(bus, { href, tabs, page, frames, zoom = 1, capt
   return { browser };
 }
 
-/** A background page with one attached-to-be tab. */
+/**
+ * A background page with one attached-to-be tab. The tab's frames get the
+ * `browser.runtime.sendMessage` a content script has, which reaches the
+ * background's listeners as from that tab and frame.
+ */
 export function setup({ page = makePage(), frames, zoom = 1, tabs = { 1: { url: "https://example.test/", title: "Test page" } } } = {}) {
   const bus = makeBus();
   const captures = [];
   const bg = extensionContext(bus, { href: EXT_ORIGIN + "/_generated_background_page.html", tabs, page, frames, zoom, captures });
+  const tabId = Number(Object.keys(tabs)[0]);
+  for (const [frameId, context] of Object.entries(frames || { 0: page })) {
+    context.browser = {
+      runtime: {
+        getFrameId: () => -1,
+        sendMessage(message) {
+          const sender = { id: bg.browser.runtime.id, tab: { id: tabId }, frameId: Number(frameId), url: "https://example.test/" };
+          for (const fn of bg.browser.runtime.onMessage.listeners.slice()) fn(JSON.parse(JSON.stringify(message)), sender, () => {});
+          return Promise.resolve();
+        },
+      },
+    };
+  }
   return { bus, bg, page, captures, tabs };
 }
 

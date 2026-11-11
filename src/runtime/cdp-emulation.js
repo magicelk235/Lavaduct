@@ -661,23 +661,34 @@
       };
       return reg.report;
     }
+    // The page may wrap a hooked method again after the hook went in. So
+    // unhooking restores only methods that are still the hook's own, and a
+    // hook left inside a page's wrapper turns back into the original.
     function hookDialogs() {
       if (reg.hooks.dialogs) return;
       var report = reporter();
       var text = function (v) { return v === undefined ? "" : String(v); };
-      reg.hooks.dialogs = { alert: W.alert, confirm: W.confirm, prompt: W.prompt };
-      W.alert = function alert(message) {
+      var hook = { originals: { alert: W.alert, confirm: W.confirm, prompt: W.prompt }, wrappers: {} };
+      var off = function (name, self, args) { return hook.originals[name].apply(self, args); };
+      hook.wrappers.alert = function alert(message) {
+        if (reg.hooks.dialogs !== hook) return off("alert", this, arguments);
         report({ kind: "dialog", type: "alert", message: text(message), url: location.href }, true);
       };
-      W.confirm = function confirm(message) {
+      hook.wrappers.confirm = function confirm(message) {
+        if (reg.hooks.dialogs !== hook) return off("confirm", this, arguments);
         report({ kind: "dialog", type: "confirm", message: text(message), url: location.href }, true);
         return true;
       };
-      W.prompt = function prompt(message, defaultValue) {
+      hook.wrappers.prompt = function prompt(message, defaultValue) {
+        if (reg.hooks.dialogs !== hook) return off("prompt", this, arguments);
         var d = text(defaultValue);
         report({ kind: "dialog", type: "prompt", message: text(message), defaultPrompt: d, url: location.href }, true);
         return d;
       };
+      W.alert = hook.wrappers.alert;
+      W.confirm = hook.wrappers.confirm;
+      W.prompt = hook.wrappers.prompt;
+      reg.hooks.dialogs = hook;
     }
     function consoleArg(v) {
       var t = typeof v;
@@ -697,15 +708,15 @@
       var report = reporter();
       var c = W.console;
       var TYPES = { warn: "warning", group: "startGroup", groupCollapsed: "startGroupCollapsed", groupEnd: "endGroup" };
-      var originals = {};
+      var hook = { originals: {}, wrappers: {} };
       ["log", "info", "warn", "error", "debug", "dir", "dirxml", "table", "trace", "clear", "group", "groupCollapsed", "groupEnd", "assert", "count", "timeEnd"].forEach(function (m) {
         var f = c[m];
         if (typeof f !== "function") return;
-        originals[m] = f;
-        c[m] = function () {
+        hook.originals[m] = f;
+        c[m] = hook.wrappers[m] = function () {
           try {
             var args = Array.prototype.slice.call(arguments);
-            if (m !== "assert" || !args[0]) {
+            if (reg.hooks.console === hook && (m !== "assert" || !args[0])) {
               if (m === "assert") args = ["Assertion failed:"].concat(args.slice(1));
               report({ kind: "console", type: TYPES[m] || m, args: args.slice(0, 50).map(consoleArg), t: Date.now(), frames: frames(new Error().stack, 1) });
             }
@@ -738,20 +749,25 @@
       };
       W.addEventListener("error", onError);
       W.addEventListener("unhandledrejection", onRejection);
-      reg.hooks.console = { originals: originals, onError: onError, onRejection: onRejection };
+      hook.onError = onError;
+      hook.onRejection = onRejection;
+      reg.hooks.console = hook;
+    }
+    function restore(obj, hook) {
+      Object.keys(hook.wrappers || {}).forEach(function (m) {
+        if (obj[m] === hook.wrappers[m]) obj[m] = hook.originals[m];
+      });
     }
     function unhook(what) {
       var h = reg.hooks;
       if (h.console && what !== "dialogs") {
-        Object.keys(h.console.originals).forEach(function (m) { W.console[m] = h.console.originals[m]; });
+        restore(W.console, h.console);
         W.removeEventListener("error", h.console.onError);
         W.removeEventListener("unhandledrejection", h.console.onRejection);
         h.console = null;
       }
       if (h.dialogs && what !== "console") {
-        W.alert = h.dialogs.alert;
-        W.confirm = h.dialogs.confirm;
-        W.prompt = h.dialogs.prompt;
+        restore(W, h.dialogs);
         h.dialogs = null;
       }
     }
