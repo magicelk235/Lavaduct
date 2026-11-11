@@ -34,6 +34,26 @@ function u64(buf: Buffer, at: number): number {
   return Number(v);
 }
 
+// The zip format says a name without the UTF-8 flag (bit 11) is code page 437,
+// which is what Windows' built-in zipper and older tools write. Many other tools
+// write UTF-8 without setting the flag, so a name that decodes as UTF-8 is taken
+// as UTF-8 and only the rest as CP437; decoding those as UTF-8 too turned every
+// byte above 0x7f into U+FFFD, and a manifest naming the file never found it.
+const CP437_HIGH =
+  "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u00a0";
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
+
+function entryName(raw: Buffer, flags: number): string {
+  if (flags & 0x0800) return raw.toString("utf-8");
+  try {
+    return UTF8.decode(raw);
+  } catch {
+    let s = "";
+    for (const b of raw) s += b < 0x80 ? String.fromCharCode(b) : CP437_HIGH[b - 0x80];
+    return s;
+  }
+}
+
 /** Offset of the end-of-central-directory record, searched backwards over the comment window. */
 function findEocd(buf: Buffer): number {
   const stop = Math.max(0, buf.length - EOCD_SIZE - MAX_COMMENT);
@@ -109,7 +129,7 @@ function readCentralDirectory(buf: Buffer): CentralEntry[] {
     const nameStart = p + 46;
     const extraStart = nameStart + nameLen;
     if (extraStart + extraLen > buf.length) throw new Error("Corrupt zip archive (truncated central directory)");
-    const name = buf.toString("utf-8", nameStart, extraStart);
+    const name = entryName(buf.subarray(nameStart, extraStart), flags);
 
     // The zip64 extra field carries only the values whose 32-bit slot is maxed out, in this order.
     if (size === 0xffffffff || compressedSize === 0xffffffff || localOffset === 0xffffffff) {
