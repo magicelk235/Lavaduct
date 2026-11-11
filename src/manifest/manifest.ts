@@ -864,8 +864,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: 
     }
   }
 
-  const icons = m.icons;
-  if (!icons || typeof icons !== "object" || Object.keys(icons).length === 0) {
+  if (needsPlaceholderIcons(m)) {
     issues.push({
       severity: "info",
       category: "ui",
@@ -874,9 +873,28 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: 
       fix: "Replace it with real icons for production.",
       autoFixed: true,
     });
+  } else if (!m.icons || typeof m.icons !== "object" || Object.keys(m.icons).length === 0) {
+    issues.push({
+      severity: "info",
+      category: "ui",
+      message: "Only the toolbar button declares icons (action.default_icon); Firefox's add-ons manager shows a generic icon for this add-on.",
+      file: "manifest.json",
+      fix: "Add an icons key to the manifest.",
+    });
   }
 
   return { issues, permissionsToRemove };
+}
+
+/**
+ * Whether the conversion writes a placeholder icon set: the manifest declares no
+ * icons, and no action or browser_action icon either (MV3 allows icons declared
+ * only there). The analyzer and synthesizePlaceholderIcons share this test.
+ */
+export function needsPlaceholderIcons(m: Manifest): boolean {
+  if (m.icons && typeof m.icons === "object" && Object.keys(m.icons).length > 0) return false;
+  const actionIcon = (m.action ?? m.browser_action)?.default_icon;
+  return !(actionIcon && (typeof actionIcon === "string" || (typeof actionIcon === "object" && Object.keys(actionIcon).length > 0)));
 }
 
 /**

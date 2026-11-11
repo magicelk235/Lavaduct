@@ -2,7 +2,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import type { Manifest } from "../types.js";
-import { wireActionIcons } from "../manifest/manifest.js";
+import { needsPlaceholderIcons, wireActionIcons } from "../manifest/manifest.js";
 
 const SIZES = [48, 128, 256, 512];
 
@@ -100,11 +100,8 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
  * No-op when the manifest already declares any icon. Returns the sizes written.
  */
 export function synthesizePlaceholderIcons(stageDir: string, manifest: Manifest, appName: string): number[] {
-  if (manifest.icons && Object.keys(manifest.icons).length > 0) return [];
-  // MV3 allows icons declared only under action.default_icon — respect those too.
+  if (!needsPlaceholderIcons(manifest)) return [];
   const existingAction = (manifest.action ?? manifest.browser_action) as Record<string, unknown> | undefined;
-  const actionIcon = existingAction?.default_icon;
-  if (actionIcon && (typeof actionIcon === "string" || Object.keys(actionIcon).length > 0)) return [];
 
   const [r, g, b] = colorFor(appName);
   const icons: Record<string, string> = {};
@@ -119,7 +116,7 @@ export function synthesizePlaceholderIcons(stageDir: string, manifest: Manifest,
   manifest.icons = icons;
 
   // Wire the toolbar button to the same set if an action exists. Reaching here
-  // means the line-105 guard found no usable default_icon (absent, or an empty
+  // means needsPlaceholderIcons found no usable default_icon (absent, or an empty
   // {}), so assign unconditionally — a truthiness check would skip the {} case.
   if (existingAction) existingAction.default_icon = { ...icons };
   // The author declared no icon anywhere, so a sidebar without one is filled too.
