@@ -313,7 +313,9 @@ export function insertAtHeadStart(html: string, markup: string): string {
   if (at >= 0) return html.slice(0, at) + "\n    " + markup + html.slice(at);
   const doctype = new RegExp(BOM_RE.source + "?(?:\\s|<!--[\\s\\S]*?-->)*<!doctype\\b[^>]*>", "i").exec(html);
   if (doctype) return html.slice(0, doctype[0].length) + "\n" + markup + html.slice(doctype[0].length);
-  return markup + "\n" + html;
+  // The byte order mark only declares UTF-8 at the very start of the file.
+  const bom = BOM_RE.exec(html)?.[0] ?? "";
+  return bom + markup + "\n" + html.slice(bom.length);
 }
 
 function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
