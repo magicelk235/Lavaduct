@@ -294,7 +294,7 @@ function wireReceiver(stageDir: string, manifest: Manifest): void {
 }
 
 const TRIVIA_RE = /(?:\uFEFF|\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*/y;
-const DIRECTIVE_RE = /(["'])(?:(?!\1)[^\\\r\n]|\\.)*\1[ \t]*(;)?(?=[ \t]*(?:\r?\n|$)|(?<=;))/y;
+const DIRECTIVE_RE = /(["'])(?:(?!\1)[^\\\r\n]|\\.)*\1[ \t]*(;)?(?=[ \t]*(?:\r?\n|$|\/\/|\/\*)|(?<=;))/y;
 
 /**
  * End of a script's directive prologue ("use strict"; and friends), so code can be
@@ -314,9 +314,11 @@ function directivePrologueEnd(src: string): number {
     if (!m) return end;
     if (!m[2]) {
       // Without a semicolon the string only ends the statement if the next line
-      // can't continue the expression.
-      const next = /\S/.exec(src.slice(DIRECTIVE_RE.lastIndex));
-      if (next && /[.([`+\-*/%,?=<>&|]/.test(next[0])) return end;
+      // can't continue the expression. Comments in between don't count.
+      TRIVIA_RE.lastIndex = DIRECTIVE_RE.lastIndex;
+      TRIVIA_RE.exec(src);
+      const next = src.charAt(TRIVIA_RE.lastIndex);
+      if (next && /[.([`+\-*/%,?=<>&|]/.test(next)) return end;
     }
     at = DIRECTIVE_RE.lastIndex;
     end = at;
