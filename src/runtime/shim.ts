@@ -305,11 +305,13 @@ function headInsertIndex(html: string): number {
  * Insert markup at the top of the page's head. A page with no `<head>` tag gets it
  * after its doctype: anything but whitespace or comments ahead of `<!DOCTYPE html>`
  * drops the page into quirks mode, which reflows layout built for standards mode.
+ * A UTF-8 byte order mark may lead, decoded (U+FEFF) or as latin1 bytes.
  */
+const BOM_RE = /^(?:\uFEFF|\u00EF\u00BB\u00BF)/;
 export function insertAtHeadStart(html: string, markup: string): string {
   const at = headInsertIndex(html);
   if (at >= 0) return html.slice(0, at) + "\n    " + markup + html.slice(at);
-  const doctype = /^(?:\uFEFF)?(?:\s|<!--[\s\S]*?-->)*<!doctype\b[^>]*>/i.exec(html);
+  const doctype = new RegExp(BOM_RE.source + "?(?:\\s|<!--[\\s\\S]*?-->)*<!doctype\\b[^>]*>", "i").exec(html);
   if (doctype) return html.slice(0, doctype[0].length) + "\n" + markup + html.slice(doctype[0].length);
   return markup + "\n" + html;
 }
@@ -337,14 +339,18 @@ function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
  * root-absolute so it resolves from any depth. Classic scripts in <head> run
  * before deferred and module scripts, so the shim is in place before the page's
  * bundle evaluates. Returns the number of pages changed.
+ *
+ * Pages are read and written as latin1, one character per byte, so a page in
+ * windows-1252 or another non-UTF-8 charset keeps its bytes: the tags looked
+ * for and the markup inserted are ASCII either way.
  */
 export function injectShimIntoHtmlPages(dir: string, shimFile: string): number {
   const tag = `<script src="/${shimFile}"></script>`;
   let count = 0;
   for (const file of walkHtmlFiles(dir)) {
-    const html = readFileSync(file, "utf-8");
+    const html = readFileSync(file, "latin1");
     if (html.includes(tag)) continue;
-    writeFileSync(file, insertAtHeadStart(html, tag), "utf-8");
+    writeFileSync(file, insertAtHeadStart(html, tag), "latin1");
     count++;
   }
   return count;
