@@ -81,10 +81,13 @@ export function findFirefox(selector?: string): FirefoxInstall {
 /**
  * File and folder name for an extension: its name without spaces or punctuation.
  * Combining marks stay with their letters (Indic vowel signs, accents), and the
- * name is composed first, so a decomposed spelling gives the same name.
+ * name is composed first, so a decomposed spelling gives the same name. Windows
+ * keeps device names like CON and COM1 with any extension (Con.xpi), so those get
+ * a trailing "_" on every OS.
  */
 function deriveAppName(name: string): string {
-  return name.normalize("NFC").replace(/[^\p{L}\p{M}\p{N}_-]+/gu, "") || "Extension";
+  const stripped = name.normalize("NFC").replace(/[^\p{L}\p{M}\p{N}_-]+/gu, "") || "Extension";
+  return /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])$/i.test(stripped) ? `${stripped}_` : stripped;
 }
 
 /**
