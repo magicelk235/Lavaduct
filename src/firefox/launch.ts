@@ -99,6 +99,18 @@ export async function quitFirefoxForProfile(install: FirefoxInstall, profilePath
 }
 
 /**
+ * The executable of the Firefox that has the profile open, when it comes from
+ * another install than `install`. Undefined when no Firefox has the profile
+ * open, it is this install's, or the holder can't be told.
+ */
+export function otherInstallHolding(install: FirefoxInstall, profilePath: string): string | undefined {
+  if (!profileInUse(profilePath)) return undefined;
+  const exe = holderOf(install, profilePath)?.exe;
+  const dirs = [install.installDir, platform.profileSetup(install).hashDir].map(pathKey);
+  return exe && !dirs.includes(pathKey(dirname(exe))) ? exe : undefined;
+}
+
+/**
  * Hand an .xpi to Firefox, which shows its install prompt. If Firefox already
  * has the profile open, the new process forwards the request to it and
  * exits. Forwarding matches on the profile path as the running Firefox
@@ -110,14 +122,9 @@ export async function quitFirefoxForProfile(install: FirefoxInstall, profilePath
  * running" dialog.
  */
 export function openXpiInFirefox(install: FirefoxInstall, profile: FirefoxProfile, xpiPath: string): void {
-  if (profileInUse(profile.path)) {
-    const exe = holderOf(install, profile.path)?.exe;
-    const dirs = [install.installDir, platform.profileSetup(install).hashDir].map(pathKey);
-    if (exe && !dirs.includes(pathKey(dirname(exe)))) {
-      throw new Error(
-        `${profile.path} is open in the Firefox at ${exe}. Quit that Firefox first, or pass --firefox "${exe}".`,
-      );
-    }
+  const exe = otherInstallHolding(install, profile.path);
+  if (exe) {
+    throw new Error(`${profile.path} is open in the Firefox at ${exe}. Quit that Firefox first, or pass --firefox "${exe}".`);
   }
   openProfileInFirefox(install, profile, [resolve(xpiPath)]);
 }

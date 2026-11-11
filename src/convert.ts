@@ -37,7 +37,7 @@ import { signWithAmo } from "./sign/amo.js";
 import { zipDirectory } from "./zip/write.js";
 import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firefox/locate.js";
 import { dedicatedProfile, profileDowngradeProblem, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
-import { openXpiInFirefox, quitFirefoxForProfile, startedBeforeUserJs } from "./firefox/launch.js";
+import { openXpiInFirefox, otherInstallHolding, quitFirefoxForProfile, startedBeforeUserJs } from "./firefox/launch.js";
 import { BidiSession } from "./firefox/bidi.js";
 import { RdpSession } from "./firefox/rdp.js";
 import {
@@ -434,8 +434,15 @@ async function installTemporarily(
   if (opts.headless) return installHeadless({ install, profile }, stageDir, addonId, staticRules);
   // A Firefox that an earlier temporary install started still has its devtools
   // server: load this add-on next to the others rather than restart it,
-  // which would drop them.
+  // which would drop them. Unless it is another install than the one
+  // --firefox picks: then the add-on would land in a Firefox nobody asked for.
   let session = await RdpSession.attach(profile.path);
+  const other = session && opts.firefox !== undefined ? otherInstallHolding(install, profile.path) : undefined;
+  if (session && other) {
+    session.end();
+    session = undefined;
+    info(`${profile.path} is open in the Firefox at ${other}, not the one --firefox picks.`);
+  }
   if (session) {
     info(`Using the Firefox that already has ${profile.path} open with remote debugging on`);
     if (raiseRuleLimit(profile.path, staticRules)) warn(RULE_LIMIT_RESTART);
