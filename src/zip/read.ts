@@ -57,20 +57,22 @@ function readCentralDirectory(buf: Buffer): CentralEntry[] {
   let cdOffset = buf.readUInt32LE(eocd + 16);
   let cdEnd = eocd;
 
+  // A zip64 end record sits right before its locator, which sits right before
+  // the EOCD. The locator's offset is as written, so bytes prepended to the
+  // archive leave it short; the record's fixed-size form then ends exactly at
+  // the locator. Either way the central directory ends where the record starts.
   const locator = eocd - 20;
-  if (
-    (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) &&
-    locator >= 0 &&
-    buf.readUInt32LE(locator) === SIG_ZIP64_LOCATOR
-  ) {
-    const z = u64(buf, locator + 8);
-    if (z + 56 > buf.length || buf.readUInt32LE(z) !== SIG_ZIP64_EOCD) {
-      throw new Error("Corrupt zip64 archive (bad zip64 end-of-central-directory record)");
+  if (locator >= 0 && buf.readUInt32LE(locator) === SIG_ZIP64_LOCATOR) {
+    let z = u64(buf, locator + 8);
+    if (z + 56 > locator || buf.readUInt32LE(z) !== SIG_ZIP64_EOCD) z = locator - 56;
+    const found = z >= 0 && buf.readUInt32LE(z) === SIG_ZIP64_EOCD;
+    if (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+      if (!found) throw new Error("Corrupt zip64 archive (bad zip64 end-of-central-directory record)");
+      count = u64(buf, z + 32);
+      cdSize = u64(buf, z + 40);
+      cdOffset = u64(buf, z + 48);
     }
-    count = u64(buf, z + 32);
-    cdSize = u64(buf, z + 40);
-    cdOffset = u64(buf, z + 48);
-    cdEnd = z;
+    if (found) cdEnd = z;
   }
 
   // Offsets normally count from the start of the buffer. omni.ja puts its
