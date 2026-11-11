@@ -1764,6 +1764,12 @@
     identity: {
       AccountStatus: ["SYNC", "ANY"],
     },
+    // Firefox's has INSTALL, UPDATE and BROWSER_UPDATE. Chrome code compares a
+    // repeat with OnInstalledReason.CHROME_UPDATE, the reason the onInstalled
+    // wrapper gives a temporary add-on loaded again.
+    runtime: {
+      OnInstalledReason: ["install", "update", "chrome_update", "shared_module_update"],
+    },
     storage: {
       AccessLevel: ["TRUSTED_AND_UNTRUSTED_CONTEXTS", "TRUSTED_CONTEXTS"],
     },
