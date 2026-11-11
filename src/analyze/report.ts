@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Issue, Manifest, Severity } from "../types.js";
-import { withoutPortWildcard } from "../manifest/manifest.js";
+import { cspWildcardHostPaths, withoutPortWildcard } from "../manifest/manifest.js";
 import { color } from "../util.js";
 
 /**
@@ -74,6 +74,10 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     const required = gecko.data_collection_permissions?.required;
     if (Array.isArray(required)) parts.push(`data_collection_permissions.required \`${required.join(", ")}\``);
     out.push(`Set \`browser_specific_settings.gecko\`${parts.length ? `: ${parts.join(", ")}` : ""}.`);
+    const max = before.browser_specific_settings?.gecko?.strict_max_version;
+    if (typeof max === "string" && gecko.strict_max_version === undefined) {
+      out.push(`Removed \`browser_specific_settings.gecko.strict_max_version\` \`${max}\`, below the minimum Firefox version; no Firefox would install the add-on.`);
+    }
   } else if (!gecko && before.browser_specific_settings?.gecko) {
     out.push("Removed `browser_specific_settings.gecko` (Android-only build).");
   }
@@ -98,6 +102,15 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     typeof m.content_security_policy === "object" ? m.content_security_policy.sandbox : (m.sandbox as Record<string, unknown> | undefined)?.content_security_policy;
   if (sandboxCsp(before) === undefined && sandboxCsp(after) !== undefined)
     out.push("Added Chrome's default sandbox CSP (Firefox would apply script-src 'self' to the sandbox pages, blocking eval and inline scripts).");
+
+  const cspSources = (m: Manifest): string[] => {
+    const csp = m.content_security_policy;
+    const sandbox = (m.sandbox as Record<string, unknown> | undefined)?.content_security_policy;
+    const all = [...(typeof csp === "string" ? [csp] : Object.values(csp ?? {})), sandbox].filter((p): p is string => typeof p === "string");
+    return all.flatMap(cspWildcardHostPaths);
+  };
+  const cspPorted = [...new Set(cspSources(before))].filter((s) => !cspSources(after).includes(s));
+  if (cspPorted.length) out.push(`Wrote the default port after the wildcard host in CSP source(s) ${quoted(cspPorted)} (Firefox drops a wildcard host followed by a path).`);
 
   const overridesBefore = before.chrome_url_overrides;
   if (overridesBefore && typeof overridesBefore === "object") {

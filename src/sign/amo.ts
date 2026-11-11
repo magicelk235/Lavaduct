@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { cacheDir, readState, stateDir, writeState } from "../state.js";
@@ -38,6 +38,42 @@ const POLICY_NOTICE =
   "https://extensionworkshop.com/documentation/publish/add-on-policies/";
 
 const ADDON_VERSION_FIX = "Pass --addon-version <x.y.z.w> with a version this add-on has never used on AMO.";
+
+// addons-linter (src/const.js MAX_FILE_SIZE_TO_PARSE_MB, src/linter.js scanFile)
+// won't parse a file it reads as text from 5 MiB up and reports FILE_TOO_LARGE as
+// a validation error, so AMO refuses to sign the package. It reads as text the
+// files its HTML, JavaScript, JSON and language-pack scanners take; everything
+// else (CSS, images, wasm) goes through its binary scanner, which has no limit.
+const AMO_MAX_TEXT_FILE_BYTES = 5 * 1024 * 1024;
+const AMO_TEXT_FILE_RE = /\.(html?|m?js|jsm|json|properties|ftl|dtd)$/i;
+
+/**
+ * The files in `dir` (a staged add-on) that AMO's validator refuses as too large to
+ * parse, as warnings of category "amo". The amo route stops on them before
+ * uploading, since AMO would reject the version.
+ */
+export function filesTooLargeForAmo(dir: string): Issue[] {
+  const issues: Issue[] = [];
+  const walk = (sub: string) => {
+    for (const entry of readdirSync(join(dir, sub), { withFileTypes: true })) {
+      const rel = sub ? `${sub}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) walk(rel);
+      else if (entry.isFile() && AMO_TEXT_FILE_RE.test(entry.name)) {
+        const size = statSync(join(dir, rel)).size;
+        if (size < AMO_MAX_TEXT_FILE_BYTES) continue;
+        issues.push({
+          severity: "warning",
+          category: "amo",
+          message: `${rel} is ${(size / 1024 / 1024).toFixed(1)} MiB; AMO's validator refuses text files of 5 MiB or more (FILE_TOO_LARGE), so AMO won't sign this add-on.`,
+          file: rel,
+          fix: "Split the file in the extension's own build (lavaduct doesn't), or install it with --sign unsigned or --sign temporary.",
+        });
+      }
+    }
+  };
+  walk("");
+  return issues;
+}
 
 export interface SignWithAmoOptions {
   addonId: string;
