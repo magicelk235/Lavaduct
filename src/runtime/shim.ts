@@ -67,6 +67,7 @@ const SW_REGISTRATION_REF_RE = /\b(?:self|globalThis)\s*\.\s*registration\s*(?:\
 const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
 const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
+const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
 
 interface Usage {
   favicon: boolean;
@@ -78,12 +79,14 @@ interface Usage {
   pushManager: boolean;
   locks: boolean;
   permissions: boolean;
+  extraHeaders: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false, permissions: false,
+    extraHeaders: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -103,6 +106,7 @@ function scanUsage(dir: string): Usage {
       if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
+      if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
     }
   }
   return found;
@@ -142,6 +146,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
+    extraHeaders: usage.extraHeaders,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so

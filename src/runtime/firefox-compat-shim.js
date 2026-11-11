@@ -1908,6 +1908,36 @@
     } catch (e) {}
   }
 
+  // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
+  // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
+  // such as Cookie or Referer; Firefox shows every header without it, has no
+  // such value, and refuses the whole listener ("Invalid enumeration value").
+  // Each webRequest event's addListener drops it from the spec; the add-on's
+  // function is passed through as it is, so removeListener and hasListener
+  // still find it. Only emitted for a bundle that names extraHeaders.
+  function installWebRequestExtraHeaders() {
+    if (!CONFIG.extraHeaders) return;
+    namespaces.forEach(function (ns) {
+      var wr = null;
+      try { wr = ns.webRequest; } catch (e) {}
+      if (!wr || typeof wr !== "object") return;
+      Object.keys(wr).forEach(function (name) {
+        if (!/^on[A-Z]/.test(name)) return;
+        var ev = null;
+        try { ev = wr[name]; } catch (e) {}
+        if (!ev || typeof ev.addListener !== "function") return;
+        var add = ev.addListener;
+        replaceMember(ev, "addListener", function (fn, filter, spec) {
+          var args = Array.prototype.slice.call(arguments);
+          if (Array.isArray(spec) && spec.indexOf("extraHeaders") >= 0) {
+            args[2] = spec.filter(function (v) { return v !== "extraHeaders"; });
+          }
+          return add.apply(ev, args);
+        });
+      });
+    });
+  }
+
   // ── permissions Firefox doesn't know ───────────────────────────────────────
   // The conversion removes the permissions Firefox doesn't know, offscreen and
   // sidePanel among them, and Firefox's permissions.contains, request and
@@ -2091,5 +2121,6 @@
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
+  try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
