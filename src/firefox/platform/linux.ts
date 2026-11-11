@@ -126,9 +126,12 @@ export function linuxProfileRoot(
   if (existsSync(legacy) || existsSync(join(home, "mozilla")) || env.MOZ_LEGACY_HOME?.startsWith("1")) {
     return legacy;
   }
-  // Firefox ignores a relative XDG_CONFIG_HOME, as the XDG spec says to.
-  const xdg = env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : join(home, ".config");
-  return join(xdg, "mozilla", "firefox");
+  return join(xdgConfigHome(home, env), "mozilla", "firefox");
+}
+
+/** $XDG_CONFIG_HOME, or ~/.config when it is unset or relative: Firefox ignores a relative one, as the XDG spec says to. */
+function xdgConfigHome(home: string, env: { XDG_CONFIG_HOME?: string }): string {
+  return env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : join(home, ".config");
 }
 
 /**
@@ -189,7 +192,7 @@ export const linux: Platform = {
     // Both native roots can exist when an older and a newer Firefox share a machine.
     return [
       join(home, ".mozilla", "firefox"),
-      join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "mozilla", "firefox"),
+      join(xdgConfigHome(home, process.env), "mozilla", "firefox"),
       join(sandboxHome("snap", home), ".mozilla", "firefox"),
       join(flatpak, ".mozilla", "firefox"),
       join(flatpak, "config", "mozilla", "firefox"),
