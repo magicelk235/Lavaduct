@@ -2094,7 +2094,10 @@
   // such value, and refuses the whole listener ("Invalid enumeration value").
   // Each webRequest event's addListener drops it from the spec; the add-on's
   // function is passed through as it is, so removeListener and hasListener
-  // still find it. Only emitted for a bundle that names extraHeaders.
+  // still find it. A spec left empty, or passed as undefined, isn't passed on:
+  // Chrome takes one on every event, but Firefox's onErrorOccurred has no such
+  // parameter and refuses any third argument ("Incorrect argument types").
+  // Only emitted for a bundle that names extraHeaders.
   function installWebRequestExtraHeaders() {
     if (!CONFIG.extraHeaders) return;
     namespaces.forEach(function (ns) {
@@ -2109,8 +2112,10 @@
         var add = ev.addListener;
         replaceMember(ev, "addListener", function (fn, filter, spec) {
           var args = Array.prototype.slice.call(arguments);
-          if (Array.isArray(spec) && spec.indexOf("extraHeaders") >= 0) {
-            args[2] = spec.filter(function (v) { return v !== "extraHeaders"; });
+          if (args.length > 2) {
+            var kept = Array.isArray(spec) ? spec.filter(function (v) { return v !== "extraHeaders"; }) : spec;
+            if (kept == null || (Array.isArray(kept) && !kept.length)) args.length = 2;
+            else if (kept !== spec && kept.length !== spec.length) args[2] = kept;
           }
           return add.apply(ev, args);
         });
