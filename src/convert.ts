@@ -174,7 +174,6 @@ function scratchDir(): { path: string; dispose(): void } {
 
 interface Log {
   ok(msg: string): void;
-  warn(msg: string): void;
 }
 
 type BuildSettings = Pick<
@@ -186,19 +185,23 @@ type BuildSettings = Pick<
  * Stage the extension and turn it into a Firefox add-on: source rewrites, the shim,
  * the Firefox manifest, DNR rules, the page bridge, the background scripts and
  * placeholder icons. Writes the final manifest.json and returns it, with the number
- * of static DNR rules the add-on carries. --analyze runs this on a scratch copy, so
- * its preview is exactly what a conversion produces.
+ * of static DNR rules the add-on carries and the issues only the build finds (DNR
+ * rules Firefox won't take, files staging couldn't copy). --analyze runs this on a
+ * scratch copy, so its preview is exactly what a conversion produces.
  */
 function buildAddon(
   src: { extPath: string; manifest: Manifest; permissionsToRemove: string[]; name: string; chromeId?: string; addonId: string },
   stageDir: string,
   settings: BuildSettings,
   log: Log,
-): { manifest: Manifest; staticRules: number } {
+): { manifest: Manifest; staticRules: number; notes: Issue[] } {
   const { manifest } = src;
-  for (const asset of stageExtension(src.extPath, stageDir, collectReferencedPaths(manifest))) {
-    log.warn(`Manifest-referenced asset not staged (broken/external symlink or copy error): ${asset}. It will 404 in Firefox.`);
-  }
+  const notes: Issue[] = stageExtension(src.extPath, stageDir, collectReferencedPaths(manifest)).map((asset) => ({
+    severity: "warning",
+    category: "staging",
+    message: `Manifest-referenced asset not staged (broken/external symlink or copy error): ${asset}. It will 404 in Firefox.`,
+    file: asset,
+  }));
   const junk = removeUnreadableLocales(stageDir, manifest.default_locale);
   if (junk.length > 0) log.ok(`Left out ${junk.join(", ")}: no messages.json Chrome reads, so Chrome skips it, and Firefox would refuse the add-on`);
   const catalogs = normalizeLocaleCatalogs(stageDir);
@@ -262,7 +265,7 @@ function buildAddon(
   }
 
   const dnr = applyDnr(stageDir, out);
-  for (const note of dnr.notes) log.warn(note);
+  notes.push(...dnr.notes);
   if (settings.oauthBridge !== false) {
     for (const note of applyOAuthBridge(stageDir, out, src.chromeId)) log.ok(note);
   }
@@ -276,7 +279,7 @@ function buildAddon(
   if (maps > 0) log.ok(`Stripped dangling sourcemap refs from ${maps} script(s)`);
 
   writeManifest(stageDir, out);
-  return { manifest: out, staticRules: dnr.staticRules };
+  return { manifest: out, staticRules: dnr.staticRules, notes };
 }
 
 /** Extract an input and read its manifest and identity. */
@@ -319,8 +322,9 @@ export function analyzeExtension(opts: AnalyzeOptions): Analysis {
     const src = load(opts.input, scratch.path, opts.minFirefoxVersion ?? DEFAULT_MIN_FIREFOX);
     const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, { ...opts, minFirefox: src.minFirefox });
     const addonId = opts.addonId ?? deriveAddonId({ chromeId: src.chromeId, name: src.name });
-    const quiet: Log = { ok() {}, warn() {} };
-    const { manifest: built } = buildAddon({ ...src, permissionsToRemove, addonId }, join(scratch.path, STAGE_DIR), opts, quiet);
+    const quiet: Log = { ok() {} };
+    const { manifest: built, notes } = buildAddon({ ...src, permissionsToRemove, addonId }, join(scratch.path, STAGE_DIR), opts, quiet);
+    issues.push(...notes);
     return {
       name: src.name,
       appName: deriveAppName(src.name),
@@ -613,7 +617,8 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
 
     // Kept in the output directory: a temporary install loads it in place.
     info("Staging clean extension assets …");
-    const { manifest: built, staticRules } = buildAddon({ ...src, permissionsToRemove, addonId }, stageDir, opts, { ok, warn });
+    const { manifest: built, staticRules, notes } = buildAddon({ ...src, permissionsToRemove, addonId }, stageDir, opts, { ok });
+    issues.push(...notes);
     const version = built.version ?? "";
     result.stagedPath = stageDir;
     result.version = version;
@@ -630,6 +635,13 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     };
     const reportPath = writeReportFile(outputDir, meta, issues);
     ok(`Report → ${reportPath}`);
+    // The build's own findings come after the gate above; under --strict a warning
+    // among them blocks just the same.
+    if (opts.strict && !opts.force && countBlocking(notes, true) > 0) {
+      printIssues(issues);
+      fail(`${countBlocking(issues, true)} blocking issue(s) (--strict: warnings count). Re-run with --force to convert anyway.`);
+      return result;
+    }
 
     info("Packing .xpi");
     let packed: { version: string; xpiPath: string; sha256: string } | undefined;
