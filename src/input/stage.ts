@@ -475,8 +475,14 @@ function guardAncestorOriginsAccess(stageDir: string): number {
     let last = 0;
     for (let m: RegExpExecArray | null; (m = ANCESTOR_INDEX_RE.exec(content)); ) {
       const start = receiverChainStart(content, m.index);
-      // `.ancestorOrigins` needs a receiver; a bare one is not this shape.
+      // `.ancestorOrigins` needs a receiver; a bare one is not this shape. A chain
+      // that starts with "." or "?." continues a call or index to its left
+      // (`frames[0].location…`, `f()?.location…`), which the walk can't take in,
+      // and wrapping from the dot would emit `frames[0](.location… || "")`, a
+      // SyntaxError that kills the whole file. Leave those as they are.
       if (start === m.index || start < last) continue;
+      const lead = content.charCodeAt(start);
+      if (lead === 46 || lead === 63) continue;
       const end = m.index + m[0].length;
       out += content.slice(last, start) + "(" + content.slice(start, end) + ' || "")';
       last = end;
