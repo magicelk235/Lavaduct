@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Issue, Manifest, Severity } from "../types.js";
+import { withoutPortWildcard } from "../manifest/manifest.js";
 import { color } from "../util.js";
 
 /**
@@ -16,7 +17,7 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     if (before[key] !== undefined && after[key] === undefined) out.push(`Dropped \`${key}\` (Chrome-only).`);
   }
 
-  if (before.version !== after.version) out.push(`Version \`${before.version}\` → \`${after.version}\` (Firefox format).`);
+  if (before.version !== after.version) out.push(`Version ${before.version === undefined ? "(none)" : `\`${before.version}\``} → \`${after.version}\` (Firefox format).`);
 
   // A malformed manifest can set permissions to a non-array (a bare string,
   // an object); guard with Array.isArray so .filter()/.includes() never throw
@@ -30,13 +31,14 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   const toRequired = optional.filter((p) => !required.includes(p) && requiredAfter.includes(p));
   const toOptional = required.filter((p) => !optional.includes(p) && optionalAfter.includes(p));
   const quoted = (list: string[]) => list.map((p) => `\`${p}\``).join(", ");
-  if (toRequired.length) out.push(`Moved ${quoted(toRequired)} from \`optional_permissions\` to \`permissions\` (Firefox grants ${toRequired.length > 1 ? "them" : "it"} at install, without a prompt).`);
+  if (toRequired.length) out.push(`Moved ${quoted(toRequired)} from \`optional_permissions\` to \`permissions\` (Firefox only grants ${toRequired.length > 1 ? "them" : "it"} at install).`);
   if (toOptional.length) out.push(`Moved ${quoted(toOptional)} from \`permissions\` to \`optional_permissions\` (Firefox only grants ${toOptional.length > 1 ? "them" : "it"} at runtime).`);
 
-  const removedPerms = required.filter((p) => !requiredAfter.includes(p) && !toOptional.includes(p));
+  // A pattern that only lost its port wildcard is kept, not removed.
+  const removedPerms = required.filter((p) => !requiredAfter.includes(withoutPortWildcard(p)) && !toOptional.includes(p));
   if (removedPerms.length) out.push(`Removed permission(s): ${quoted(removedPerms)}.`);
 
-  const removedOptPerms = optional.filter((p) => !optionalAfter.includes(p) && !toRequired.includes(p));
+  const removedOptPerms = optional.filter((p) => !optionalAfter.includes(withoutPortWildcard(p)) && !toRequired.includes(p));
   if (removedOptPerms.length) out.push(`Removed optional permission(s): ${quoted(removedOptPerms)}.`);
 
   // Permissions the converter grants for an emulation (chrome.debugger runs on
@@ -45,12 +47,16 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   const addedPerms = requiredAfter.filter((p) => !required.includes(p) && !toRequired.includes(p) && p !== "<all_urls>" && !p.includes("://"));
   if (addedPerms.length) out.push(`Added permission(s) ${quoted(addedPerms)}, which the converter's emulations run on.`);
 
-  for (const key of ["permissions", "host_permissions", "optional_host_permissions"] as const) {
+  const ported: string[] = [];
+  for (const key of ["permissions", "optional_permissions", "host_permissions", "optional_host_permissions"] as const) {
     const beforeHosts = Array.isArray(before[key]) ? (before[key] as unknown[]).filter((p): p is string => typeof p === "string") : [];
     const afterHosts = Array.isArray(after[key]) ? (after[key] as unknown[]).filter((p): p is string => typeof p === "string") : [];
-    const removed = key === "permissions" ? [] : beforeHosts.filter((p) => !afterHosts.includes(p));
+    for (const p of beforeHosts) if (withoutPortWildcard(p) !== p && afterHosts.includes(withoutPortWildcard(p))) ported.push(p);
+    if (key === "optional_permissions") continue;
+    const removed = key === "permissions" ? [] : beforeHosts.filter((p) => !afterHosts.includes(withoutPortWildcard(p)));
     if (removed.length) out.push(`Removed \`${key}\` pattern(s): ${removed.map((p) => `\`${p}\``).join(", ")}.`);
-    const added = afterHosts.filter((p) => (p === "<all_urls>" || p.includes("://")) && !beforeHosts.includes(p));
+    const beforeFixed = beforeHosts.map(withoutPortWildcard);
+    const added = afterHosts.filter((p) => (p === "<all_urls>" || p.includes("://")) && !beforeFixed.includes(p));
     if (added.length) {
       const why = added.includes("<all_urls>")
         ? "the chrome.debugger emulation needs access to every page"
@@ -58,6 +64,7 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
       out.push(`Added \`${key}\` pattern(s) ${added.map((p) => `\`${p}\``).join(", ")}: ${why}.`);
     }
   }
+  if (ported.length) out.push(`Dropped the port wildcard from ${quoted(ported)} (Firefox has none; a pattern without a port matches every port).`);
 
   const gecko = after.browser_specific_settings?.gecko;
   if (gecko && JSON.stringify(gecko) !== JSON.stringify(before.browser_specific_settings?.gecko)) {
@@ -86,6 +93,13 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
 
   if (before.incognito === "split" && after.incognito === undefined)
     out.push('Removed `incognito: "split"` (Firefox would fall back to not_allowed; the default is spanning).');
+
+  const overridesBefore = before.chrome_url_overrides;
+  if (overridesBefore && typeof overridesBefore === "object") {
+    const kept = after.chrome_url_overrides ?? {};
+    const dropped = Object.keys(overridesBefore).filter((k) => !(k in kept));
+    if (dropped.length) out.push(`Removed \`chrome_url_overrides\` ${dropped.map((k) => `\`${k}\``).join(", ")} (Firefox only lets add-ons replace the new tab page).`);
+  }
 
   if (Array.isArray(before.web_accessible_resources) && Array.isArray(after.web_accessible_resources)) {
     const hasDynamicUrl = (list: unknown[]) =>

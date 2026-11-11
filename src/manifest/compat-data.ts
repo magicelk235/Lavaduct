@@ -7,31 +7,53 @@ import { FIREFOX_API_SUPPORT, FIREFOX_PERMISSION_SUPPORT } from "./compat-genera
 // stripped, and the advice the analyzer prints. The analyzer and the manifest transform
 // both read these tables, so the report and the output agree.
 
-/** Compare dotted version strings numerically: `compareFirefoxVersions("128.0", "139") < 0`. */
+// One dot-separated part of a Mozilla version: a number, then an optional string,
+// number and remainder ("0a1" is 0, "a", 1, ""). nsVersionComparator's rules.
+function versionPart(part: string | undefined): [number, string, number, string] {
+  const m = /^(\d*)([^\d]*)(\d*)(.*)$/s.exec(part ?? "") as RegExpExecArray;
+  return [Number.parseInt(m[1], 10) || 0, m[2], Number.parseInt(m[3], 10) || 0, m[4]];
+}
+
+// A part's string sorts before none at all: 161.0a1 comes before 161.0.
+function compareVersionStrings(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a === "") return 1;
+  if (b === "") return -1;
+  return a < b ? -1 : 1;
+}
+
+/**
+ * Compare Firefox versions the way Firefox does (Services.vc.compare), so a Nightly
+ * or Beta sorts before its release: `compareFirefoxVersions("161.0a1", "161.0") < 0`.
+ */
 export function compareFirefoxVersions(a: string, b: string): number {
   const pa = String(a).split(".");
   const pb = String(b).split(".");
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (Number.parseInt(pa[i] ?? "0", 10) || 0) - (Number.parseInt(pb[i] ?? "0", 10) || 0);
+    const [numA, strA, numC, extraA] = versionPart(pa[i]);
+    const [numB, strB, numD, extraB] = versionPart(pb[i]);
+    const d = numA - numB || compareVersionStrings(strA, strB) || numC - numD || compareVersionStrings(extraA, extraB);
     if (d !== 0) return d;
   }
   return 0;
 }
 
 /**
- * Permissions Firefox grants at install without a prompt and ignores in
- * optional_permissions (PermissionNoPrompt in Firefox's manifest schema). The transform
- * moves them from optional_permissions to permissions; there is no prompt either way.
+ * Permissions Firefox only grants at install and ignores in optional_permissions
+ * (PermissionNoPrompt, and declarativeNetRequest, which is a plain Permission, in
+ * Firefox's manifest schemas). The transform moves them from optional_permissions to
+ * permissions. Value: whether Firefox asks for the permission at install.
  * browser-compat-data still lists contextMenus as optional, which current Firefox drops.
  */
-export const INSTALL_TIME_PERMISSIONS: Record<string, true> = {
-  alarms: true,
-  contextMenus: true,
-  declarativeNetRequestWithHostAccess: true,
-  dns: true,
-  identity: true,
-  storage: true,
-  unlimitedStorage: true,
+export const INSTALL_TIME_PERMISSIONS: Record<string, boolean> = {
+  alarms: false,
+  contextMenus: false,
+  declarativeNetRequest: true,
+  declarativeNetRequestWithHostAccess: false,
+  dns: false,
+  identity: false,
+  storage: false,
+  unlimitedStorage: false,
 };
 
 /**
@@ -138,7 +160,7 @@ const SHIMMED_APIS: Record<string, { message: string; fix: string }> = {
   },
   offscreen: {
     message: "chrome.offscreen is emulated with a hidden iframe in the background page (createDocument, closeDocument, hasDocument, Reason).",
-    fix: "No action needed; runtime.getContexts() doesn't list the document, so check it with offscreen.hasDocument().",
+    fix: "No action needed; runtime.getContexts() lists the document too.",
   },
   "identity.getAuthToken": {
     message: "identity.getAuthToken is emulated with identity.launchWebAuthFlow and the manifest's oauth2 client.",
@@ -272,9 +294,17 @@ const HAND_NOTES: Record<string, ApiNote> = {
     fix: "Translate the config, or route requests with proxy.onRequest. Firefox also only allows proxy.settings when the user lets the add-on run in private windows.",
   },
   OFFSCREEN_DOCUMENT: {
+    severity: "info",
+    message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT", which Firefox\'s context types lack, is answered by the shim from its offscreen emulation.',
+    fix: "No action needed when the type is passed as the string.",
+    shimmed: true,
+  },
+  // Firefox builds runtime.ContextType from its own context types, so this member is
+  // undefined there and getContexts() throws on the filter.
+  "ContextType.OFFSCREEN_DOCUMENT": {
     severity: "warning",
-    message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT" throws in Firefox, whose context types have no offscreen documents.',
-    fix: "Ask chrome.offscreen.hasDocument() instead; the shim answers it.",
+    message: "runtime.ContextType.OFFSCREEN_DOCUMENT is undefined in Firefox, so a getContexts() filter built from it throws.",
+    fix: 'Pass the string "OFFSCREEN_DOCUMENT", which the shim answers.',
   },
 };
 

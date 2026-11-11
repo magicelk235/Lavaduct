@@ -227,12 +227,16 @@ export function matchPatternError(pattern: string): string | null {
   if (host === "*") return null;
   const body = host.startsWith("*.") ? host.slice(2) : host;
   if (body === "") return "empty host after '*.'";
-  if (body.includes("*")) {
-    return host.endsWith(":*")
-      ? "Firefox has no port wildcard; a pattern without a port already matches every port"
-      : `host "${host}" may only use '*' as the whole host or a leading '*.'`;
-  }
+  if (body.includes("*")) return `host "${host}" may only use '*' as the whole host or a leading '*.'`;
   return null;
+}
+
+// Chrome's port wildcard (host:*) isn't in Firefox's grammar, and a Firefox pattern
+// without a port already matches every port, so dropping it keeps the pattern's
+// meaning. Patterns are checked and written in this form.
+const PORT_WILDCARD_RE = /^([^:/]*:\/\/[^/]*?):\*(?=\/)/;
+export function withoutPortWildcard<T>(pattern: T): T {
+  return (typeof pattern === "string" ? pattern.replace(PORT_WILDCARD_RE, "$1") : pattern) as T;
 }
 
 // web_accessible_resources match patterns Firefox refuses, such as Chrome's own
@@ -241,7 +245,22 @@ function invalidResourceMatches(m: Manifest): string[] {
   const out: string[] = [];
   for (const entry of Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []) {
     if (typeof entry !== "object" || entry === null || !("matches" in entry)) continue;
-    for (const p of strings(entry.matches)) if (matchPatternError(p) !== null) out.push(p);
+    for (const p of strings(entry.matches)) if (matchPatternError(withoutPortWildcard(p)) !== null) out.push(p);
+  }
+  return out;
+}
+
+// Firefox's ExtensionID (toolkit/components/extensions/schemas/manifest.json): a GUID
+// in braces or name@domain. web_accessible_resources extension_ids also takes "*".
+const FIREFOX_EXTENSION_ID_RE = /^(?:\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}|[a-z0-9-._]*@[a-z0-9-._]+)$/i;
+const resourceExtensionIdOk = (id: unknown): id is string => typeof id === "string" && (id === "*" || FIREFOX_EXTENSION_ID_RE.test(id));
+
+// web_accessible_resources extension_ids Firefox refuses: Chrome's 32-letter IDs.
+function invalidResourceExtensionIds(m: Manifest): string[] {
+  const out: string[] = [];
+  for (const entry of Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []) {
+    if (typeof entry !== "object" || entry === null || !("extension_ids" in entry)) continue;
+    for (const id of strings(entry.extension_ids)) if (!resourceExtensionIdOk(id)) out.push(id);
   }
   return out;
 }
@@ -255,6 +274,23 @@ function remoteSearchFavicon(m: Manifest): string | null {
   const icon = typeof provider === "object" && provider !== null && "favicon_url" in provider ? provider.favicon_url : undefined;
   if (typeof icon !== "string") return null;
   return icon.startsWith("//") || URL.canParse(icon) ? icon : null;
+}
+
+// Firefox takes a search engine only from https:// or a local http:// address
+// (search_url and suggest_url patterns in chrome_settings_overrides.json) and refuses
+// the whole manifest otherwise; Chrome also takes http://. A __MSG_ value is checked
+// after Firefox localizes it, which needs the locale files, so it is left alone.
+const SECURE_SEARCH_URL_RE = /^(?:https:\/\/|http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d*)?(?:\/|$))/;
+function insecureSearchUrls(m: Manifest): Array<[string, string]> {
+  const overrides = m.chrome_settings_overrides;
+  const provider = typeof overrides === "object" && overrides !== null && "search_provider" in overrides ? overrides.search_provider : undefined;
+  if (typeof provider !== "object" || provider === null) return [];
+  const out: Array<[string, string]> = [];
+  for (const key of ["search_url", "suggest_url"]) {
+    const url: unknown = Reflect.get(provider, key);
+    if (typeof url === "string" && url !== "" && !url.includes("__MSG_") && !SECURE_SEARCH_URL_RE.test(url)) out.push([key, url]);
+  }
+  return out;
 }
 
 // Firefox accepts a port in a pattern but compares it as part of the host name, so a
@@ -370,6 +406,14 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   const mv = m.manifest_version ?? 2;
   const required = strings(m.permissions);
   const optional = strings(m.optional_permissions);
+  // Port-wildcard patterns that become valid without the wildcard.
+  const portWildcards = new Set<string>();
+  const patternError = (pattern: string): string | null => {
+    const fixed = withoutPortWildcard(pattern);
+    const err = matchPatternError(fixed);
+    if (err === null && fixed !== pattern) portWildcards.add(pattern);
+    return err;
+  };
 
   // Firefox validates content-script patterns strictly: one it can't parse makes it
   // refuse the whole manifest.
@@ -382,9 +426,9 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     ];
     for (const [key, list] of lists) {
       for (const pat of strings(list)) {
-        const err = matchPatternError(pat);
+        const err = patternError(pat);
         if (err === null) {
-          const port = portIssue(pat, `content_scripts[${i}].${key}`, "content_scripts");
+          const port = portIssue(withoutPortWildcard(pat), `content_scripts[${i}].${key}`, "content_scripts");
           if (port) issues.push(port);
           continue;
         }
@@ -412,9 +456,9 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   // them so the manifest says what Firefox actually grants.
   for (const key of ["host_permissions", "optional_host_permissions"] as const) {
     for (const pat of strings(m[key])) {
-      const err = matchPatternError(pat);
+      const err = patternError(pat);
       if (err === null) {
-        const port = portIssue(pat, key, "permission");
+        const port = portIssue(withoutPortWildcard(pat), key, "permission");
         if (port) issues.push(port);
         continue;
       }
@@ -458,11 +502,13 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   }
 
   for (const perm of optional) {
-    if (INSTALL_TIME_PERMISSIONS[perm] !== true || required.includes(perm)) continue;
+    if (!Object.hasOwn(INSTALL_TIME_PERMISSIONS, perm) || required.includes(perm)) continue;
     issues.push({
       severity: "warning",
       category: "permission",
-      message: `Optional permission "${perm}" moves to permissions: Firefox grants it at install without a prompt and ignores it in optional_permissions.`,
+      message: INSTALL_TIME_PERMISSIONS[perm]
+        ? `Optional permission "${perm}" moves to permissions: Firefox ignores it in optional_permissions, so it asks for it at install instead.`
+        : `Optional permission "${perm}" moves to permissions: Firefox grants it at install without a prompt and ignores it in optional_permissions.`,
       file: "manifest.json",
       fix: `permissions.request() for "${perm}" throws in Firefox; it is already granted, so check it with permissions.contains() first.`,
       autoFixed: true,
@@ -486,7 +532,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   for (const key of ["permissions", "optional_permissions"] as const) {
     for (const perm of strings(m[key])) {
       if (perm !== "<all_urls>" && !perm.includes("://")) continue;
-      const err = matchPatternError(perm);
+      const err = patternError(perm);
       if (err !== null) {
         const favicon = perm.startsWith("chrome://favicon");
         issues.push({
@@ -507,10 +553,22 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
           fix: 'Move it into "host_permissions" (MV3 requires URL patterns there).',
         });
       } else {
-        const port = portIssue(perm, key, "permission");
+        const port = portIssue(withoutPortWildcard(perm), key, "permission");
         if (port) issues.push(port);
       }
     }
+  }
+  for (const entry of Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []) {
+    if (typeof entry === "object" && entry !== null && "matches" in entry) for (const p of strings(entry.matches)) patternError(p);
+  }
+  if (portWildcards.size) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `${[...portWildcards].join(", ")} use${portWildcards.size > 1 ? "" : "s"} a port wildcard, which Firefox doesn't have: it refuses a manifest whose content scripts use one and grants nothing through such a host permission. A Firefox pattern without a port matches every port, so the wildcard is dropped.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
   }
 
   for (const gate of KEY_GATES) {
@@ -639,11 +697,15 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   }
 
   const war: unknown[] = Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : [];
-  if (war.some((e) => typeof e === "object" && e !== null && "use_dynamic_url" in e)) {
+  const dynamic = war.filter((e): e is object => typeof e === "object" && e !== null && "use_dynamic_url" in e);
+  if (dynamic.length) {
+    const bare = dynamic.some((e) => !("matches" in e) && !("extension_ids" in e));
     issues.push({
       severity: "info",
       category: "resources",
-      message: "web_accessible_resources use_dynamic_url is Chrome-only; it is removed, and the resources load from their regular moz-extension:// URL.",
+      message:
+        "web_accessible_resources use_dynamic_url is Chrome-only; it is removed, and the resources load from their regular moz-extension:// URL." +
+        (bare ? " An entry left with neither matches nor extension_ids, which Firefox refuses the whole manifest over, goes with it; it opened its files to no web page." : ""),
       file: "manifest.json",
       fix: "Firefox already gives every install its own random moz-extension:// host.",
       autoFixed: true,
@@ -662,6 +724,18 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     });
   }
 
+  const badIds = [...new Set(invalidResourceExtensionIds(m))];
+  if (badIds.length) {
+    issues.push({
+      severity: "info",
+      category: "resources",
+      message: `web_accessible_resources extension_ids lists ${badIds.join(", ")}, which Firefox refuses along with the whole manifest (it only takes add-on IDs and "*"); the IDs are removed, and an entry left matching nothing goes with it.`,
+      file: "manifest.json",
+      fix: "Those extensions have other IDs in Firefox; list their Firefox add-on IDs to share the files with them.",
+      autoFixed: true,
+    });
+  }
+
   const favicon = remoteSearchFavicon(m);
   if (favicon !== null) {
     issues.push({
@@ -671,6 +745,16 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       file: "manifest.json",
       fix: "Firefox shows the add-on's icon for the search engine instead.",
       autoFixed: true,
+    });
+  }
+
+  for (const [key, url] of insecureSearchUrls(m)) {
+    issues.push({
+      severity: "error",
+      category: "manifest",
+      message: `chrome_settings_overrides.search_provider.${key} is ${url}; Firefox only takes https:// search engines (or a localhost address) and refuses to load a manifest with it.`,
+      file: "manifest.json",
+      fix: "Point it at the engine's https:// address.",
     });
   }
 
@@ -725,9 +809,10 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       issues.push({
         severity: "warning",
         category: "ui",
-        message: `chrome_url_overrides.${k} isn't supported in Firefox, which only lets add-ons replace the new tab page.`,
+        message: `chrome_url_overrides.${k} isn't supported in Firefox, which only lets add-ons replace the new tab page and refuses the whole manifest over any other override, so it is removed.`,
         file: "manifest.json",
         fix: "Open the page from the toolbar button or a menu instead.",
+        autoFixed: true,
       });
     }
   }
@@ -862,14 +947,14 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   const removed = new Set(permissionsToRemove);
   const keep = (p: unknown): p is string =>
     typeof p === "string" && !removed.has(p) && (!p.includes("://") || matchPatternError(p) === null);
-  const required = Array.isArray(out.permissions) ? out.permissions.filter(keep) : [];
-  const optional = Array.isArray(out.optional_permissions) ? out.optional_permissions.filter(keep) : [];
+  const required = Array.isArray(out.permissions) ? out.permissions.map(withoutPortWildcard).filter(keep) : [];
+  const optional = Array.isArray(out.optional_permissions) ? out.optional_permissions.map(withoutPortWildcard).filter(keep) : [];
   const permissions = [
     ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] !== true),
-    ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] === true && !required.includes(p)),
+    ...optional.filter((p) => Object.hasOwn(INSTALL_TIME_PERMISSIONS, p) && !required.includes(p)),
   ];
   const optionalPermissions = [
-    ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] !== true),
+    ...optional.filter((p) => !Object.hasOwn(INSTALL_TIME_PERMISSIONS, p)),
     ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] === true && !optional.includes(p)),
   ];
   // Chrome leaves blocking webRequest to policy-installed MV3 extensions, so store
@@ -898,7 +983,7 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   for (const key of ["host_permissions", "optional_host_permissions"] as const) {
     const list = out[key];
     if (!Array.isArray(list)) continue;
-    const kept = list.filter((p) => typeof p === "string" && matchPatternError(p) === null);
+    const kept = list.map(withoutPortWildcard).filter((p) => typeof p === "string" && matchPatternError(p) === null);
     if (kept.length) out[key] = kept;
     else delete out[key];
   }
@@ -950,19 +1035,33 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   // normal and private windows.
   if (out.incognito === "split") delete out.incognito;
 
+  // An extension that only adds rules at runtime may declare rule_resources: [],
+  // which Chrome accepts. Firefox wants at least one ruleset there and refuses the
+  // whole manifest otherwise; the permission alone gives the API.
+  const rules = out.declarative_net_request?.rule_resources;
+  if (Array.isArray(rules) && rules.length === 0) delete out.declarative_net_request;
+
   if (Array.isArray(out.web_accessible_resources)) {
     out.web_accessible_resources = out.web_accessible_resources.filter((entry: unknown) => {
       if (typeof entry !== "object" || entry === null) return true;
       Reflect.deleteProperty(entry, "use_dynamic_url");
-      if (!("matches" in entry) || !Array.isArray(entry.matches)) return true;
-      const kept = entry.matches.filter((p: unknown) => typeof p === "string" && matchPatternError(p) === null);
-      if (kept.length === entry.matches.length) return true;
-      if (kept.length) {
+      if ("extension_ids" in entry && Array.isArray(entry.extension_ids)) {
+        const ids = entry.extension_ids.filter(resourceExtensionIdOk);
+        if (ids.length) entry.extension_ids = ids;
+        else Reflect.deleteProperty(entry, "extension_ids");
+      }
+      // Chrome takes use_dynamic_url as an entry's only key besides resources, and
+      // such an entry opens its files to no web page. Firefox refuses the whole
+      // manifest over an entry with neither matches nor extension_ids.
+      if (!("matches" in entry)) return "extension_ids" in entry;
+      if (!Array.isArray(entry.matches)) return true;
+      const kept = entry.matches.map(withoutPortWildcard).filter((p: unknown) => typeof p === "string" && matchPatternError(p) === null);
+      if (kept.length || entry.matches.length === 0) {
         entry.matches = kept;
         return true;
       }
       Reflect.deleteProperty(entry, "matches");
-      return "extension_ids" in entry && strings(entry.extension_ids).length > 0;
+      return "extension_ids" in entry;
     });
   }
 
@@ -978,6 +1077,14 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     else delete out.author;
   }
 
+  // Firefox's schema marks every override but newtab unsupported, which makes it
+  // refuse the whole manifest.
+  const urlOverrides = out.chrome_url_overrides;
+  if (urlOverrides && typeof urlOverrides === "object") {
+    for (const k of Object.keys(urlOverrides)) if (k !== "newtab") Reflect.deleteProperty(urlOverrides, k);
+    if (Object.keys(urlOverrides).length === 0) delete out.chrome_url_overrides;
+  }
+
   // A shortcut Firefox can't parse makes it refuse the manifest. Drop just that chord;
   // the command stays, and users can bind it in about:addons.
   if (out.commands && typeof out.commands === "object") {
@@ -988,6 +1095,19 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
       if (typeof suggested !== "object" || suggested === null) continue;
       for (const [platform] of invalidShortcuts(def)) Reflect.deleteProperty(suggested, platform);
       if (Object.keys(suggested).length === 0) delete def.suggested_key;
+    }
+  }
+
+  // Content-script patterns lose a port wildcard. Chrome accepts an empty
+  // exclude_matches; Firefox wants at least one pattern and refuses the whole
+  // manifest otherwise. An empty list excludes nothing either way.
+  if (Array.isArray(out.content_scripts)) {
+    for (const cs of out.content_scripts) {
+      if (!cs || typeof cs !== "object") continue;
+      if (Array.isArray(cs.matches)) cs.matches = cs.matches.map(withoutPortWildcard);
+      if (!("exclude_matches" in cs) || !Array.isArray(cs.exclude_matches)) continue;
+      if (cs.exclude_matches.length === 0) Reflect.deleteProperty(cs, "exclude_matches");
+      else cs.exclude_matches = cs.exclude_matches.map(withoutPortWildcard);
     }
   }
 

@@ -128,11 +128,14 @@ type RuleOutcome = { rule: unknown; renamed: boolean; narrowed: boolean; bracket
 
 const DOMAIN_CONDITIONS = ["requestDomains", "excludedRequestDomains", "initiatorDomains", "excludedInitiatorDomains"];
 
-// Chrome takes an IPv6 address in a domain list bare (::1). Firefox wants it the
-// way a URL writes it ([::1]) and refuses the rule otherwise.
+// Chrome lower-cases the domains in a rule's domain conditions and takes an IPv6
+// address bare (::1). Firefox wants each one canonical, lower case and an IPv6
+// address the way a URL writes it ([::1]), and drops the rule otherwise.
 function firefoxDomain(domain: unknown): unknown {
-  if (typeof domain !== "string" || !domain.includes(":") || domain.startsWith("[")) return domain;
-  return URL.parse(`http://[${domain}]/`)?.hostname ?? domain;
+  if (typeof domain !== "string") return domain;
+  const lower = domain.toLowerCase();
+  if (!lower.includes(":") || lower.startsWith("[")) return lower;
+  return URL.parse(`http://[${lower}]/`)?.hostname ?? domain;
 }
 
 // Rewrite one rule into the form Firefox evaluates the way Chrome does, or say why it
