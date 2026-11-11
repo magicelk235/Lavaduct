@@ -725,9 +725,10 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       issues.push({
         severity: "warning",
         category: "ui",
-        message: `chrome_url_overrides.${k} isn't supported in Firefox, which only lets add-ons replace the new tab page.`,
+        message: `chrome_url_overrides.${k} isn't supported in Firefox, which only lets add-ons replace the new tab page and refuses the whole manifest over any other override, so it is removed.`,
         file: "manifest.json",
         fix: "Open the page from the toolbar button or a menu instead.",
+        autoFixed: true,
       });
     }
   }
@@ -976,6 +977,14 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     const email = "email" in out.author ? out.author.email : undefined;
     if (typeof email === "string" && email) out.author = email;
     else delete out.author;
+  }
+
+  // Firefox's schema marks every override but newtab unsupported, which makes it
+  // refuse the whole manifest.
+  const urlOverrides = out.chrome_url_overrides;
+  if (urlOverrides && typeof urlOverrides === "object") {
+    for (const k of Object.keys(urlOverrides)) if (k !== "newtab") Reflect.deleteProperty(urlOverrides, k);
+    if (Object.keys(urlOverrides).length === 0) delete out.chrome_url_overrides;
   }
 
   // A shortcut Firefox can't parse makes it refuse the manifest. Drop just that chord;

@@ -87,6 +87,13 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   if (before.incognito === "split" && after.incognito === undefined)
     out.push('Removed `incognito: "split"` (Firefox would fall back to not_allowed; the default is spanning).');
 
+  const overridesBefore = before.chrome_url_overrides;
+  if (overridesBefore && typeof overridesBefore === "object") {
+    const kept = after.chrome_url_overrides ?? {};
+    const dropped = Object.keys(overridesBefore).filter((k) => !(k in kept));
+    if (dropped.length) out.push(`Removed \`chrome_url_overrides\` ${dropped.map((k) => `\`${k}\``).join(", ")} (Firefox only lets add-ons replace the new tab page).`);
+  }
+
   if (Array.isArray(before.web_accessible_resources) && Array.isArray(after.web_accessible_resources)) {
     const hasDynamicUrl = (list: unknown[]) =>
       list.some((e) => !!e && typeof e === "object" && "use_dynamic_url" in (e as Record<string, unknown>));
