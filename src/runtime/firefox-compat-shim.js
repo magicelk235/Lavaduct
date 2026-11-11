@@ -324,7 +324,9 @@
   var PANEL_MSG_KEY = "__sidePanelShim:message";
 
   function installSidePanel() {
-    if (!isExtensionPage) return;
+    // Chrome defines chrome.sidePanel only with the sidePanel permission, and
+    // code tests for it: `if (chrome.sidePanel) open() else openWindow()`.
+    if (!isExtensionPage || !CONFIG.sidePanel) return;
     var sidebar = api.sidebarAction || null;
     if (!sidebar && !api.windows) return;
 

@@ -143,8 +143,12 @@ function shimSource(dir: string, config: ShimConfig): string {
   // The config goes in as a JSON literal, so nothing from the manifest is ever
   // interpolated into code. JSON.stringify leaves U+2028/U+2029 raw, which are
   // line terminators inside a JS string literal; escape them.
+  const sidePanelPath = (config.sidePanelPath ?? "").split(/[?#]/)[0].replace(/^\/+/, "");
   const json = JSON.stringify({
-    sidePanelPath: (config.sidePanelPath ?? "").split(/[?#]/)[0].replace(/^\/+/, ""),
+    // Chrome defines chrome.sidePanel only for an add-on that asks for the
+    // permission; one that declares or sets a panel page gets it as well.
+    sidePanel: (config.declaredPermissions ?? []).includes("sidePanel") || sidePanelPath !== "",
+    sidePanelPath,
     noDefaultPanel: config.noDefaultPanel === true,
     panelQuery: (config.panelQuery ?? "").replace(/^\?/, ""),
     extensionId: config.extensionId ?? "",
