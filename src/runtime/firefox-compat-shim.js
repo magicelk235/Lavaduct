@@ -62,7 +62,18 @@
   var namespaces = [];
   try { if (typeof browser === "object" && browser) namespaces.push(browser); } catch (e) {}
   try { if (typeof chrome === "object" && chrome && namespaces.indexOf(chrome) < 0) namespaces.push(chrome); } catch (e) {}
-  if (!namespaces.length) return;
+  if (!namespaces.length) {
+    // A manifest sandbox page: no extension API in either browser, but Chrome
+    // defines window.chrome on every page, an object without extension
+    // namespaces, and code written for Chrome reads it unguarded
+    // (webextension-polyfill's wrapAPIs). Firefox defines none.
+    try {
+      if (typeof chrome === "undefined" && location.protocol === "moz-extension:") {
+        Object.defineProperty(G, "chrome", { value: {}, writable: true, configurable: true, enumerable: true });
+      }
+    } catch (e) {}
+    return;
+  }
   // Our own calls go through the promise-returning namespace.
   var api = namespaces[0];
 
