@@ -48,7 +48,7 @@
       port = api.runtime.connect({ name: PORT_NAME });
       port.onMessage.addListener(function (m) {
         if (!m || m.__pageBridgeReply !== true) return;
-        reply(m.response, null);
+        reply(m.response, typeof m.error === "string" ? m.error : null);
       });
       port.onDisconnect.addListener(function () {
         var err = null;

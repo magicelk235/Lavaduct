@@ -40,7 +40,7 @@ const MISSING_RESOURCE_TYPES: Record<string, true> = { webbundle: true, webtrans
 // rule_resources paths come from the extension's manifest, which is untrusted, and the
 // sanitized rules are written back to them, so keep every write inside the staged
 // directory. A leading "/" means the extension root, as it does in Firefox.
-function resolveInside(stageDir: string, p: string): string | null {
+export function resolveInside(stageDir: string, p: string): string | null {
   const root = resolve(stageDir);
   const full = resolve(root, p.replace(/^\/+/, ""));
   const rel = relative(root, full);

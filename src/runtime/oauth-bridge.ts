@@ -2,6 +2,8 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, relative } from "node:path";
 import type { Manifest } from "../types.js";
+import { matchPatternError } from "../manifest/manifest.js";
+import { resolveInside } from "../manifest/dnr.js";
 import { TEMPLATE_DIR } from "../paths.js";
 import { NAME } from "../name.js";
 import { walkScripts } from "../input/stage.js";
@@ -62,9 +64,26 @@ function patternMatches(pattern: string, url: URL): boolean {
   return new RegExp(`^${pathRe}$`).test(url.pathname + url.search);
 }
 
-function bridgedMatches(manifest: Manifest): string[] {
+/**
+ * externally_connectable.matches as content-script patterns Firefox accepts.
+ * Chrome parses them with every scheme allowed and takes a port wildcard
+ * (`http://localhost:*\/*`), while one pattern Firefox's grammar refuses in
+ * content_scripts makes it refuse the whole add-on. A port wildcard becomes the
+ * same pattern without a port, which matches every port in Firefox; any other
+ * pattern Firefox refuses is left out, with the reason.
+ */
+function bridgedMatches(manifest: Manifest): { matches: string[]; dropped: string[] } {
   const raw = manifest.externally_connectable?.matches;
-  return Array.isArray(raw) ? raw.filter((m): m is string => typeof m === "string" && m.length > 0) : [];
+  const matches: string[] = [];
+  const dropped: string[] = [];
+  for (const m of Array.isArray(raw) ? raw : []) {
+    if (typeof m !== "string" || m.length === 0) continue;
+    const pattern = m.replace(/^([^:/]*:\/\/[^/]*?):\*(?=\/)/, "$1");
+    const error = matchPatternError(pattern);
+    if (error === null) matches.push(pattern);
+    else dropped.push(`"${m}" (${error})`);
+  }
+  return { matches, dropped };
 }
 
 /**
@@ -77,7 +96,7 @@ function bridgedMatches(manifest: Manifest): string[] {
  * isn't seen.
  */
 export function framedSites(stageDir: string, manifest: Manifest): string[] {
-  const matches = bridgedMatches(manifest);
+  const { matches } = bridgedMatches(manifest);
   if (matches.length === 0) return [];
   const contentScripts = new Set(
     (Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [])
@@ -184,8 +203,10 @@ export function deriveChromeId(manifest: Manifest): string | undefined {
  * notes for the report.
  */
 export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?: string): string[] {
-  const matches = bridgedMatches(manifest);
-  if (matches.length === 0) return [];
+  const { matches, dropped } = bridgedMatches(manifest);
+  if (matches.length === 0) {
+    return dropped.length > 0 ? [`Page bridge skipped: Firefox refuses every externally_connectable pattern as a content-script match: ${dropped.join(", ")}`] : [];
+  }
   const bg = manifest.background;
   if (!bg || (typeof bg.service_worker !== "string" && !Array.isArray(bg.scripts) && typeof bg.page !== "string")) {
     return ["Page bridge skipped: the extension has no background to receive messages from externally_connectable pages."];
@@ -222,6 +243,7 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   manifest.content_scripts = scripts;
   delete manifest.externally_connectable;
   const notes = [`Page bridge wired for externally_connectable pages: ${matches.join(", ")}`];
+  if (dropped.length > 0) notes.push(`Page bridge left out patterns Firefox refuses as content-script matches: ${dropped.join(", ")}`);
   if (sites.length > 0) {
     grantFramePermissions(manifest, sites);
     const hosts = sites.map((s) => new URL(s.slice(0, -1)).host).join(", ");
@@ -235,7 +257,11 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   return notes;
 }
 
-/** Load the receiver before the extension's own background code. */
+/**
+ * Load the receiver before the extension's own background code. The worker and
+ * page paths come from the untrusted manifest, so a path that leads out of the
+ * staged directory is never written to.
+ */
 function wireReceiver(stageDir: string, manifest: Manifest): void {
   const bg = manifest.background;
   if (!bg) return;
@@ -245,8 +271,8 @@ function wireReceiver(stageDir: string, manifest: Manifest): void {
   }
   if (typeof bg.service_worker === "string") {
     const sw = bg.service_worker.replace(/^(?:\.?\/)+/, "");
-    const swPath = join(stageDir, sw);
-    if (!existsSync(swPath)) return;
+    const swPath = resolveInside(stageDir, sw);
+    if (!swPath || !existsSync(swPath)) return;
     const src = readFileSync(swPath, "utf-8");
     if (bg.type === "module") {
       // A module's imports run before its body.
@@ -264,8 +290,8 @@ function wireReceiver(stageDir: string, manifest: Manifest): void {
     return;
   }
   if (typeof bg.page === "string") {
-    const pagePath = join(stageDir, bg.page.replace(/^\/+/, ""));
-    if (!existsSync(pagePath)) return;
+    const pagePath = resolveInside(stageDir, bg.page);
+    if (!pagePath || !existsSync(pagePath)) return;
     const tag = `<script src="/${BRIDGE_BACKGROUND}"></script>`;
     const html = readFileSync(pagePath, "utf-8");
     if (!html.includes(tag)) writeFileSync(pagePath, insertAtHeadStart(html, tag), "utf-8");
@@ -273,7 +299,7 @@ function wireReceiver(stageDir: string, manifest: Manifest): void {
 }
 
 const TRIVIA_RE = /(?:\uFEFF|\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/)*/y;
-const DIRECTIVE_RE = /(["'])(?:(?!\1)[^\\\r\n]|\\.)*\1[ \t]*(;)?(?=[ \t]*(?:\r?\n|$)|(?<=;))/y;
+const DIRECTIVE_RE = /(["'])(?:(?!\1)[^\\\r\n]|\\.)*\1[ \t]*(;)?(?=[ \t]*(?:\r?\n|$|\/\/|\/\*)|(?<=;))/y;
 
 /**
  * End of a script's directive prologue ("use strict"; and friends), so code can be
@@ -293,9 +319,11 @@ function directivePrologueEnd(src: string): number {
     if (!m) return end;
     if (!m[2]) {
       // Without a semicolon the string only ends the statement if the next line
-      // can't continue the expression.
-      const next = /\S/.exec(src.slice(DIRECTIVE_RE.lastIndex));
-      if (next && /[.([`+\-*/%,?=<>&|]/.test(next[0])) return end;
+      // can't continue the expression. Comments in between don't count.
+      TRIVIA_RE.lastIndex = DIRECTIVE_RE.lastIndex;
+      TRIVIA_RE.exec(src);
+      const next = src.charAt(TRIVIA_RE.lastIndex);
+      if (next && /[.([`+\-*/%,?=<>&|]/.test(next)) return end;
     }
     at = DIRECTIVE_RE.lastIndex;
     end = at;
