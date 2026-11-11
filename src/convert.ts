@@ -287,9 +287,10 @@ function load(input: string, scratch: string, minFirefox: string) {
   return { extPath, manifest, name, chromeId: deriveChromeId(manifest), minFirefox };
 }
 
-function issuesOf(extPath: string, manifest: Manifest, minFirefox: string) {
-  const { issues, permissionsToRemove } = analyzeManifest(manifest, { minFirefox });
-  return { issues: [...issues, ...scanExtension(extPath, manifest, { minFirefox })], permissionsToRemove };
+function issuesOf(extPath: string, manifest: Manifest, settings: BuildSettings & { minFirefox: string }) {
+  const shim = settings.generateShim !== false;
+  const { issues, permissionsToRemove } = analyzeManifest(manifest, { minFirefox: settings.minFirefox, shim, oauthBridge: settings.oauthBridge !== false });
+  return { issues: [...issues, ...scanExtension(extPath, manifest, { minFirefox: settings.minFirefox, shim })], permissionsToRemove };
 }
 
 export type AnalyzeOptions = Pick<ConvertOptions, "input" | "addonId"> & BuildSettings;
@@ -316,7 +317,7 @@ export function analyzeExtension(opts: AnalyzeOptions): Analysis {
   const scratch = scratchDir();
   try {
     const src = load(opts.input, scratch.path, opts.minFirefoxVersion ?? DEFAULT_MIN_FIREFOX);
-    const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, src.minFirefox);
+    const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, { ...opts, minFirefox: src.minFirefox });
     const addonId = opts.addonId ?? deriveAddonId({ chromeId: src.chromeId, name: src.name });
     const quiet: Log = { ok() {}, warn() {} };
     const { manifest: built } = buildAddon({ ...src, permissionsToRemove, addonId }, join(scratch.path, STAGE_DIR), opts, quiet);
@@ -554,7 +555,7 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     result.chromeId = src.chromeId;
     ok(`Loaded "${src.name}" (MV${result.manifestVersion})`);
 
-    const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, src.minFirefox);
+    const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, { ...opts, minFirefox: src.minFirefox });
     result.issues = issues;
     const blocking = countBlocking(issues, opts.strict);
     if (blocking > 0 && !opts.force) {

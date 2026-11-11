@@ -144,6 +144,8 @@ type ApiNote = {
   message: string;
   fix: string;
   shimmed?: boolean;
+  /** For a shimmed entry: what happens in a build without the shim (--no-shim). */
+  unshimmed?: string;
   /** First Firefox release with the API; the analyzer skips the entry when --min-firefox is at least this. */
   since?: string;
 };
@@ -302,6 +304,7 @@ const HAND_NOTES: Record<string, ApiNote> = {
     message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT", which Firefox\'s context types lack, is answered by the shim from its offscreen emulation, which also adds the member to runtime.ContextType.',
     fix: "No action needed.",
     shimmed: true,
+    unshimmed: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT" fails, because Firefox\'s context types lack it.',
   },
 };
 
@@ -373,7 +376,7 @@ function buildApiTable(): Record<string, ApiNote> {
     };
   }
   for (const [name, note] of Object.entries(SHIMMED_APIS)) {
-    table[apiKey(name)] = { severity: "info", ...note, shimmed: true };
+    table[apiKey(name)] = { severity: "info", ...note, shimmed: true, unshimmed: missingMessage(name, !name.includes(".")) };
   }
   return { ...table, ...HAND_NOTES };
 }

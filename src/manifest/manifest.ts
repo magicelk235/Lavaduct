@@ -422,7 +422,11 @@ const KEY_GATES: Array<{ since: string; applies: (m: Manifest) => boolean; messa
   },
 ];
 
-export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): ManifestAnalysis {
+/**
+ * `shim: false` (--no-shim) and `oauthBridge: false` (--no-oauth-bridge) describe a
+ * build without that emulation, so nothing it would cover is reported as shimmed.
+ */
+export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: boolean; oauthBridge?: boolean }): ManifestAnalysis {
   const issues: Issue[] = [];
   const permissionsToRemove: string[] = [];
   const before = (version: string) => compareFirefoxVersions(opts.minFirefox, version) < 0;
@@ -500,7 +504,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     if (perm === "<all_urls>" || perm.includes("://") || !Object.hasOwn(FIREFOX_PERMISSION_SUPPORT, perm)) continue;
     const since = FIREFOX_PERMISSION_SUPPORT[perm];
     if (since === null) {
-      const shimmed = SHIMMED_PERMISSIONS.has(perm);
+      const shimmed = opts.shim !== false && SHIMMED_PERMISSIONS.has(perm);
       issues.push({
         severity: shimmed ? "info" : "warning",
         category: "permission",
@@ -508,7 +512,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
           ? `Permission "${perm}" is removed (Firefox doesn't know it), but the shim keeps the feature working.`
           : `Unsupported permission "${perm}" will be removed; Firefox doesn't have it.`,
         file: "manifest.json",
-        fix: UNSUPPORTED_PERMISSIONS[perm],
+        fix: shimmed || !SHIMMED_PERMISSIONS.has(perm) ? UNSUPPORTED_PERMISSIONS[perm] : `--no-shim leaves out the emulation, so the "${perm}" features don't work.`,
         autoFixed: true,
         ...(shimmed ? { shimmed: true } : {}),
       });
@@ -557,7 +561,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       if (perm !== "<all_urls>" && !perm.includes("://")) continue;
       const err = patternError(perm);
       if (err !== null) {
-        const favicon = perm.startsWith("chrome://favicon");
+        const favicon = opts.shim !== false && perm.startsWith("chrome://favicon");
         issues.push({
           severity: favicon ? "info" : "warning",
           category: "permission",
@@ -803,14 +807,24 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
 
   const ec = m.externally_connectable;
   if (strings(ec?.matches).length > 0) {
-    issues.push({
-      severity: "info",
-      category: "manifest",
-      message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage calls (a port from runtime.connect never connects).",
-      file: "manifest.json",
-      fix: "Re-test sign-in and site integrations; --no-oauth-bridge turns the bridge off.",
-      shimmed: true,
-    });
+    issues.push(
+      opts.oauthBridge === false
+        ? {
+            severity: "warning",
+            category: "manifest",
+            message: "Firefox doesn't support externally_connectable, and --no-oauth-bridge leaves out the page bridge, so the listed sites can't message the extension.",
+            file: "manifest.json",
+            fix: "Convert without --no-oauth-bridge to relay their runtime.sendMessage calls.",
+          }
+        : {
+            severity: "info",
+            category: "manifest",
+            message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage calls (a port from runtime.connect never connects).",
+            file: "manifest.json",
+            fix: "Re-test sign-in and site integrations; --no-oauth-bridge turns the bridge off.",
+            shimmed: true,
+          },
+    );
   }
   const ids = strings(ec?.ids).filter((id) => id !== "*");
   if (ids.length > 0) {

@@ -133,7 +133,14 @@ function majorVersion(v: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function scanJsContent(content: string, rel: string, issues: Issue[], isClassicServiceWorker: boolean, minFirefox: string, unloadingBackground: boolean): void {
+function scanJsContent(
+  content: string,
+  rel: string,
+  issues: Issue[],
+  isClassicServiceWorker: boolean,
+  opts: { minFirefox: string; shim: boolean; unloadingBackground: boolean },
+): void {
+  const { minFirefox, unloadingBackground } = opts;
   const lineAt = makeLineResolver(content);
 
   const hits: Array<{ name: string; at: number; info: (typeof API_PATTERNS)[number]["info"] }> = [];
@@ -147,14 +154,16 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isClassicS
     // A more specific match (chrome.identity.launchWebAuthFlow) subsumes the
     // generic namespace one (chrome.identity) — skip the duplicate.
     if (hits.some((o) => o !== h && o.name.startsWith(h.name + "."))) continue;
+    // Without the shim (--no-shim) nothing emulates the API.
+    const lacking = h.info.shimmed === true && !opts.shim;
     issues.push({
-      severity: h.info.severity,
+      severity: lacking ? "warning" : h.info.severity,
       category: "api",
-      message: h.info.message,
+      message: lacking ? (h.info.unshimmed ?? h.info.message) : h.info.message,
       file: rel,
       line: lineAt(h.at),
-      fix: h.info.fix,
-      shimmed: h.info.shimmed,
+      fix: lacking ? "--no-shim leaves out the emulation: convert without it, or feature-detect the API." : h.info.fix,
+      shimmed: lacking ? undefined : h.info.shimmed,
     });
   }
 
@@ -252,8 +261,10 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isClassicS
  * runs every disk-backed check (missing manifest files, _locales consistency,
  * chrome.* APIs Firefox lacks, background timers and importScripts, favicon
  * access, hardcoded extension and chrome:// URLs, main-world scripting).
+ * `shim: false` (--no-shim) reports what the shim would emulate as missing.
  */
-export function scanExtension(extPath: string, manifest: Manifest, opts: { minFirefox: string }): Issue[] {
+export function scanExtension(extPath: string, manifest: Manifest, opts: { minFirefox: string; shim?: boolean }): Issue[] {
+  const shim = opts.shim !== false;
   const issues: Issue[] = [];
 
   // Declared icon paths that don't exist on disk → Firefox shows a blank icon and
@@ -427,15 +438,26 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
       const m = FAVICON_RE.exec(content);
       if (m) {
         faviconNoted = true;
-        issues.push({
-          severity: "info",
-          category: "api",
-          message: "Favicon access via chrome://favicon / _favicon; the shim serves these URLs for <img> and fetch.",
-          file: rel,
-          line: lineAt(m.index),
-          fix: "No action needed for images and fetch; a favicon URL used from CSS isn't covered.",
-          shimmed: true,
-        });
+        issues.push(
+          shim
+            ? {
+                severity: "info",
+                category: "api",
+                message: "Favicon access via chrome://favicon / _favicon; the shim serves these URLs for <img> and fetch.",
+                file: rel,
+                line: lineAt(m.index),
+                fix: "No action needed for images and fetch; a favicon URL used from CSS isn't covered.",
+                shimmed: true,
+              }
+            : {
+                severity: "warning",
+                category: "api",
+                message: "Favicon access via chrome://favicon / _favicon; Firefox has no favicon service for add-ons, so these URLs don't load.",
+                file: rel,
+                line: lineAt(m.index),
+                fix: "--no-shim leaves out the shim that serves them; convert without it.",
+              },
+        );
       }
     }
 
@@ -477,14 +499,25 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
       const m = NEW_TAB_URL_RE.exec(content);
       if (m) {
         newTabNoted = true;
-        issues.push({
-          severity: "info",
-          category: "api",
-          message: "chrome://newtab is opened as Firefox's new tab page: the shim drops the URL from tabs.create, tabs.update and windows.create, which refuse chrome:// URLs.",
-          file: rel,
-          line: lineAt(m.index),
-          shimmed: true,
-        });
+        issues.push(
+          shim
+            ? {
+                severity: "info",
+                category: "api",
+                message: "chrome://newtab is opened as Firefox's new tab page: the shim drops the URL from tabs.create, tabs.update and windows.create, which refuse chrome:// URLs.",
+                file: rel,
+                line: lineAt(m.index),
+                shimmed: true,
+              }
+            : {
+                severity: "warning",
+                category: "api",
+                message: "chrome://newtab can't be opened: tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox.",
+                file: rel,
+                line: lineAt(m.index),
+                fix: "--no-shim leaves out the shim that opens Firefox's new tab page instead; convert without it.",
+              },
+        );
       }
     }
 
@@ -503,7 +536,7 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
       }
     }
 
-    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel, opts.minFirefox, unloadingBackground);
+    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel, { minFirefox: opts.minFirefox, shim, unloadingBackground });
   }
 
   return issues;
