@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import type * as Sqlite from "node:sqlite";
@@ -65,18 +65,39 @@ function fileStamp(path: string): string {
   }
 }
 
+// Copies what `src` holds up to wherever it ends now. copyFileSync can't be used
+// on a live -wal: libuv asks for as many bytes as the file had when the copy
+// began, and when SQLite truncates the file during a checkpoint every read past
+// the new end returns nothing and the copy never finishes.
+function copyToEnd(src: string, dest: string, chunk: Buffer): void {
+  const input = openSync(src, "r");
+  try {
+    const output = openSync(dest, "w");
+    try {
+      for (let n; (n = readSync(input, chunk, 0, chunk.length, null)) > 0; ) {
+        for (let off = 0; off < n; ) off += writeSync(output, chunk, off, n - off);
+      }
+    } finally {
+      closeSync(output);
+    }
+  } finally {
+    closeSync(input);
+  }
+}
+
 // Firefox holds an exclusive lock on the live database on macOS and Linux, and
 // opening it at all would leave a -shm file in the profile, so the database and
 // its -wal are copied and the copy is read. A copy Firefox wrote to halfway
-// through is taken again.
+// through, or cut short, is taken again.
 function copyDatabase(dbPath: string, scratch: string): string {
   const sources = [dbPath, `${dbPath}-wal`];
+  const chunk = Buffer.allocUnsafe(1 << 20);
   for (let attempt = 0; attempt < 5; attempt++) {
     const before = sources.map(fileStamp).join();
     for (const src of sources) {
       const dest = join(scratch, basename(src));
       try {
-        copyFileSync(src, dest);
+        copyToEnd(src, dest, chunk);
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
         rmSync(dest, { force: true });
