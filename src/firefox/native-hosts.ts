@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { ENV_PREFIX } from "../name.js";
 import { readState, stateDir, writeState } from "../state.js";
 import { walkScripts } from "../input/stage.js";
@@ -259,13 +259,20 @@ export function registerNativeHosts(
     }
 
     // A machine-wide Firefox manifest belongs to the app: the copy keeps the
-    // program and the add-ons it names.
+    // program and the add-ons it names. Windows Firefox resolves a relative
+    // program path against the manifest's folder, which the copy leaves.
     const base = existing ? readManifest(existing.file) : undefined;
     const source = base ?? chrome.manifest;
+    const basePath = base && typeof base.path === "string" ? base.path : undefined;
     const manifest = {
       name,
       description: typeof source.description === "string" ? source.description : name,
-      path: base && typeof base.path === "string" ? base.path : program,
+      path:
+        existing && basePath !== undefined
+          ? sys.platform === "win32" && !win32.isAbsolute(basePath)
+            ? win32.join(win32.dirname(existing.file), basePath)
+            : basePath
+          : program,
       type: "stdio",
       allowed_extensions: [...(base ? strings(base.allowed_extensions) : []), opts.addonId],
     };
@@ -319,6 +326,16 @@ export function unregisterNativeHosts(addonId: string, sys: HostSystem = hostSys
       notes.push({ ok: false, detail: `${rec.file} can't be written: ${(e as Error).message}` });
     }
   }
-  writeState(RECORDS_FILE, records.filter((r) => r.addonId !== addonId));
+  const kept = records.filter((r) => r.addonId !== addonId);
+  // A manifest written for this add-on that other add-ons still use passes to
+  // one of them, so the last to go removes it (and its registry key).
+  for (const rec of records) {
+    if (rec.addonId !== addonId || !rec.created) continue;
+    const heir = kept.find((r) => r.file === rec.file);
+    if (!heir) continue;
+    heir.created = true;
+    if (rec.registryKey !== undefined) heir.registryKey = rec.registryKey;
+  }
+  writeState(RECORDS_FILE, kept);
   return notes;
 }

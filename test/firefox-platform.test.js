@@ -218,8 +218,8 @@ test("Linux: each kind of install reads its own profile root", () => {
     // A relative XDG_CONFIG_HOME is invalid by the XDG spec and ignored.
     assert.equal(linuxProfileRoot(undefined, home, { XDG_CONFIG_HOME: "cfg" }), join(home, ".config/mozilla/firefox"));
     assert.equal(linuxProfileRoot(undefined, home, { MOZ_LEGACY_HOME: "1" }), join(home, ".mozilla/firefox"));
-    // Any ~/.mozilla (native messaging hosts, other Mozilla apps) keeps the legacy layout.
-    mkdirSync(join(home, ".mozilla/native-messaging-hosts"), { recursive: true });
+    // The legacy profile root itself, ~/.mozilla/firefox, keeps the legacy layout.
+    mkdirSync(join(home, ".mozilla/firefox"), { recursive: true });
     assert.equal(linuxProfileRoot(undefined, home, {}), join(home, ".mozilla/firefox"));
 
     assert.equal(linuxProfileRoot("snap", home, {}), join(home, "snap/firefox/common/.mozilla/firefox"));

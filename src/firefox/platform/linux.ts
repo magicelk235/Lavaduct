@@ -103,10 +103,13 @@ export function sandboxHome(sandbox: Sandbox, home: string): string {
 
 /**
  * The profiles.ini directory an install reads. Firefox 147+ uses
- * $XDG_CONFIG_HOME/mozilla/firefox unless ~/.mozilla already exists or
- * MOZ_LEGACY_HOME=1. The snap keeps the legacy layout under its own $HOME.
- * The Flatpak persists ~/.mozilla in its app folder and points
- * XDG_CONFIG_HOME at the app's config folder.
+ * $XDG_CONFIG_HOME/mozilla/firefox unless the legacy root ~/.mozilla/firefox
+ * (or ~/mozilla, its MOZ_USER_DIR) already exists, or MOZ_LEGACY_HOME=1. A
+ * bare ~/.mozilla doesn't count: native messaging apps create
+ * ~/.mozilla/native-messaging-hosts, which Firefox still reads, on XDG
+ * machines too. The snap keeps the legacy layout under its own $HOME. The
+ * Flatpak persists ~/.mozilla in its app folder and points XDG_CONFIG_HOME at
+ * the app's config folder.
  */
 export function linuxProfileRoot(
   sandbox: Sandbox | undefined,
@@ -116,16 +119,19 @@ export function linuxProfileRoot(
   if (sandbox === "snap") return join(sandboxHome("snap", home), ".mozilla", "firefox");
   if (sandbox === "flatpak") {
     const app = sandboxHome("flatpak", home);
-    return existsSync(join(app, ".mozilla"))
-      ? join(app, ".mozilla", "firefox")
-      : join(app, "config", "mozilla", "firefox");
+    const legacy = join(app, ".mozilla", "firefox");
+    return existsSync(legacy) ? legacy : join(app, "config", "mozilla", "firefox");
   }
-  if (existsSync(join(home, ".mozilla")) || env.MOZ_LEGACY_HOME?.startsWith("1")) {
-    return join(home, ".mozilla", "firefox");
+  const legacy = join(home, ".mozilla", "firefox");
+  if (existsSync(legacy) || existsSync(join(home, "mozilla")) || env.MOZ_LEGACY_HOME?.startsWith("1")) {
+    return legacy;
   }
-  // Firefox ignores a relative XDG_CONFIG_HOME, as the XDG spec says to.
-  const xdg = env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : join(home, ".config");
-  return join(xdg, "mozilla", "firefox");
+  return join(xdgConfigHome(home, env), "mozilla", "firefox");
+}
+
+/** $XDG_CONFIG_HOME, or ~/.config when it is unset or relative: Firefox ignores a relative one, as the XDG spec says to. */
+function xdgConfigHome(home: string, env: { XDG_CONFIG_HOME?: string }): string {
+  return env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : join(home, ".config");
 }
 
 /**
@@ -145,28 +151,44 @@ export function procLocksHolder(procLocks: string, inode: bigint): { pid: number
   return undefined;
 }
 
+function readProcLocks(): string | undefined {
+  try {
+    return readFileSync("/proc/locks", "utf-8");
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Firefox holds an fcntl lock on `.parentlock` and also writes a `lock`
- * symlink. /proc/locks shows the fcntl lock with a PID from this process's
- * namespace, which also covers the Flatpak's sandboxed Firefox. The symlink is
- * the fallback where /proc/locks isn't available.
+ * symlink to `<ip>:+<pid>`. /proc/locks shows the fcntl lock with a PID from
+ * this process's namespace, which also covers the Flatpak's sandboxed Firefox.
+ * Where fcntl locks fail (NFS without a lock daemon), Firefox locks with the
+ * symlink alone, written without the `+`. The symlink is also the fallback
+ * where /proc/locks isn't available.
  */
-function lockState(profilePath: string): { locked: boolean; pid?: number } {
+export function lockState(
+  profilePath: string,
+  readLocks: () => string | undefined = readProcLocks,
+): { locked: boolean; pid?: number } {
+  const symlink = join(profilePath, "lock");
   const stat = statSync(join(profilePath, ".parentlock"), { bigint: true, throwIfNoEntry: false });
   if (stat) {
-    let procLocks: string | undefined;
-    try {
-      procLocks = readFileSync("/proc/locks", "utf-8");
-    } catch {
-      procLocks = undefined;
-    }
+    const procLocks = readLocks();
     if (procLocks !== undefined) {
       const holder = procLocksHolder(procLocks, stat.ino);
-      if (!holder) return { locked: false };
-      return { locked: true, pid: holder.pid > 0 ? holder.pid : undefined };
+      if (holder) return { locked: true, pid: holder.pid > 0 ? holder.pid : undefined };
+      let target: string | undefined;
+      try {
+        target = readlinkSync(symlink);
+      } catch {
+        target = undefined;
+      }
+      // A `+` symlink without its fcntl lock is what a Firefox that died left.
+      if (target === undefined || target.includes(":+")) return { locked: false };
     }
   }
-  const pid = symlinkLockHolder(join(profilePath, "lock"));
+  const pid = symlinkLockHolder(symlink);
   return { locked: pid !== undefined, pid };
 }
 
@@ -186,7 +208,7 @@ export const linux: Platform = {
     // Both native roots can exist when an older and a newer Firefox share a machine.
     return [
       join(home, ".mozilla", "firefox"),
-      join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "mozilla", "firefox"),
+      join(xdgConfigHome(home, process.env), "mozilla", "firefox"),
       join(sandboxHome("snap", home), ".mozilla", "firefox"),
       join(flatpak, ".mozilla", "firefox"),
       join(flatpak, "config", "mozilla", "firefox"),
