@@ -100,8 +100,26 @@ function errorDetail(status: number, body: unknown): string {
   return messagesOf(body).join(" ") || `HTTP ${status}`;
 }
 
+// A failed request, or a connection dropped mid-response (undici's bare "terminated"),
+// named after the reason undici keeps on the error's cause.
+function unreachable(url: string, err: unknown): Error {
+  const cause = err instanceof Error ? err.cause : undefined;
+  const reason =
+    (cause instanceof Error && (cause.message || (cause as NodeJS.ErrnoException).code)) ||
+    (err instanceof Error ? err.message : String(err));
+  return new Error(`Couldn't reach AMO at ${new URL(url).origin}: ${reason}`);
+}
+
+async function readBytes(res: Response): Promise<Buffer> {
+  try {
+    return Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    throw unreachable(res.url, err);
+  }
+}
+
 async function readBody(res: Response): Promise<unknown> {
-  const text = await res.text();
+  const text = (await readBytes(res)).toString("utf-8");
   try {
     return JSON.parse(text);
   } catch {
@@ -140,15 +158,11 @@ async function amoFetch(
         },
       });
     } catch (err) {
-      const cause = err instanceof Error ? err.cause : undefined;
-      const reason =
-        (cause instanceof Error && (cause.message || (cause as NodeJS.ErrnoException).code)) ||
-        (err instanceof Error ? err.message : String(err));
-      throw new Error(`Couldn't reach AMO at ${new URL(url).origin}: ${reason}`);
+      throw unreachable(url, err);
     }
     if (res.status !== 429) return res;
 
-    await res.arrayBuffer();
+    await readBytes(res);
     const header = res.headers.get("retry-after")?.trim() ?? "";
     const seconds = /^\d+$/.test(header) ? Number(header) : Math.ceil((Date.parse(header) - Date.now()) / 1000);
     const wait = Number.isFinite(seconds) ? Math.max(1, seconds) : DEFAULT_RETRY_AFTER_SECONDS;
@@ -360,7 +374,7 @@ async function awaitSignature(
       if (!download.ok) {
         throw new Error(`Couldn't download the signed version ${version} from AMO (HTTP ${download.status}).`);
       }
-      const data = Buffer.from(await download.arrayBuffer());
+      const data = await readBytes(download);
       writeSignedCache(addonId, contentHash, version, data);
       mkdirSync(dirname(signedXpiPath), { recursive: true });
       writeFileSync(signedXpiPath, data);
