@@ -36,8 +36,6 @@ export interface ShimConfig {
   serviceWorker?: boolean;
   /** That worker's script, root-relative: the Chrome manifest's background.service_worker. */
   serviceWorkerScript?: string;
-  /** Hosts whose requests from the add-on carry its Chrome origin (see backendHosts). */
-  backendHosts?: string[];
   /** The worker's webpack chunk-loading global, when its chunks load ahead of it (see wireBackground). */
   webpackChunkGlobal?: string;
   /** The Chrome manifest asks for userScripts, which Firefox only grants at runtime. */
@@ -151,7 +149,6 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
     serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
-    backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
@@ -190,28 +187,6 @@ export function usesDebugger(dir: string, manifest: Manifest): boolean {
     }
   }
   return false;
-}
-
-/**
- * The hosts an extension's pages may talk to by its own content security policy
- * (extension_pages connect-src): its backends. Chrome sends them the extension's
- * chrome-extension://<id> origin, which some allow by name; Firefox would send a
- * moz-extension:// origin with a random per-install host. Wildcard hosts give
- * their domain, which covers every subdomain.
- */
-export function backendHosts(manifest: Manifest): string[] {
-  const cspObj = manifest.content_security_policy;
-  const csp = typeof cspObj === "string" ? cspObj : typeof cspObj?.extension_pages === "string" ? cspObj.extension_pages : "";
-  const hosts = new Set<string>();
-  for (const directive of csp.split(";")) {
-    const [name, ...sources] = directive.trim().split(/\s+/);
-    if (name?.toLowerCase() !== "connect-src") continue;
-    for (const source of sources) {
-      const host = /^(?:(?:https?|wss?):\/\/)?(?:\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?(?:\/.*)?$/i.exec(source)?.[1];
-      if (host) hosts.add(host.toLowerCase());
-    }
-  }
-  return [...hosts].sort();
 }
 
 /**

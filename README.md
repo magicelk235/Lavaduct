@@ -111,8 +111,8 @@ all sites. A background that was a service worker says so to code that asks
 (`ServiceWorkerGlobalScope`), and its pages still reach it through
 `navigator.serviceWorker` while it reaches them through `clients`, both carried
 over `postMessage` to the event page. `chrome://newtab` opens Firefox's new tab
-page, and the add-on's requests to the backends its CSP names carry its Chrome
-origin.
+page, and the add-on's own requests to the hosts it has access to carry its
+Chrome origin.
 Chrome's enum objects that Firefox lacks (declarativeNetRequest's `RuleActionType`,
 `HeaderOperation` and the like, `identity.AccountStatus`, `storage.AccessLevel`) are
 there for code that builds arguments from them. Rules the code adds at runtime get

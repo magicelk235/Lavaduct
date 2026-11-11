@@ -13,7 +13,7 @@
 //     extension's pages, and `clients`, `registration` and the `message` event
 //     in the background, over window.postMessage;
 //   - chrome://newtab URLs, which tabs.create and windows.create refuse;
-//   - the add-on's Chrome origin on requests to its own backends;
+//   - the add-on's Chrome origin on its own requests;
 //   - Chrome's enum objects that Firefox's declarativeNetRequest, identity and
 //     storage lack;
 //   - declarativeNetRequest rules added at runtime that Firefox would refuse;
@@ -1508,19 +1508,22 @@
     });
   }
 
-  // ── The add-on's origin at its own backends ────────────────────────────────
-  // Chrome sends an extension's requests with its chrome-extension://<id> origin,
-  // and some backends allow the extension by that name: a WebSocket handshake
-  // with Firefox's moz-extension://<random uuid> origin is refused outright.
-  // For the hosts the add-on's own content security policy lets it connect to,
-  // a session rule gives its requests (and only its: the initiator is this
-  // add-on) the Chrome origin they have in Chrome.
+  // ── The add-on's Chrome origin on its own requests ─────────────────────────
+  // Chrome sends every request an extension's own pages make with its
+  // chrome-extension://<id> origin, and some backends allow the extension by
+  // that name only: Firefox's moz-extension://<random uuid> origin gets a
+  // WebSocket handshake refused, or a 403 "Not allowed by CORS". A session rule
+  // gives the add-on's own requests (the initiator is this add-on, never a tab
+  // or a content script) the Chrome origin they have in Chrome. Firefox applies
+  // a modifyHeaders rule only to requests the add-on has host access to, and
+  // those are the ones Firefox exempts from CORS, so the origin a server
+  // reflects back never has to match. Requests to other hosts keep Firefox's
+  // origin, and its CORS check passes as before.
   var BACKEND_ORIGIN_RULE_ID = 2147480001;
 
   function installBackendOrigin() {
-    var hosts = Array.isArray(CONFIG.backendHosts) ? CONFIG.backendHosts : [];
     var dnr = api.declarativeNetRequest;
-    if (!isBackground || !hosts.length || !CONFIG.extensionId || !dnr || typeof dnr.updateSessionRules !== "function") return;
+    if (!isBackground || !CONFIG.extensionId || !dnr || typeof dnr.updateSessionRules !== "function") return;
     var rule = {
       id: BACKEND_ORIGIN_RULE_ID,
       priority: 1,
@@ -1528,7 +1531,7 @@
         type: "modifyHeaders",
         requestHeaders: [{ header: "origin", operation: "set", value: "chrome-extension://" + String(CONFIG.extensionId).toLowerCase() }],
       },
-      condition: { requestDomains: hosts, initiatorDomains: [loc.host], resourceTypes: ["websocket", "xmlhttprequest", "other"] },
+      condition: { initiatorDomains: [loc.host], resourceTypes: ["websocket", "xmlhttprequest", "other"] },
     };
     Promise.resolve(dnr.updateSessionRules({ removeRuleIds: [BACKEND_ORIGIN_RULE_ID], addRules: [rule] })).catch(function (e) {
       dbg("backend origin rule failed:", errorMessage(e));
