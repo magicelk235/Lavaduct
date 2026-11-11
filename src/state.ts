@@ -36,11 +36,31 @@ export function readState<T>(file: string, fallback: T): T {
   }
 }
 
+// Windows refuses a rename onto a file another process is renaming onto or reading
+// at that moment (EPERM, EACCES or EBUSY), where POSIX just replaces it. Runs that
+// write the same state file at once wait out each other's few milliseconds.
+const RENAME_RETRY_MS = 2_000;
+const RENAME_WAIT = new Int32Array(new SharedArrayBuffer(4));
+
+function renameReplacing(from: string, to: string): void {
+  const deadline = Date.now() + RENAME_RETRY_MS;
+  for (;;) {
+    try {
+      renameSync(from, to);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform !== "win32" || !(code === "EPERM" || code === "EACCES" || code === "EBUSY") || Date.now() > deadline) throw err;
+      Atomics.wait(RENAME_WAIT, 0, 0, 10);
+    }
+  }
+}
+
 /** Write a JSON file into the state dir atomically (temp file + rename). */
 export function writeState(file: string, value: unknown): void {
   const path = join(stateDir(), file);
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n");
-  renameSync(tmp, path);
+  renameReplacing(tmp, path);
 }
