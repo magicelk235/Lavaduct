@@ -385,6 +385,42 @@ function lacksSandboxCsp(m: Manifest): boolean {
   return typeof sandbox === "object" && sandbox !== null && typeof Reflect.get(sandbox, "content_security_policy") !== "string";
 }
 
+/** Calls `fn` on every CSP string in the manifest and stores what it returns:
+ * each string member of an MV3 content_security_policy (`where` is its key),
+ * MV2's string policy ("content_security_policy") and MV2's sandbox policy
+ * ("sandbox.content_security_policy"). */
+function mapManifestCsps(m: Manifest, fn: (csp: string, where: string) => string): void {
+  const csp = m.content_security_policy;
+  if (typeof csp === "string") m.content_security_policy = fn(csp, "content_security_policy");
+  else if (typeof csp === "object" && csp !== null) {
+    for (const [key, value] of Object.entries(csp)) if (typeof value === "string") csp[key] = fn(value, key);
+  }
+  const sandbox: unknown = m.sandbox;
+  if (typeof sandbox === "object" && sandbox !== null) {
+    const policy: unknown = Reflect.get(sandbox, "content_security_policy");
+    if (typeof policy === "string") Reflect.set(sandbox, "content_security_policy", fn(policy, "sandbox.content_security_policy"));
+  }
+}
+
+// A CSP source can name every host with a bare "*" and still restrict the path
+// (http://*/api/test). Firefox's parser refuses a wildcard host followed by a
+// path ("Couldn't parse invalid host") and drops the source; it takes one
+// followed by a port. A source without a port means the scheme's default port,
+// so writing that port in keeps the source as Chrome reads it.
+const CSP_DEFAULT_PORTS: Record<string, string> = { http: "80", ws: "80", https: "443", wss: "443" };
+const CSP_WILDCARD_HOST_PATH = /(^|[\s;])((https?|wss?):\/\/\*)(\/[^\s;]*)/gi;
+
+/** The sources in `csp` that Firefox drops for a wildcard host followed by a path. */
+export function cspWildcardHostPaths(csp: string): string[] {
+  return [...csp.matchAll(CSP_WILDCARD_HOST_PATH)].map((match) => match[2] + match[4]);
+}
+
+/** `csp` with the default port written after each wildcard host a path follows. */
+export function withWildcardHostPorts(csp: string): string {
+  return csp.replace(CSP_WILDCARD_HOST_PATH, (_all, lead: string, origin: string, scheme: string, path: string) =>
+    `${lead}${origin}:${CSP_DEFAULT_PORTS[scheme.toLowerCase()]}${path}`);
+}
+
 // Manifest keys Firefox added after its first Manifest V3 release, and what an older
 // Firefox does when it meets them.
 const KEY_GATES: Array<{ since: string; applies: (m: Manifest) => boolean; message: string; category: string }> = [
@@ -676,6 +712,21 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       severity: "info",
       category: "manifest",
       message: "sandbox pages without a sandbox CSP get script-src 'self' in Firefox, which blocks eval() and inline scripts there; Chrome's default sandbox CSP, which allows both, is written into the manifest.",
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
+  const wildcardPaths = new Set<string>();
+  mapManifestCsps(JSON.parse(JSON.stringify(m)), (policy) => {
+    for (const source of cspWildcardHostPaths(policy)) wildcardPaths.add(source);
+    return policy;
+  });
+  if (wildcardPaths.size > 0) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `CSP source(s) ${[...wildcardPaths].join(", ")} name every host and a path; Firefox can't parse a wildcard host followed by a path and drops the source, so the scheme's default port is written after the wildcard, which Firefox accepts and which matches the same URLs.`,
       file: "manifest.json",
       autoFixed: true,
     });
@@ -1068,6 +1119,8 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
       out.sandbox = Object.assign({}, out.sandbox, { content_security_policy: CHROME_SANDBOX_CSP });
     }
   }
+
+  mapManifestCsps(out, withWildcardHostPorts);
 
   // An extension that only adds rules at runtime may declare rule_resources: [],
   // which Chrome accepts. Firefox wants at least one ruleset there and refuses the
