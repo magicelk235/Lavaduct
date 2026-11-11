@@ -36,7 +36,7 @@ import { deriveAddonId } from "./sign/addon-id.js";
 import { signWithAmo } from "./sign/amo.js";
 import { zipDirectory } from "./zip/write.js";
 import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firefox/locate.js";
-import { dedicatedProfile, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
+import { dedicatedProfile, profileDowngradeProblem, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
 import { openXpiInFirefox, quitFirefoxForProfile, startedBeforeUserJs } from "./firefox/launch.js";
 import { BidiSession } from "./firefox/bidi.js";
 import { RdpSession } from "./firefox/rdp.js";
@@ -374,6 +374,10 @@ function planRoute(opts: ConvertOptions, minFirefox: string): Plan {
   // The temporary route turns remote debugging on in a profile of its own, not the user's, unless told otherwise.
   const profile =
     route.route === "temporary" && opts.profile === undefined ? dedicatedProfile(install) : resolveProfile(opts.profile, install);
+  // A Firefox that has the profile open may take the add-on without a restart;
+  // the install routes check again before they start one.
+  const downgrade = profileInUse(profile.path) ? undefined : profileDowngradeProblem(install, profile.path);
+  if (downgrade) throw new Error(downgrade);
   return { route, target: { install, profile } };
 }
 
@@ -436,6 +440,11 @@ async function installTemporarily(
     info(`Using the Firefox that already has ${profile.path} open with remote debugging on`);
     if (raiseRuleLimit(profile.path, staticRules)) warn(RULE_LIMIT_RESTART);
   } else {
+    const downgrade = profileDowngradeProblem(install, profile.path);
+    if (downgrade) {
+      fail(downgrade);
+      return "failed";
+    }
     if (profileInUse(profile.path)) {
       if (!opts.firefoxRestart) {
         fail(
@@ -517,6 +526,11 @@ async function installByPrompt(
             `Quit Firefox and start it again, then open ${xpi} in it to install the add-on.`,
         );
         return "skipped";
+      }
+      const downgrade = profileDowngradeProblem(install, profile.path);
+      if (downgrade) {
+        fail(downgrade);
+        return "failed";
       }
       info("Restarting Firefox so the setting takes effect …");
       if (!(await quitFirefoxForProfile(install, profile.path))) {
