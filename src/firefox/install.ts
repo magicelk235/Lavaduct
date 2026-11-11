@@ -11,6 +11,39 @@ import { pathKey } from "./platform/shared.js";
 const PREF_LINE_RE = /^\s*(?:user_|sticky_)?pref\(\s*["']([^"']+)["']/;
 
 /**
+ * The pref each line of a prefs file sets, by name; undefined for lines that
+ * set none, including pref lines inside a /* … *\/ block, which Firefox's pref
+ * parser skips. Strings don't span lines; comment markers inside them don't count.
+ */
+function prefNames(lines: string[]): (string | undefined)[] {
+  let inBlock = false;
+  return lines.map((line) => {
+    const name = inBlock ? undefined : PREF_LINE_RE.exec(line)?.[1];
+    let quote: string | undefined;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inBlock) {
+        if (ch === "*" && line[i + 1] === "/") {
+          inBlock = false;
+          i++;
+        }
+      } else if (quote) {
+        if (ch === "\\") i++;
+        else if (ch === quote) quote = undefined;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === "#" || (ch === "/" && line[i + 1] === "/")) {
+        break;
+      } else if (ch === "/" && line[i + 1] === "*") {
+        inBlock = true;
+        i++;
+      }
+    }
+    return name;
+  });
+}
+
+/**
  * Prefs Firefox checks before it starts its devtools server, the one the
  * temporary route loads add-ons through.
  */
@@ -41,8 +74,9 @@ export function setUserPrefs(profilePath: string, prefs: Readonly<Record<string,
   if (lines.at(-1) === "") lines.pop();
 
   const placed = new Set<string>();
-  const kept = lines.flatMap((line) => {
-    const name = PREF_LINE_RE.exec(line)?.[1];
+  const names = prefNames(lines);
+  const kept = lines.flatMap((line, i) => {
+    const name = names[i];
     if (name === undefined || !Object.hasOwn(prefs, name)) return [line];
     if (placed.has(name)) return [];
     placed.add(name);
@@ -85,9 +119,11 @@ function numericPref(profilePath: string, name: string): number | undefined {
     } catch {
       continue;
     }
-    for (const line of text.split(/\r?\n/)) {
-      if (PREF_LINE_RE.exec(line)?.[1] !== name) continue;
-      const value = /,\s*(-?\d+)\s*\)/.exec(line)?.[1];
+    const lines = text.split(/\r?\n/);
+    const names = prefNames(lines);
+    for (let i = 0; i < lines.length; i++) {
+      if (names[i] !== name) continue;
+      const value = /,\s*(-?\d+)\s*\)/.exec(lines[i])?.[1];
       if (value !== undefined) return Number(value);
     }
   }
