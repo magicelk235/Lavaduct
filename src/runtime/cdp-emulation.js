@@ -1184,7 +1184,8 @@
         if (el && el.localName === "textarea") replaceInField(el, "\n", "insertLineBreak");
         else if (el && el.isContentEditable) {
           try { D.execCommand(base === "insertLineBreak" ? "insertLineBreak" : "insertParagraph", false, null); } catch (e) {}
-        } else if (el && el.localName === "input") submitImplicitly(el);
+        } else if (el && el.localName === "input" && /^(?:submit|reset|button|image)$/.test(String(el.type).toLowerCase())) el.click();
+        else if (el && el.localName === "input") submitImplicitly(el);
         else if (el && (el.localName === "a" || el.localName === "button" || el.localName === "summary")) el.click();
         return true;
       }
