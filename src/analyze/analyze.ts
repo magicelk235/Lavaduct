@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import type { Issue, Manifest } from "../types.js";
 import { parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
 import { UNSUPPORTED_APIS, compareFirefoxVersions } from "../manifest/compat-data.js";
@@ -8,9 +8,11 @@ import { matchBalancedParen, rootLiteralsFromGetURL, importScriptsTargets } from
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
  * symlinks are stat'ed to resolve their target kind); `seen` holds realpaths of
- * visited directories to break symlink cycles.
+ * visited directories to break symlink cycles. A symlink whose target lies
+ * outside `root` (the input's realpath) is skipped: staging never ships one, and
+ * a `link -> /` would otherwise walk the whole disk.
  */
-function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new Set<string>()): string[] {
+function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new Set<string>(), root?: string): string[] {
   let real: string;
   try {
     real = realpathSync(dir);
@@ -19,6 +21,7 @@ function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new S
   }
   if (seen.has(real)) return acc;
   seen.add(real);
+  root ??= real;
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -34,6 +37,8 @@ function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new S
     let isFile = entry.isFile();
     if (entry.isSymbolicLink()) {
       try {
+        const target = relative(root, realpathSync(full));
+        if (target.split(sep)[0] === ".." || isAbsolute(target)) continue;
         const st = statSync(full);
         isDir = st.isDirectory();
         isFile = st.isFile();
@@ -41,7 +46,7 @@ function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new S
         continue;
       }
     }
-    if (isDir) walkFiles(full, exts, acc, seen);
+    if (isDir) walkFiles(full, exts, acc, seen, root);
     else if (isFile && exts.some((e) => name.endsWith(e))) acc.push(full);
   }
   return acc;
