@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { ConvertOptions, ConvertResult, Issue, Manifest, SignRoute } from "./types.js";
 import { ENV_PREFIX, NAME } from "./name.js";
 import { extractExtension } from "./input/extract.js";
-import { applySourceRewrites, normalizeLocaleCatalogs, removeUnreadableLocales, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
+import { applySourceRewrites, matchManifestPathCase, normalizeLocaleCatalogs, removeUnreadableLocales, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import {
   analyzeManifest,
@@ -253,6 +253,15 @@ function buildAddon(
     sidebarPanel: panelPage,
     debuggerEmulation,
   });
+  for (const change of matchManifestPathCase(stageDir, out)) {
+    notes.push({
+      severity: "info",
+      category: "manifest",
+      message: `Manifest path ${change}, the file's case on disk; Firefox looks files up by exact name in the .xpi, where Chrome's case-insensitive disk found them.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
   if (!manifest.side_panel && out.sidebar_action && panelPage) {
     log.ok(`Sidebar declared for ${panelPage}, the page the extension opens with chrome.sidePanel`);
   }

@@ -880,8 +880,69 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: 
 }
 
 /**
- * Collect every concrete file path the manifest references as a runtime asset
- * (scripts, pages, css, icons, web_accessible_resources, DNR rulesets, …),
+ * Call `map` with each file path the manifest names as a runtime asset (scripts,
+ * pages, css, icons, web_accessible_resources, DNR rulesets, …) and store what it
+ * returns in its place. The one list of path-bearing keys, shared by staging and by
+ * the rewrites that edit those paths.
+ */
+export function mapManifestPaths(m: Manifest, map: (path: string) => string): void {
+  const slot = (holder: unknown, key: string | number) => {
+    if (typeof holder !== "object" || holder === null) return;
+    const record = holder as Record<string | number, unknown>;
+    const value = record[key];
+    if (typeof value !== "string" || !value) return;
+    const mapped = map(value);
+    if (mapped !== value) record[key] = mapped;
+  };
+  const each = (list: unknown) => {
+    if (Array.isArray(list)) for (let i = 0; i < list.length; i++) slot(list, i);
+  };
+  const values = (holder: unknown) => {
+    if (typeof holder === "object" && holder !== null && !Array.isArray(holder)) for (const key of Object.keys(holder)) slot(holder, key);
+  };
+
+  if (Array.isArray(m.content_scripts)) {
+    for (const cs of m.content_scripts) {
+      if (typeof cs !== "object" || cs === null) continue;
+      if ("js" in cs) each(cs.js);
+      if ("css" in cs) each(cs.css);
+    }
+  }
+  each(m.background?.scripts);
+  slot(m.background, "service_worker");
+  slot(m.background, "page");
+  for (const a of [m.action, m.browser_action, m.page_action]) {
+    slot(a, "default_popup");
+    if (typeof a?.default_icon === "string") slot(a, "default_icon");
+    else values(a?.default_icon);
+  }
+  values(m.icons);
+  slot(m, "options_page");
+  slot(m.options_ui, "page");
+  slot(m, "devtools_page");
+  values(m.chrome_url_overrides);
+  each(m.sandbox?.pages);
+  if (Array.isArray(m.declarative_net_request?.rule_resources)) for (const r of m.declarative_net_request.rule_resources) slot(r, "path");
+  // side_panel.default_path becomes the Firefox sidebar page, so a miss here leaves an
+  // empty sidebar.
+  slot(m.side_panel, "default_path");
+  slot(m.sidebar_action, "default_panel");
+  slot(m.storage, "managed_schema");
+
+  // web_accessible_resources: MV2 string[], MV3 [{resources: string[]}], or a bare
+  // string (invalid, but hand-edited manifests produce it).
+  slot(m, "web_accessible_resources");
+  if (Array.isArray(m.web_accessible_resources)) {
+    for (let i = 0; i < m.web_accessible_resources.length; i++) {
+      const entry: unknown = m.web_accessible_resources[i];
+      if (typeof entry === "string") slot(m.web_accessible_resources, i);
+      else if (typeof entry === "object" && entry !== null && "resources" in entry) each(entry.resources);
+    }
+  }
+}
+
+/**
+ * Collect every concrete file path the manifest references as a runtime asset,
  * normalized to forward-slash relative paths. Glob/wildcard resource entries
  * (containing '*') are skipped — only literal paths are returned. Used by the
  * stager so a declared resource is never dropped as "dev cruft" (e.g. a
@@ -890,53 +951,15 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: 
  */
 export function collectReferencedPaths(m: Manifest): Set<string> {
   const paths = new Set<string>();
-  const add = (p: unknown) => {
-    if (typeof p === "string" && p && !p.includes("*")) {
+  mapManifestPaths(m, (p) => {
+    if (!p.includes("*")) {
       // Drop any #fragment/?query (e.g. "devpanel.html#popup") so the concrete
       // file on disk is preserved during staging, not a phantom "…#popup" name.
       const filePart = p.split(/[#?]/)[0];
       if (filePart) paths.add(filePart.replace(/^\.?\//, "").replace(/\\/g, "/"));
     }
-  };
-  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
-
-  for (const cs of arr(m.content_scripts)) {
-    if (typeof cs !== "object" || cs === null) continue;
-    if ("js" in cs) for (const j of arr(cs.js)) add(j);
-    if ("css" in cs) for (const c of arr(cs.css)) add(c);
-  }
-  for (const b of arr(m.background?.scripts)) add(b);
-  add(m.background?.service_worker);
-  add(m.background?.page);
-  for (const a of [m.action, m.browser_action, m.page_action]) {
-    add(a?.default_popup);
-    const di = a?.default_icon;
-    if (typeof di === "string") add(di);
-    else if (di && typeof di === "object") for (const p of Object.values(di)) add(p);
-  }
-  for (const p of Object.values(m.icons ?? {})) add(p);
-  add(m.options_page);
-  add(m.options_ui?.page);
-  add(m.devtools_page);
-  for (const p of Object.values(m.chrome_url_overrides ?? {})) add(p);
-  for (const p of arr(m.sandbox?.pages)) add(p);
-  for (const r of arr(m.declarative_net_request?.rule_resources)) {
-    if (typeof r === "object" && r !== null && "path" in r) add(r.path);
-  }
-  // side_panel.default_path becomes the Firefox sidebar page, so a miss here leaves an
-  // empty sidebar.
-  add(m.side_panel?.default_path);
-  add(m.sidebar_action?.default_panel);
-  const storage = m.storage;
-  if (typeof storage === "object" && storage !== null && "managed_schema" in storage) add(storage.managed_schema);
-
-  // web_accessible_resources: MV2 string[], MV3 [{resources: string[]}], or a bare
-  // string (invalid, but hand-edited manifests produce it).
-  if (typeof m.web_accessible_resources === "string") add(m.web_accessible_resources);
-  for (const entry of arr(m.web_accessible_resources)) {
-    if (typeof entry === "string") add(entry);
-    else if (typeof entry === "object" && entry !== null && "resources" in entry) for (const r of arr(entry.resources)) add(r);
-  }
+    return p;
+  });
   return paths;
 }
 

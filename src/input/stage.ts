@@ -1,7 +1,7 @@
 import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, statSync, realpathSync, copyFileSync } from "node:fs";
 import { join, dirname, resolve, relative, sep, posix } from "node:path";
 import type { Manifest } from "../types.js";
-import { parseJsonc } from "../manifest/manifest.js";
+import { mapManifestPaths, parseJsonc } from "../manifest/manifest.js";
 
 /** Names/globs excluded from the clean staged extension. */
 const EXCLUDE_EXACT = new Set([
@@ -281,6 +281,53 @@ function firefoxReadsJson(text: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Spell each path the manifest names the way the file is named on disk. Chrome on
+ * macOS and Windows reads an unpacked or installed extension from a case-insensitive
+ * disk, so "icons/a.png" finds Icons/A.png; Firefox reads a packed .xpi by exact
+ * name, and the icon, script or page is missing (the temporary route loads the folder
+ * and hides this on macOS and Windows). A path with no file, or more than one file
+ * differing only in case, is left as it is. Returns "old → new" for each change.
+ */
+export function matchManifestPathCase(stageDir: string, manifest: Manifest): string[] {
+  const listings = new Map<string, string[] | null>();
+  const namesIn = (dir: string) => {
+    if (!listings.has(dir)) {
+      try {
+        listings.set(dir, readdirSync(dir));
+      } catch {
+        listings.set(dir, null);
+      }
+    }
+    return listings.get(dir) ?? null;
+  };
+  const changed: string[] = [];
+  mapManifestPaths(manifest, (path) => {
+    if (path.includes("*")) return path;
+    const cut = path.search(/[#?]/);
+    const filePart = cut === -1 ? path : path.slice(0, cut);
+    const lead = /^\.?\//.exec(filePart)?.[0] ?? "";
+    const actual: string[] = [];
+    let dir = stageDir;
+    for (const segment of filePart.slice(lead.length).split("/")) {
+      const names = namesIn(dir);
+      if (!names) return path;
+      let name = segment;
+      if (!names.includes(segment)) {
+        const matches = names.filter((n) => n.toLowerCase() === segment.toLowerCase());
+        if (matches.length !== 1) return path;
+        name = matches[0];
+      }
+      actual.push(name);
+      dir = join(dir, name);
+    }
+    const fixed = lead + actual.join("/") + (cut === -1 ? "" : path.slice(cut));
+    if (fixed !== path) changed.push(`${path} → ${fixed}`);
+    return fixed;
+  });
+  return changed;
 }
 
 /**
