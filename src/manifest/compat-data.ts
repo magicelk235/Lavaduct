@@ -293,18 +293,13 @@ const HAND_NOTES: Record<string, ApiNote> = {
     message: "Firefox's proxy.settings takes a different config than Chrome's (proxyType/http/ssl/autoConfigUrl instead of mode/rules/pacScript), so Chrome-style configs are rejected.",
     fix: "Translate the config, or route requests with proxy.onRequest. Firefox also only allows proxy.settings when the user lets the add-on run in private windows.",
   },
+  // Matches the string and runtime.ContextType.OFFSCREEN_DOCUMENT alike; the shim
+  // gives Firefox's ContextType the member it lacks.
   OFFSCREEN_DOCUMENT: {
     severity: "info",
-    message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT", which Firefox\'s context types lack, is answered by the shim from its offscreen emulation.',
-    fix: "No action needed when the type is passed as the string.",
+    message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT", which Firefox\'s context types lack, is answered by the shim from its offscreen emulation, which also adds the member to runtime.ContextType.',
+    fix: "No action needed.",
     shimmed: true,
-  },
-  // Firefox builds runtime.ContextType from its own context types, so this member is
-  // undefined there and getContexts() throws on the filter.
-  "ContextType.OFFSCREEN_DOCUMENT": {
-    severity: "warning",
-    message: "runtime.ContextType.OFFSCREEN_DOCUMENT is undefined in Firefox, so a getContexts() filter built from it throws.",
-    fix: 'Pass the string "OFFSCREEN_DOCUMENT", which the shim answers.',
   },
 };
 

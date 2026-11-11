@@ -1,7 +1,7 @@
-// Firefox's runtime.getContexts() has no OFFSCREEN_DOCUMENT context type, but the
-// shim answers a filter naming it from its offscreen emulation, so the analyzer
-// reports the string form as shimmed. runtime.ContextType.OFFSCREEN_DOCUMENT is
-// still undefined in Firefox, and a filter built from it throws.
+// Firefox's runtime.getContexts() has no OFFSCREEN_DOCUMENT context type and its
+// runtime.ContextType has no such member, but the shim answers a filter naming it
+// from its offscreen emulation and adds the member, so the analyzer reports both
+// forms as shimmed.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -34,11 +34,13 @@ chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] });`);
   assert.doesNotMatch(offscreen.fix, /doesn't list/);
 });
 
-test("the ContextType member Firefox lacks is still a warning", () => {
-  const issues = scan("chrome.runtime.getContexts({ contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT] });");
-  const [issue] = issues.filter((i) => i.message.includes("ContextType.OFFSCREEN_DOCUMENT"));
-  assert.equal(issue.severity, "warning");
-  assert.ok(!issue.shimmed);
+test("a filter built from runtime.ContextType is reported as shimmed too", () => {
+  const issues = scan(`chrome.offscreen.createDocument({ url: "o.html", reasons: ["DOM_PARSER"], justification: "x" });
+chrome.runtime.getContexts({ contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT] });`);
+  const ctx = issues.filter((i) => i.message.includes("OFFSCREEN_DOCUMENT"));
+  assert.equal(ctx.length, 1);
+  assert.equal(ctx[0].severity, "info");
+  assert.equal(ctx[0].shimmed, true);
 });
 
 test("Firefox has no OFFSCREEN_DOCUMENT context type or ContextType member", { skip: firefox ? false : "no Firefox install found", timeout: 120_000 }, async (t) => {
