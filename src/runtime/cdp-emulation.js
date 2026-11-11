@@ -272,16 +272,18 @@
     function thrown(e, group, compile, inPromise) {
       return { result: remote(e, false, group), exceptionDetails: exceptionDetails(e, compile, group, inPromise) };
     }
+    // A page may have replaced window.Promise (zone.js does); Firefox awaits
+    // only a native promise, which an async function always returns.
     function settle(value, wantValue, group, wait) {
       if (wait && value && typeof value.then === "function") {
-        return Promise.resolve(value).then(function (v) {
+        return (async function () {
+          var v;
+          try { v = await value; } catch (e) { return thrown(e, group, false, true); }
           try { return { result: remote(v, wantValue, group) }; } catch (e) {
             if (e instanceof Fail) return { __protocolError: e.message };
             throw e;
           }
-        }, function (e) {
-          return thrown(e, group, false, true);
-        });
+        })();
       }
       return { result: remote(value, wantValue, group) };
     }
