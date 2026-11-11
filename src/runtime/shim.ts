@@ -52,7 +52,8 @@ export interface ShimConfig {
 // to be a service worker changes what code testing for one does, and so do the
 // service worker's `clients` and `registration` in the background and
 // navigator.serviceWorker in the extension's pages; the background's Web Lock
-// names are translated only for code that takes locks.
+// names are translated only for code that takes locks, and getManifest() gains
+// the worker's script only for code that reads service_worker.
 const FAVICON_REF_RE = /chrome:\/\/favicon|(?:^|[^\w$])_favicon\//m;
 const OFFSCREEN_REF_RE = /\.\s*offscreen\b|\[\s*["']offscreen["']\s*\]/;
 const NEW_TAB_REF_RE = /["'`]chrome:\/\/new-?tab(?:-page)?\/?["'`]/i;
@@ -66,6 +67,9 @@ const SW_CLIENTS_REF_RE = /\b(?:self|globalThis)\s*\.\s*clients\b|\bclients\s*\.
 const SW_REGISTRATION_REF_RE = /\b(?:self|globalThis)\s*\.\s*registration\s*(?:\?\.|\.)\s*(?:active|installing|waiting|scope|addEventListener|update|unregister)\b/;
 const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
 const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
+// The manifest's worker script read at runtime: bundles resolve it against their
+// own location to decide whether they run in the background.
+const SW_MANIFEST_REF_RE = /\bservice_worker\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
@@ -80,6 +84,7 @@ interface Usage {
   serviceWorkerClients: boolean;
   serviceWorkerRegistration: boolean;
   pushManager: boolean;
+  serviceWorkerManifest: boolean;
   locks: boolean;
   permissions: boolean;
   extraHeaders: boolean;
@@ -89,7 +94,7 @@ interface Usage {
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
-    serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false, permissions: false,
+    serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
     extraHeaders: false, messaging: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -108,6 +113,7 @@ function scanUsage(dir: string): Usage {
       if (!found.serviceWorkerClients) found.serviceWorkerClients = SW_CLIENTS_REF_RE.test(src);
       if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
       if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
+      if (!found.serviceWorkerManifest) found.serviceWorkerManifest = SW_MANIFEST_REF_RE.test(src);
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
@@ -147,6 +153,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
     serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
+    serviceWorkerManifest: config.serviceWorker === true && usage.serviceWorkerManifest,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
