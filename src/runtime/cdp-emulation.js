@@ -1498,10 +1498,16 @@
       if (!nav) return;
       var ts = function (d) { return (d && d.timeStamp ? d.timeStamp : Date.now()) / 1000; };
       var pageOn = function (d) { var s = sessions[d.tabId]; return s && s.page; };
+      // Counts top-frame navigation starts and commits per tab, so an abort can
+      // tell whether the navigation went on.
+      var navSeq = {};
+      var navStep = function (d) { if (d.frameId === 0) navSeq[d.tabId] = (navSeq[d.tabId] || 0) + 1; };
       nav.onBeforeNavigate.addListener(function (d) {
+        navStep(d);
         if (d.frameId === 0 && pageOn(d)) emit(d.tabId, "Page.frameStartedLoading", { frameId: String(d.tabId) });
       });
       nav.onCommitted.addListener(function (d) {
+        navStep(d);
         var s = sessions[d.tabId];
         if (!s) return;
         if (d.frameId === 0) {
@@ -1533,11 +1539,21 @@
         emit(d.tabId, "Page.lifecycleEvent", { frameId: String(d.tabId), loaderId: String(d.tabId), name: "load", timestamp: ts(d) });
         emit(d.tabId, "Page.frameStoppedLoading", { frameId: String(d.tabId) });
       });
+      // Firefox cancels the first load of many navigations and loads them
+      // again (NS_BINDING_ABORTED, then a commit). An abort is a failure only
+      // when no navigation followed it and the tab stopped loading.
       nav.onErrorOccurred.addListener(function (d) {
         if (d.frameId !== 0) return;
-        var waiter = commitWaiters[d.tabId];
-        if (waiter) waiter(d.error || "Navigation failed");
-        if (pageOn(d)) emit(d.tabId, "Page.frameStoppedLoading", { frameId: String(d.tabId) });
+        var failed = function () {
+          var waiter = commitWaiters[d.tabId];
+          if (waiter) waiter(d.error || "Navigation failed");
+          if (pageOn(d)) emit(d.tabId, "Page.frameStoppedLoading", { frameId: String(d.tabId) });
+        };
+        if (!/\b2152398850\b/.test(String(d.error))) { failed(); return; }
+        var seq = navSeq[d.tabId];
+        getTab(d.tabId).then(function (tab) {
+          if (navSeq[d.tabId] === seq && tab.status !== "loading") failed();
+        }, failed);
       });
       // A fragment or history navigation never commits; it answers a
       // Page.navigate to that URL.
