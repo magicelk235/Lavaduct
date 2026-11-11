@@ -17,9 +17,13 @@ const EXCLUDE_EXACT = new Set([
   "yarn.lock",
   "pnpm-lock.yaml",
   "tsconfig.json",
+  // Credentials and editor settings a source folder holds; never runtime files.
+  ".npmrc",
+  ".vscode",
+  ".idea",
 ]);
 
-const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log"];
+const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log", ".pem"];
 // Doc/config files: bare name or name + extension only (e.g. "LICENSE",
 // "LICENSE.txt"), never a prefix match — that would drop legit runtime files
 // like "LICENSE_KEY.js" or "READMExporter.js".
@@ -27,13 +31,16 @@ const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log"];
 // the name — changelog.html, license.js, Changelog.json — must ship, or it 404s
 // at runtime (only manifest-referenced paths are otherwise protected).
 const EXCLUDE_DOC_RE = /^(README|CHANGELOG|LICENSE)(\.(txt|md|markdown|rst|adoc))?$/i;
+// Tool dotfiles, and .env files with their secrets (.env, .env.local, …).
 const EXCLUDE_DOTFILE = [".eslint", ".prettier"];
+const ENV_FILE_RE = /^\.env(\..+)?$/;
 
 function shouldExclude(name: string): boolean {
   if (EXCLUDE_EXACT.has(name)) return true;
   if (EXCLUDE_SUFFIX.some((s) => name.endsWith(s))) return true;
   if (EXCLUDE_DOC_RE.test(name)) return true;
   if (EXCLUDE_DOTFILE.some((p) => name.startsWith(p))) return true;
+  if (ENV_FILE_RE.test(name)) return true;
   return false;
 }
 
