@@ -1538,9 +1538,12 @@
   var DNR_DOMAIN_CONDITIONS = ["requestDomains", "excludedRequestDomains", "initiatorDomains", "excludedInitiatorDomains"];
   var DNR_MISSING_TYPES = { webbundle: true, webtransport: true };
 
+  // Chrome lower-cases a rule's domains, and Firefox refuses an upper-case one.
   function firefoxDomain(d) {
-    if (typeof d !== "string" || d.indexOf(":") < 0 || d.charAt(0) === "[") return d;
-    try { return new URL("http://[" + d + "]/").hostname; } catch (e) { return d; }
+    if (typeof d !== "string") return d;
+    var lower = d.toLowerCase();
+    if (lower.indexOf(":") < 0 || lower.charAt(0) === "[") return lower;
+    try { return new URL("http://[" + lower + "]/").hostname; } catch (e) { return d; }
   }
 
   // The rule as Firefox takes it, or null when it can't.
