@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, relative } from "node:path";
 import type { Manifest } from "../types.js";
+import { matchPatternError } from "../manifest/manifest.js";
 import { TEMPLATE_DIR } from "../paths.js";
 import { NAME } from "../name.js";
 import { walkScripts } from "../input/stage.js";
@@ -62,9 +63,26 @@ function patternMatches(pattern: string, url: URL): boolean {
   return new RegExp(`^${pathRe}$`).test(url.pathname + url.search);
 }
 
-function bridgedMatches(manifest: Manifest): string[] {
+/**
+ * externally_connectable.matches as content-script patterns Firefox accepts.
+ * Chrome parses them with every scheme allowed and takes a port wildcard
+ * (`http://localhost:*\/*`), while one pattern Firefox's grammar refuses in
+ * content_scripts makes it refuse the whole add-on. A port wildcard becomes the
+ * same pattern without a port, which matches every port in Firefox; any other
+ * pattern Firefox refuses is left out, with the reason.
+ */
+function bridgedMatches(manifest: Manifest): { matches: string[]; dropped: string[] } {
   const raw = manifest.externally_connectable?.matches;
-  return Array.isArray(raw) ? raw.filter((m): m is string => typeof m === "string" && m.length > 0) : [];
+  const matches: string[] = [];
+  const dropped: string[] = [];
+  for (const m of Array.isArray(raw) ? raw : []) {
+    if (typeof m !== "string" || m.length === 0) continue;
+    const pattern = m.replace(/^([^:/]*:\/\/[^/]*?):\*(?=\/)/, "$1");
+    const error = matchPatternError(pattern);
+    if (error === null) matches.push(pattern);
+    else dropped.push(`"${m}" (${error})`);
+  }
+  return { matches, dropped };
 }
 
 /**
@@ -77,7 +95,7 @@ function bridgedMatches(manifest: Manifest): string[] {
  * isn't seen.
  */
 export function framedSites(stageDir: string, manifest: Manifest): string[] {
-  const matches = bridgedMatches(manifest);
+  const { matches } = bridgedMatches(manifest);
   if (matches.length === 0) return [];
   const contentScripts = new Set(
     (Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [])
@@ -184,8 +202,10 @@ export function deriveChromeId(manifest: Manifest): string | undefined {
  * notes for the report.
  */
 export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?: string): string[] {
-  const matches = bridgedMatches(manifest);
-  if (matches.length === 0) return [];
+  const { matches, dropped } = bridgedMatches(manifest);
+  if (matches.length === 0) {
+    return dropped.length > 0 ? [`Page bridge skipped: Firefox refuses every externally_connectable pattern as a content-script match: ${dropped.join(", ")}`] : [];
+  }
   const bg = manifest.background;
   if (!bg || (typeof bg.service_worker !== "string" && !Array.isArray(bg.scripts) && typeof bg.page !== "string")) {
     return ["Page bridge skipped: the extension has no background to receive messages from externally_connectable pages."];
@@ -222,6 +242,7 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   manifest.content_scripts = scripts;
   delete manifest.externally_connectable;
   const notes = [`Page bridge wired for externally_connectable pages: ${matches.join(", ")}`];
+  if (dropped.length > 0) notes.push(`Page bridge left out patterns Firefox refuses as content-script matches: ${dropped.join(", ")}`);
   if (sites.length > 0) {
     grantFramePermissions(manifest, sites);
     const hosts = sites.map((s) => new URL(s.slice(0, -1)).host).join(", ");

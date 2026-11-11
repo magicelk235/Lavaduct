@@ -216,7 +216,7 @@ const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is
  * toolkit/components/extensions/schemas/manifest.json). Returns null when Firefox
  * accepts it, else a short reason.
  */
-function matchPatternError(pattern: string): string | null {
+export function matchPatternError(pattern: string): string | null {
   if (pattern === "<all_urls>") return null;
   const m = /^([^:/]*):\/\/([^/]*)(.*)$/.exec(pattern);
   if (!m) return "not a scheme://host/path pattern";
