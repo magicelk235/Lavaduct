@@ -21,7 +21,12 @@ const EXCLUDE_EXACT = new Set([
   ".npmrc",
   ".vscode",
   ".idea",
+  // A Recommended add-on's AMO badge; addons-linter refuses the name anywhere.
+  "mozilla-recommendation.json",
 ]);
+// Excluded at the package root only: a signed .xpi's signature, which covers the
+// files and add-on ID the conversion changes.
+const SIGNATURE_DIR = "META-INF";
 
 const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log", ".pem"];
 // Doc/config files: bare name or name + extension only (e.g. "LICENSE",
@@ -91,7 +96,7 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
       // file like _metadata/junk.js (parent excluded) from riding in just because
       // its own basename is clean.
       const segments = rel.split("/");
-      if (segments.some(shouldExclude)) {
+      if (segments.some(shouldExclude) || segments[0] === SIGNATURE_DIR) {
         // Still allow an excluded directory to be entered when a kept path lives
         // inside it; cpSync won't recurse otherwise and the kept child is lost.
         const asDir = rel + "/";
