@@ -1040,6 +1040,16 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     }
   }
 
+  // Chrome accepts an empty exclude_matches; Firefox wants at least one pattern and
+  // refuses the whole manifest otherwise. An empty list excludes nothing either way.
+  if (Array.isArray(out.content_scripts)) {
+    for (const cs of out.content_scripts) {
+      if (cs && typeof cs === "object" && "exclude_matches" in cs && Array.isArray(cs.exclude_matches) && cs.exclude_matches.length === 0) {
+        Reflect.deleteProperty(cs, "exclude_matches");
+      }
+    }
+  }
+
   const prepend = opts.contentScriptPrepend ?? [];
   if (prepend.length && Array.isArray(out.content_scripts)) {
     for (const cs of out.content_scripts) {
