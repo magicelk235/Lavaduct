@@ -1,124 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import vm from "node:vm";
-import { buildShim, fakeBrowser, makeEvent, runInContext, plain, tick, EXT_ORIGIN } from "./shim-sandbox.js";
+import { fakeBrowser, runInContext, plain, tick, EXT_ORIGIN } from "./shim-sandbox.js";
+import { SHIM, makePage, makeBus, extensionContext, setup, send } from "./debugger-sandbox.js";
 
 // Firefox has no chrome.debugger; the shim emulates the DevTools protocol on
 // scripting, tabs, webNavigation and webRequest. Here the "tab" is a node:vm
 // context: executeScript serializes the injected function and runs it there, as
 // Firefox does, and the context's eval reports a top-level `return` in Firefox's
 // words.
-
-const SHIM = buildShim({ debuggerEmulation: true });
-
-/** A page context whose syntax errors read like Firefox's. */
-function makePage({ title = "Test page", devicePixelRatio = 1 } = {}) {
-  const quiet = { log() {}, info() {}, warn() {}, error() {}, debug() {} };
-  const page = vm.createContext({ console: quiet, setTimeout, clearTimeout, Promise, JSON, devicePixelRatio, innerWidth: 800, innerHeight: 600, scrollX: 0, scrollY: 0 });
-  vm.runInContext(`
-    var window = globalThis;
-    var document = { title: ${JSON.stringify(title)}, documentElement: { scrollWidth: 800, scrollHeight: 2000, clientWidth: 800, clientHeight: 600 }, body: {} };
-    var location = { href: "https://example.test/" };
-    var CustomEvent = function (type, init) { this.type = type; this.detail = init && init.detail; };
-    var __listeners = {};
-    window.addEventListener = function (type, fn) { (__listeners[type] = __listeners[type] || []).push(fn); };
-    window.removeEventListener = function () {};
-    window.dispatchEvent = function (ev) { (__listeners[ev.type] || []).forEach(function (fn) { fn(ev); }); return true; };
-    var __eval = eval;
-    eval = function (code) {
-      try { return __eval(code); } catch (e) {
-        if (e && e.name === "SyntaxError" && e.message === "Illegal return statement") e.message = "return not in function";
-        throw e;
-      }
-    };
-  `, page);
-  return page;
-}
-
-/** Runtime messaging and BroadcastChannel between the contexts of one add-on. */
-function makeBus() {
-  const channels = [];
-  const bus = {
-    contexts: [],
-    send(from, message) {
-      // Every listener of every other context hears it; the first promise answers.
-      let answer;
-      for (const to of bus.contexts) {
-        if (to === from) continue;
-        for (const fn of to.runtime.onMessage.listeners.slice()) {
-          const r = fn(JSON.parse(JSON.stringify(message)), { id: from.runtime.id, url: EXT_ORIGIN + "/page.html" }, () => {});
-          if (!answer && r && typeof r.then === "function") answer = r;
-        }
-      }
-      return answer ?? Promise.resolve(undefined);
-    },
-    Channel: class {
-      constructor(name) {
-        this.name = name;
-        this.onmessage = null;
-        channels.push(this);
-      }
-      postMessage(data) {
-        for (const c of channels) {
-          if (c !== this && c.name === this.name) setTimeout(() => c.onmessage && c.onmessage({ data: structuredClone(data) }), 0);
-        }
-      }
-    },
-  };
-  return bus;
-}
-
-/** One extension context of the add-on: its browser namespace, wired to `bus`. */
-function extensionContext(bus, { href, tabs, page, zoom = 1, captures = [], session }) {
-  const browser = fakeBrowser();
-  if (session) browser.storage.session = session;
-  browser.runtime.sendMessage = (message) => bus.send(browser, message);
-  browser.tabs = {
-    get: (id) => (tabs[id] ? Promise.resolve({ id, windowId: 1, index: 0, ...tabs[id] }) : Promise.reject(new Error(`Invalid tab ID: ${id}`))),
-    query: () => Promise.resolve(Object.keys(tabs).map((id) => ({ id: Number(id), windowId: 1, ...tabs[id] }))),
-    create: (props) => Promise.resolve({ id: 99, ...props }),
-    update: (id, props) => Promise.resolve({ id, ...props }),
-    remove: () => Promise.resolve(),
-    getZoom: () => Promise.resolve(zoom),
-    captureTab: (tabId, opts) => {
-      captures.push({ tabId, opts: plain(opts) });
-      return Promise.resolve("data:image/" + (opts.format === "jpeg" ? "jpeg" : "png") + ";base64,QUJD");
-    },
-    onRemoved: makeEvent(),
-    onUpdated: makeEvent(),
-  };
-  browser.scripting = {
-    executeScript: async (details) => {
-      const fn = vm.runInContext("(" + details.func.toString() + ")", page);
-      const args = vm.runInContext("JSON.parse", page)(JSON.stringify(details.args || []));
-      try {
-        return [{ frameId: 0, result: JSON.parse(JSON.stringify((await fn(...args)) ?? null)) }];
-      } catch (e) {
-        return [{ frameId: 0, error: e }];
-      }
-    },
-  };
-  const navEvents = ["onBeforeNavigate", "onCommitted", "onDOMContentLoaded", "onCompleted", "onErrorOccurred", "onHistoryStateUpdated", "onReferenceFragmentUpdated"];
-  browser.webNavigation = Object.fromEntries(navEvents.map((n) => [n, makeEvent()]));
-  browser.webNavigation.getAllFrames = () => Promise.resolve([{ frameId: 0, parentFrameId: -1, url: "https://example.test/" }]);
-  const wrEvents = ["onBeforeRequest", "onSendHeaders", "onBeforeRedirect", "onResponseStarted", "onCompleted", "onErrorOccurred"];
-  browser.webRequest = Object.fromEntries(wrEvents.map((n) => [n, makeEvent()]));
-  // The emulation keeps an event page awake with an interval while a tab is
-  // attached; it mustn't keep the test process alive.
-  const unrefInterval = (fn, ms) => setInterval(fn, ms).unref();
-  runInContext(SHIM, { browser, href, globals: { BroadcastChannel: bus.Channel, setInterval: unrefInterval } });
-  bus.contexts.push(browser);
-  return { browser };
-}
-
-function setup({ page = makePage(), zoom = 1, tabs = { 1: { url: "https://example.test/", title: "Test page" } } } = {}) {
-  const bus = makeBus();
-  const captures = [];
-  const bg = extensionContext(bus, { href: EXT_ORIGIN + "/_generated_background_page.html", tabs, page, zoom, captures });
-  return { bus, bg, page, captures, tabs };
-}
-
-const send = (browser, tabId, method, params = {}) => browser.debugger.sendCommand({ tabId }, method, params);
 
 // Claude in Chrome's javascript_tool, verbatim in logic: it evaluates `{code}` in
 // REPL mode, and only when V8 reports a compile-time "Illegal return statement"

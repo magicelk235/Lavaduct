@@ -260,9 +260,10 @@
         scriptId: String(reg.seq),
         exception: exception,
       };
+      // SpiderMonkey counts lines and columns from 1, DevTools from 0.
       try {
         if (typeof e.lineNumber === "number") d.lineNumber = Math.max(0, e.lineNumber - 1);
-        if (typeof e.columnNumber === "number") d.columnNumber = Math.max(0, e.columnNumber);
+        if (typeof e.columnNumber === "number") d.columnNumber = Math.max(0, e.columnNumber - 1);
       } catch (x) {}
       // V8 reports where a runtime error was thrown; a script that doesn't
       // compile has no stack, which is how clients tell the two apart.
@@ -272,16 +273,18 @@
     function thrown(e, group, compile, inPromise) {
       return { result: remote(e, false, group), exceptionDetails: exceptionDetails(e, compile, group, inPromise) };
     }
+    // A page may have replaced window.Promise (zone.js does); Firefox awaits
+    // only a native promise, which an async function always returns.
     function settle(value, wantValue, group, wait) {
       if (wait && value && typeof value.then === "function") {
-        return Promise.resolve(value).then(function (v) {
+        return (async function () {
+          var v;
+          try { v = await value; } catch (e) { return thrown(e, group, false, true); }
           try { return { result: remote(v, wantValue, group) }; } catch (e) {
             if (e instanceof Fail) return { __protocolError: e.message };
             throw e;
           }
-        }, function (e) {
-          return thrown(e, group, false, true);
-        });
+        })();
       }
       return { result: remote(value, wantValue, group) };
     }
@@ -431,7 +434,12 @@
       try { (0, eval)("if (0) {\n" + code + "\n}"); } catch (e) { if (isSyntaxError(e)) compileError = e; }
       if (compileError) {
         var fn = p.replMode && /^await is only valid/.test(String(compileError.message)) ? replFunction(code) : null;
-        if (!fn) return thrown(compileError, group, true);
+        if (!fn) {
+          // The compile check put the code one line down.
+          var failed = thrown(compileError, group, true);
+          failed.exceptionDetails.lineNumber = Math.max(0, failed.exceptionDetails.lineNumber - 1);
+          return failed;
+        }
         var promised;
         try { promised = fn(); } catch (e) { return thrown(e, group); }
         return p.awaitPromise ? settle(promised, p.returnByValue, group, true) : { result: remote(promised, false, group) };
@@ -558,7 +566,7 @@
         case "getDocument":
           return { root: nodeInfo(W.document, q.depth === -1 ? 1000 : q.depth == null ? 1 : q.depth, { left: 5000 }) };
         case "describeNode":
-          return { node: nodeInfo(nodeOf(q), q.depth === -1 ? 1000 : q.depth || 0, { left: 5000 }) };
+          return { node: nodeInfo(nodeOf(q), q.depth === -1 ? 1000 : q.depth == null ? 1 : q.depth, { left: 5000 }) };
         case "querySelector":
           root = nodeOf(q);
           var hit = root.querySelector(String(q.selector));
@@ -659,23 +667,34 @@
       };
       return reg.report;
     }
+    // The page may wrap a hooked method again after the hook went in. So
+    // unhooking restores only methods that are still the hook's own, and a
+    // hook left inside a page's wrapper turns back into the original.
     function hookDialogs() {
       if (reg.hooks.dialogs) return;
       var report = reporter();
       var text = function (v) { return v === undefined ? "" : String(v); };
-      reg.hooks.dialogs = { alert: W.alert, confirm: W.confirm, prompt: W.prompt };
-      W.alert = function alert(message) {
+      var hook = { originals: { alert: W.alert, confirm: W.confirm, prompt: W.prompt }, wrappers: {} };
+      var off = function (name, self, args) { return hook.originals[name].apply(self, args); };
+      hook.wrappers.alert = function alert(message) {
+        if (reg.hooks.dialogs !== hook) return off("alert", this, arguments);
         report({ kind: "dialog", type: "alert", message: text(message), url: location.href }, true);
       };
-      W.confirm = function confirm(message) {
+      hook.wrappers.confirm = function confirm(message) {
+        if (reg.hooks.dialogs !== hook) return off("confirm", this, arguments);
         report({ kind: "dialog", type: "confirm", message: text(message), url: location.href }, true);
         return true;
       };
-      W.prompt = function prompt(message, defaultValue) {
+      hook.wrappers.prompt = function prompt(message, defaultValue) {
+        if (reg.hooks.dialogs !== hook) return off("prompt", this, arguments);
         var d = text(defaultValue);
         report({ kind: "dialog", type: "prompt", message: text(message), defaultPrompt: d, url: location.href }, true);
         return d;
       };
+      W.alert = hook.wrappers.alert;
+      W.confirm = hook.wrappers.confirm;
+      W.prompt = hook.wrappers.prompt;
+      reg.hooks.dialogs = hook;
     }
     function consoleArg(v) {
       var t = typeof v;
@@ -695,15 +714,15 @@
       var report = reporter();
       var c = W.console;
       var TYPES = { warn: "warning", group: "startGroup", groupCollapsed: "startGroupCollapsed", groupEnd: "endGroup" };
-      var originals = {};
+      var hook = { originals: {}, wrappers: {} };
       ["log", "info", "warn", "error", "debug", "dir", "dirxml", "table", "trace", "clear", "group", "groupCollapsed", "groupEnd", "assert", "count", "timeEnd"].forEach(function (m) {
         var f = c[m];
         if (typeof f !== "function") return;
-        originals[m] = f;
-        c[m] = function () {
+        hook.originals[m] = f;
+        c[m] = hook.wrappers[m] = function () {
           try {
             var args = Array.prototype.slice.call(arguments);
-            if (m !== "assert" || !args[0]) {
+            if (reg.hooks.console === hook && (m !== "assert" || !args[0])) {
               if (m === "assert") args = ["Assertion failed:"].concat(args.slice(1));
               report({ kind: "console", type: TYPES[m] || m, args: args.slice(0, 50).map(consoleArg), t: Date.now(), frames: frames(new Error().stack, 1) });
             }
@@ -736,20 +755,25 @@
       };
       W.addEventListener("error", onError);
       W.addEventListener("unhandledrejection", onRejection);
-      reg.hooks.console = { originals: originals, onError: onError, onRejection: onRejection };
+      hook.onError = onError;
+      hook.onRejection = onRejection;
+      reg.hooks.console = hook;
+    }
+    function restore(obj, hook) {
+      Object.keys(hook.wrappers || {}).forEach(function (m) {
+        if (obj[m] === hook.wrappers[m]) obj[m] = hook.originals[m];
+      });
     }
     function unhook(what) {
       var h = reg.hooks;
       if (h.console && what !== "dialogs") {
-        Object.keys(h.console.originals).forEach(function (m) { W.console[m] = h.console.originals[m]; });
+        restore(W.console, h.console);
         W.removeEventListener("error", h.console.onError);
         W.removeEventListener("unhandledrejection", h.console.onRejection);
         h.console = null;
       }
       if (h.dialogs && what !== "console") {
-        W.alert = h.dialogs.alert;
-        W.confirm = h.dialogs.confirm;
-        W.prompt = h.dialogs.prompt;
+        restore(W, h.dialogs);
         h.dialogs = null;
       }
     }
@@ -1182,7 +1206,8 @@
         if (el && el.localName === "textarea") replaceInField(el, "\n", "insertLineBreak");
         else if (el && el.isContentEditable) {
           try { D.execCommand(base === "insertLineBreak" ? "insertLineBreak" : "insertParagraph", false, null); } catch (e) {}
-        } else if (el && el.localName === "input") submitImplicitly(el);
+        } else if (el && el.localName === "input" && /^(?:submit|reset|button|image)$/.test(String(el.type).toLowerCase())) el.click();
+        else if (el && el.localName === "input") submitImplicitly(el);
         else if (el && (el.localName === "a" || el.localName === "button" || el.localName === "summary")) el.click();
         return true;
       }
@@ -1397,6 +1422,7 @@
       delete sessions[tabId];
       persist();
       updateKeepAlive();
+      if (!anyNetwork()) hookNetwork(false);
       if (!reason) return;
       var source = { tabId: tabId };
       det.dispatch(source, reason);
@@ -1448,6 +1474,11 @@
         return r;
       });
     }
+    // A frame Firefox won't script fails the whole all-frames injection; the
+    // top frame alone is still worth reaching then.
+    function everyFrame(tabId, world, func, args) {
+      return exec(tabId, 0, world, func, args, true).catch(function () { return exec(tabId, 0, world, func, args); });
+    }
     // The relay and the dialog hook go into every frame of the tab; the console
     // hook into the top frame, while Runtime is enabled.
     function hookPage(tabId, frameId) {
@@ -1455,11 +1486,8 @@
       if (!s) return Promise.resolve();
       var all = frameId === undefined;
       var relay = { key: CDP_PAGE_KEY, msgKey: CDP_KEY };
-      // A frame Firefox won't script fails the whole all-frames injection; the
-      // top frame alone is still worth hooking then.
       var target = function (func, args, world) {
-        if (!all) return exec(tabId, frameId, world, func, args);
-        return exec(tabId, 0, world, func, args, true).catch(function () { return exec(tabId, 0, world, func, args); });
+        return all ? everyFrame(tabId, world, func, args) : exec(tabId, frameId, world, func, args);
       };
       return target(cdpIsolated, ["relay", relay], "ISOLATED").then(function () {
         return target(cdpMain, ["hookDialogs", {}, CDP_PAGE_KEY], "MAIN");
@@ -1492,10 +1520,16 @@
       if (!nav) return;
       var ts = function (d) { return (d && d.timeStamp ? d.timeStamp : Date.now()) / 1000; };
       var pageOn = function (d) { var s = sessions[d.tabId]; return s && s.page; };
+      // Counts top-frame navigation starts and commits per tab, so an abort can
+      // tell whether the navigation went on.
+      var navSeq = {};
+      var navStep = function (d) { if (d.frameId === 0) navSeq[d.tabId] = (navSeq[d.tabId] || 0) + 1; };
       nav.onBeforeNavigate.addListener(function (d) {
+        navStep(d);
         if (d.frameId === 0 && pageOn(d)) emit(d.tabId, "Page.frameStartedLoading", { frameId: String(d.tabId) });
       });
       nav.onCommitted.addListener(function (d) {
+        navStep(d);
         var s = sessions[d.tabId];
         if (!s) return;
         if (d.frameId === 0) {
@@ -1527,15 +1561,30 @@
         emit(d.tabId, "Page.lifecycleEvent", { frameId: String(d.tabId), loaderId: String(d.tabId), name: "load", timestamp: ts(d) });
         emit(d.tabId, "Page.frameStoppedLoading", { frameId: String(d.tabId) });
       });
+      // Firefox cancels the first load of many navigations and loads them
+      // again (NS_BINDING_ABORTED, then a commit). An abort is a failure only
+      // when no navigation followed it and the tab stopped loading.
       nav.onErrorOccurred.addListener(function (d) {
         if (d.frameId !== 0) return;
-        var waiter = commitWaiters[d.tabId];
-        if (waiter) waiter(d.error || "Navigation failed");
-        if (pageOn(d)) emit(d.tabId, "Page.frameStoppedLoading", { frameId: String(d.tabId) });
+        var failed = function () {
+          var waiter = commitWaiters[d.tabId];
+          if (waiter) waiter(d.error || "Navigation failed");
+          if (pageOn(d)) emit(d.tabId, "Page.frameStoppedLoading", { frameId: String(d.tabId) });
+        };
+        if (!/\b2152398850\b/.test(String(d.error))) { failed(); return; }
+        var seq = navSeq[d.tabId];
+        getTab(d.tabId).then(function (tab) {
+          if (navSeq[d.tabId] === seq && tab.status !== "loading") failed();
+        }, failed);
       });
+      // A fragment or history navigation never commits; it answers a
+      // Page.navigate to that URL.
       var sameDocument = function (type) {
         return function (d) {
-          if (d.frameId === 0 && pageOn(d)) emit(d.tabId, "Page.navigatedWithinDocument", { frameId: String(d.tabId), url: d.url, navigationType: type });
+          if (d.frameId !== 0) return;
+          var waiter = commitWaiters[d.tabId];
+          if (waiter && waiter.url === d.url) waiter(null, true);
+          if (pageOn(d)) emit(d.tabId, "Page.navigatedWithinDocument", { frameId: String(d.tabId), url: d.url, navigationType: type });
         };
       };
       if (nav.onHistoryStateUpdated) nav.onHistoryStateUpdated.addListener(sameDocument("historyApi"));
@@ -1638,6 +1687,8 @@
       var wr = api.webRequest;
       if (!wr || networkHooked === on) return;
       networkHooked = on;
+      // Requests still in flight would never hear their end.
+      if (!on) requests = {};
       var filter = { urls: ["<all_urls>"] };
       var pairs = [
         ["onBeforeRequest", net.before, ["requestBody"]], ["onSendHeaders", net.headers, ["requestHeaders"]],
@@ -1784,14 +1835,17 @@
         return { frameTree: root };
       });
     }
-    function waitForCommit(tabId, ms) {
+    // Resolves with { error, sameDocument } once the tab's top frame commits a
+    // navigation, fails, or moves within the document to `url`.
+    function waitForCommit(tabId, url, ms) {
       return new Promise(function (resolve) {
         var timer = setTimeout(function () { finish(null); }, ms);
-        function finish(error) {
+        function finish(error, sameDocument) {
           clearTimeout(timer);
           if (commitWaiters[tabId] === finish) delete commitWaiters[tabId];
-          resolve(error);
+          resolve({ error: error, sameDocument: !!sameDocument });
         }
+        finish.url = url;
         commitWaiters[tabId] = finish;
       });
     }
@@ -1843,16 +1897,20 @@
       "Page.getFrameTree": function (tabId) { return frameTree(tabId); },
       "Page.navigate": function (tabId, s, p) {
         if (typeof p.url !== "string" || !p.url) return Promise.reject(protocolError("Invalid parameters: url", -32602));
-        var committed = waitForCommit(tabId, 30000);
+        var url = p.url;
+        try { url = new URL(p.url).href; } catch (e) {}
+        var committed = waitForCommit(tabId, url, 30000);
         return Promise.resolve(api.tabs.update(tabId, { url: p.url })).then(function () {
           return committed;
         }, function (err) {
           var waiter = commitWaiters[tabId];
           if (waiter) waiter(null);
           throw protocolError(errorMessage(err));
-        }).then(function (error) {
-          var out = { frameId: String(tabId), loaderId: String(tabId) };
-          if (error) out.errorText = error;
+        }).then(function (outcome) {
+          // Chrome leaves out the loaderId of a same-document navigation.
+          var out = { frameId: String(tabId) };
+          if (!outcome.sameDocument) out.loaderId = String(tabId);
+          if (outcome.error) out.errorText = outcome.error;
           return out;
         });
       },
@@ -1971,8 +2029,9 @@
       var p = params && typeof params === "object" ? params : {};
       dbg("debugger:", method, "tab", tabId);
       if (Object.prototype.hasOwnProperty.call(COMMANDS, method)) return COMMANDS[method](tabId, s, p);
-      if (CDP_NOOP_RE.test(method)) return {};
+      // Unsupported first: Fetch.enable would otherwise pass as a no-op enable.
       if (Object.prototype.hasOwnProperty.call(CDP_UNSUPPORTED, method)) throw protocolError(method + " isn't available in Firefox: " + CDP_UNSUPPORTED[method]);
+      if (CDP_NOOP_RE.test(method)) return {};
       throw protocolError("'" + method + "' wasn't found", -32601);
     }
     function attach(target, version) {
@@ -1995,9 +2054,9 @@
       var tabId = cdpTabOf(target);
       if (!sessions[tabId]) throw new Error("Debugger is not attached to the tab with id: " + tabId + ".");
       ended(tabId, null);
-      if (!anyNetwork()) hookNetwork(false);
-      // A tab that has gone takes its hooks with it.
-      return main(tabId, "unhook", { what: "all" }).catch(noop);
+      // Every frame got the dialog hook. A tab that has gone takes its hooks
+      // with it.
+      return everyFrame(tabId, "MAIN", cdpMain, ["unhook", { what: "all" }, CDP_PAGE_KEY]).then(noop, noop);
     }
     function getTargets() {
       return Promise.resolve(api.tabs.query({})).then(function (tabs) {
