@@ -9,11 +9,6 @@ test("APIs the shim covers are reported as shimmed, not as failures", () => {
   }
 });
 
-test("asking getContexts for offscreen documents is flagged, since the shim can't cover it", () => {
-  assert.equal(UNSUPPORTED_APIS.OFFSCREEN_DOCUMENT?.severity, "warning");
-  assert.ok(!UNSUPPORTED_APIS.OFFSCREEN_DOCUMENT.shimmed);
-});
-
 test("an API Firefox lacks is a warning; one Firefox added later carries its release", () => {
   assert.equal(UNSUPPORTED_APIS["chrome.pageCapture"]?.severity, "warning");
   assert.equal(UNSUPPORTED_APIS["chrome.tabGroups"]?.since, "139");

@@ -160,7 +160,7 @@ const SHIMMED_APIS: Record<string, { message: string; fix: string }> = {
   },
   offscreen: {
     message: "chrome.offscreen is emulated with a hidden iframe in the background page (createDocument, closeDocument, hasDocument, Reason).",
-    fix: "No action needed; runtime.getContexts() doesn't list the document, so check it with offscreen.hasDocument().",
+    fix: "No action needed; runtime.getContexts() lists the document too.",
   },
   "identity.getAuthToken": {
     message: "identity.getAuthToken is emulated with identity.launchWebAuthFlow and the manifest's oauth2 client.",
@@ -294,9 +294,17 @@ const HAND_NOTES: Record<string, ApiNote> = {
     fix: "Translate the config, or route requests with proxy.onRequest. Firefox also only allows proxy.settings when the user lets the add-on run in private windows.",
   },
   OFFSCREEN_DOCUMENT: {
+    severity: "info",
+    message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT", which Firefox\'s context types lack, is answered by the shim from its offscreen emulation.',
+    fix: "No action needed when the type is passed as the string.",
+    shimmed: true,
+  },
+  // Firefox builds runtime.ContextType from its own context types, so this member is
+  // undefined there and getContexts() throws on the filter.
+  "ContextType.OFFSCREEN_DOCUMENT": {
     severity: "warning",
-    message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT" throws in Firefox, whose context types have no offscreen documents.',
-    fix: "Ask chrome.offscreen.hasDocument() instead; the shim answers it.",
+    message: "runtime.ContextType.OFFSCREEN_DOCUMENT is undefined in Firefox, so a getContexts() filter built from it throws.",
+    fix: 'Pass the string "OFFSCREEN_DOCUMENT", which the shim answers.',
   },
 };
 
