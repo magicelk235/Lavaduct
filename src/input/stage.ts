@@ -725,6 +725,169 @@ function rewriteFunctionGlobalLookups(stageDir: string): number {
   return modified;
 }
 
+// Firefox refuses to run a moz-extension: file as a script unless its name ends in
+// an extension its built-in MIME table maps to JavaScript: .js, .mjs or .jsm, in any
+// case (nsContentSecurityManager's CheckAllowExtensionProtocolScriptLoad, MV3 add-ons
+// only). The console says "Loading script with URI … was blocked because the file
+// extension is not allowed." Chrome runs any name, and Google's own Save to Google
+// Drive loads js/rpc.js.compiled from its options page. The check covers every
+// script load: <script src>, content_scripts js, background scripts, importScripts,
+// new Worker, static and dynamic import, and scripting.executeScript files.
+//
+// Give each such script a copy named <name>.js and point the references that can be
+// rewritten without a parser at it: the manifest's content_scripts js, background
+// scripts and service_worker; <script src> in the pages; literal string arguments to
+// importScripts, new Worker and new SharedWorker; and relative import specifiers.
+// Appending keeps a reference's query and fragment and its relative form valid.
+// scripting.executeScript `files` stay as they are: a regex can't tell them from
+// insertCSS `files`, and renaming a stylesheet there breaks its injection. The
+// original stays when its name still turns up in a staged file or the manifest
+// (an executeScript file, a getURL, a fetch, a web-accessible resource).
+const SCRIPT_FILE_EXT_RE = /\.(?:js|mjs|jsm)$/i;
+const HTML_SCRIPT_TAG_RE = /<script\b[^>]*>/gi;
+const TAG_SRC_RE = /(\bsrc\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+))/i;
+const TAG_TYPE_RE = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+))/i;
+const JS_SCRIPT_TYPES: Record<string, true> = {
+  "": true,
+  module: true,
+  "text/javascript": true,
+  "application/javascript": true,
+  "text/ecmascript": true,
+  "application/ecmascript": true,
+  "application/x-javascript": true,
+};
+const SCRIPT_LOAD_CALL_RE = /\b(?:importScripts|Worker|SharedWorker)\s*\(([^)]*)\)/g;
+const SCRIPT_LOAD_IMPORT_RE = /(\bimport\s*\(?\s*|\bfrom\s*)("(\.{0,2}\/[^"\n]*)"|'(\.{0,2}\/[^'\n]*)')/g;
+// JSON and CSS modules load as data, not script, and need their own names.
+const DATA_MODULE_RE = /\.(?:json|css)(?:[?#]|$)/i;
+
+function renameNonJsScripts(stageDir: string, manifest: Manifest): number {
+  if ((manifest.manifest_version ?? 2) < 3) return 0;
+  const exists = (rel: string) => {
+    try { return statSync(join(stageDir, rel)).isFile(); } catch { return false; }
+  };
+  const needsName = (rel: string) => !SCRIPT_FILE_EXT_RE.test(posix.basename(rel)) && !exists(`${rel}.js`);
+  const resolveRef = (fromRel: string, ref: string) => candidatePaths(fromRel, ref).find(exists);
+  const isPage = (rel: string) => PAGE_EXTS.some((e) => rel.toLowerCase().endsWith(e));
+  const withJs = (ref: string) => {
+    const cut = ref.search(/[?#]/);
+    return cut < 0 ? `${ref}.js` : `${ref.slice(0, cut)}.js${ref.slice(cut)}`;
+  };
+
+  // Each reference a file makes in a script-load position, with the rewrite that
+  // points the matched text at the renamed copy when `rename(ref)` returns true.
+  const rewriteRefs = (rel: string, text: string, rename: (ref: string) => boolean): string => {
+    const literals = (args: string) =>
+      args.replace(STRING_LITERAL_RE, (lit, d?: string, s?: string, b?: string) => {
+        const v = d ?? s ?? b ?? "";
+        return v && rename(v) ? lit[0] + withJs(v) + lit[0] : lit;
+      });
+    if (isPage(rel)) {
+      return text.replace(HTML_SCRIPT_TAG_RE, (tag) => {
+        const type = TAG_TYPE_RE.exec(tag);
+        if (type && !JS_SCRIPT_TYPES[(type[1] ?? type[2] ?? type[3] ?? "").trim().toLowerCase()]) return tag;
+        return tag.replace(TAG_SRC_RE, (whole, attr: string, d?: string, s?: string, u?: string) => {
+          const v = d ?? s ?? u ?? "";
+          if (!v || !rename(v)) return whole;
+          const q = d !== undefined ? '"' : s !== undefined ? "'" : "";
+          return attr + q + withJs(v) + q;
+        });
+      });
+    }
+    return text
+      // The argument list is the group right before the closing ")".
+      .replace(SCRIPT_LOAD_CALL_RE, (whole, args: string) => whole.slice(0, whole.length - args.length - 1) + literals(args) + ")")
+      .replace(SCRIPT_LOAD_IMPORT_RE, (whole, lead: string, lit: string, d?: string, s?: string) => {
+        const v = d ?? s ?? "";
+        return DATA_MODULE_RE.test(v) || !rename(v) ? whole : lead + lit[0] + withJs(v) + lit[0];
+      });
+  };
+
+  // Which files are loaded as scripts, followed through the scripts found.
+  const targets = new Set<string>();
+  const declared: string[] = [];
+  for (const cs of Array.isArray(manifest.content_scripts) ? manifest.content_scripts : []) {
+    if (Array.isArray(cs?.js)) declared.push(...cs.js.filter((p: unknown): p is string => typeof p === "string"));
+  }
+  if (Array.isArray(manifest.background?.scripts)) declared.push(...manifest.background.scripts.filter((p): p is string => typeof p === "string"));
+  if (typeof manifest.background?.service_worker === "string") declared.push(manifest.background.service_worker);
+  for (const p of declared) {
+    const rel = resolveRef("", p);
+    if (rel && needsName(rel)) targets.add(rel);
+  }
+  const sources: string[] = [];
+  const walk = (dir: string, rel: string): void => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(join(dir, e.name), r);
+      else if (e.isFile() && (isPage(r) || SCRIPT_FILE_EXT_RE.test(e.name))) sources.push(r);
+    }
+  };
+  walk(stageDir, "");
+  const queue = [...sources, ...targets];
+  const scanned = new Set<string>();
+  while (queue.length > 0) {
+    const rel = queue.pop() as string;
+    if (scanned.has(rel)) continue;
+    scanned.add(rel);
+    let text: string;
+    try { text = readFileSync(join(stageDir, rel), "utf-8"); } catch { continue; }
+    rewriteRefs(rel, text, (ref) => {
+      const target = resolveRef(rel, ref);
+      if (target && needsName(target) && !targets.has(target)) {
+        targets.add(target);
+        queue.push(target);
+      }
+      return false;
+    });
+  }
+  if (targets.size === 0) return 0;
+
+  for (const rel of targets) copyFileSync(join(stageDir, rel), join(stageDir, `${rel}.js`));
+  const renamed = (fromRel: string) => (ref: string) => {
+    const target = resolveRef(fromRel, ref);
+    return target !== undefined && targets.has(target);
+  };
+  for (const rel of [...scanned].map((r) => (targets.has(r) ? `${r}.js` : r))) {
+    let text: string;
+    try { text = readFileSync(join(stageDir, rel), "utf-8"); } catch { continue; }
+    const next = rewriteRefs(rel, text, renamed(rel));
+    if (next !== text) writeFileSync(join(stageDir, rel), next, "utf-8");
+  }
+  const fix = <T>(p: T): T => (typeof p === "string" && renamed("")(p) ? (withJs(p) as T) : p);
+  for (const cs of Array.isArray(manifest.content_scripts) ? manifest.content_scripts : []) {
+    if (Array.isArray(cs?.js)) cs.js = cs.js.map(fix);
+  }
+  if (manifest.background) {
+    if (Array.isArray(manifest.background.scripts)) manifest.background.scripts = manifest.background.scripts.map(fix);
+    if (typeof manifest.background.service_worker === "string") manifest.background.service_worker = fix(manifest.background.service_worker);
+  }
+
+  // Drop an original nothing names any more. Its new name starts with the old one,
+  // so only a mention not followed by ".js" counts.
+  const texts: string[] = [JSON.stringify(manifest)];
+  const walkAll = (dir: string): void => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) walkAll(full);
+      else if (e.isFile() && /\.(?:html?|xhtml|m?js|jsm|css|json)$/i.test(e.name)) {
+        try { texts.push(readFileSync(full, "utf-8")); } catch { /* unreadable: nothing to find */ }
+      }
+    }
+  };
+  walkAll(stageDir);
+  for (const rel of targets) {
+    const base = posix.basename(rel).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mention = new RegExp(`${base}(?!\\.js)`);
+    if (!texts.some((t) => mention.test(t))) rmSync(join(stageDir, rel), { force: true });
+  }
+  return targets.size;
+}
+
 /**
  * Run every source rewrite over the staged scripts, in dependency order: the
  * runtime.id rewrites and the self-page rewrite need to see `chrome-extension://`
@@ -734,6 +897,8 @@ function rewriteFunctionGlobalLookups(stageDir: string): number {
  */
 export function applySourceRewrites(stageDir: string, manifest: Manifest): Array<{ name: string; count: number }> {
   return [
+    // First, so every later pass (and the background lookups) sees the new names.
+    { name: "Gave scripts without a .js extension a name Firefox loads", count: renameNonJsScripts(stageDir, manifest) },
     { name: "Rewrote runtime.id-based port matchers", count: rewriteRuntimeIdUrlMatchers(stageDir) },
     { name: "Rewrote runtime.id-based extension-origin checks", count: rewriteExtensionOriginFromRuntimeId(stageDir) },
     { name: "Rewrote chrome-extension: scheme literals", count: rewriteChromeSchemeLiterals(stageDir) },
