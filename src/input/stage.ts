@@ -284,6 +284,36 @@ function firefoxReadsJson(text: string): boolean {
 }
 
 /**
+ * Remove each _locales subfolder without a messages.json Chrome can read, except
+ * the default locale's (the analyzer reports that one). Chrome ignores a folder
+ * whose name isn't one of its locales and refuses an extension whose locale
+ * folder lacks a readable catalog, so a working Chrome extension can only carry
+ * such a folder as junk Chrome skips (`_locales/xx/`, an empty folder). Firefox
+ * reads every subfolder and refuses the whole add-on over one it can't load.
+ * Returns the removed folders.
+ */
+export function removeUnreadableLocales(stageDir: string, defaultLocale: string | undefined): string[] {
+  const localesDir = join(stageDir, "_locales");
+  let locales;
+  try {
+    locales = readdirSync(localesDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const locale of locales) {
+    if (!locale.isDirectory() || locale.name === defaultLocale) continue;
+    try {
+      parseJsonc(readFileSync(join(localesDir, locale.name, "messages.json"), "utf-8"));
+    } catch {
+      rmSync(join(localesDir, locale.name), { recursive: true, force: true });
+      removed.push(`_locales/${locale.name}`);
+    }
+  }
+  return removed;
+}
+
+/**
  * Rewrite as plain JSON each _locales/<locale>/messages.json that Chrome reads and
  * Firefox doesn't. Chrome's reader also takes block comments, line breaks inside
  * strings and \x escapes; Firefox's only cuts // comments, and it refuses the whole
