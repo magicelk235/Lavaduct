@@ -260,9 +260,10 @@
         scriptId: String(reg.seq),
         exception: exception,
       };
+      // SpiderMonkey counts lines and columns from 1, DevTools from 0.
       try {
         if (typeof e.lineNumber === "number") d.lineNumber = Math.max(0, e.lineNumber - 1);
-        if (typeof e.columnNumber === "number") d.columnNumber = Math.max(0, e.columnNumber);
+        if (typeof e.columnNumber === "number") d.columnNumber = Math.max(0, e.columnNumber - 1);
       } catch (x) {}
       // V8 reports where a runtime error was thrown; a script that doesn't
       // compile has no stack, which is how clients tell the two apart.
@@ -433,7 +434,12 @@
       try { (0, eval)("if (0) {\n" + code + "\n}"); } catch (e) { if (isSyntaxError(e)) compileError = e; }
       if (compileError) {
         var fn = p.replMode && /^await is only valid/.test(String(compileError.message)) ? replFunction(code) : null;
-        if (!fn) return thrown(compileError, group, true);
+        if (!fn) {
+          // The compile check put the code one line down.
+          var failed = thrown(compileError, group, true);
+          failed.exceptionDetails.lineNumber = Math.max(0, failed.exceptionDetails.lineNumber - 1);
+          return failed;
+        }
         var promised;
         try { promised = fn(); } catch (e) { return thrown(e, group); }
         return p.awaitPromise ? settle(promised, p.returnByValue, group, true) : { result: remote(promised, false, group) };
