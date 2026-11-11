@@ -660,6 +660,7 @@
 
   function installOffscreen() {
     if (!CONFIG.offscreen || !isBackground || !hasDocument || typeof document.createElement !== "function") return;
+    offscreenEmulated = true;
     var frame = null;
     var keepAlive = null;
     var Reason = {};
@@ -674,12 +675,20 @@
     }
 
     // For runtime.getContexts in the add-on's other pages. A new event page has
-    // no frame, whatever the last one had.
+    // no frame, whatever the last one had. storage.session needs the storage
+    // permission, so an add-on without it records in localStorage, which every
+    // page of the add-on shares too.
     function recordOffscreen(url) {
+      offscreenDocumentUrl = url;
+      var session = offscreenSession();
+      if (!session) {
+        try { if (localStore) { if (url) localStore.setItem(OFFSCREEN_STATE_KEY, url); else localStore.removeItem(OFFSCREEN_STATE_KEY); } } catch (e) {}
+        return;
+      }
       try {
         var o = {};
         o[OFFSCREEN_STATE_KEY] = url;
-        var r = url ? api.storage.session.set(o) : api.storage.session.remove(OFFSCREEN_STATE_KEY);
+        var r = url ? session.set(o) : session.remove(OFFSCREEN_STATE_KEY);
         if (r && typeof r.catch === "function") r.catch(noop);
       } catch (e) {}
     }
@@ -1592,8 +1601,32 @@
   // ── runtime.getContexts ─────────────────────────────────────────────────────
   // Firefox's ContextType has no OFFSCREEN_DOCUMENT and refuses a filter naming
   // it. Code asks for that type to learn whether its offscreen document exists,
-  // which the offscreen emulation records in storage.session.
+  // which the offscreen emulation records in storage.session, or in
+  // localStorage for an add-on without the storage permission. The background
+  // that holds the document knows it without either.
   var OFFSCREEN_STATE_KEY = "__lavaductOffscreenDocument";
+  var offscreenEmulated = false;
+  var offscreenDocumentUrl = null;
+
+  function offscreenSession() {
+    try {
+      var s = api.storage && api.storage.session;
+      return s && typeof s.get === "function" ? s : null;
+    } catch (e) { return null; }
+  }
+
+  function recordedOffscreen() {
+    if (offscreenEmulated) return Promise.resolve(offscreenDocumentUrl);
+    var session = offscreenSession();
+    if (!session) {
+      var url = null;
+      try { url = localStore && localStore.getItem(OFFSCREEN_STATE_KEY); } catch (e) {}
+      return Promise.resolve(url || null);
+    }
+    return Promise.resolve().then(function () { return session.get(OFFSCREEN_STATE_KEY); }).then(function (got) {
+      return (got && got[OFFSCREEN_STATE_KEY]) || null;
+    }, function () { return null; });
+  }
 
   function installGetContexts() {
     if (!CONFIG.offscreen) return;
@@ -1610,9 +1643,7 @@
         var rest = types ? types.filter(function (t) { return t !== "OFFSCREEN_DOCUMENT"; }) : null;
         var nativeFilter = types ? Object.assign({}, filter, { contextTypes: rest }) : filter || {};
         var found = types && !rest.length ? Promise.resolve([]) : native.call(nativeRuntime, nativeFilter);
-        var offscreen = !wantsOffscreen ? Promise.resolve(null) : api.storage.session.get(OFFSCREEN_STATE_KEY).then(function (got) {
-          return (got && got[OFFSCREEN_STATE_KEY]) || null;
-        }, function () { return null; });
+        var offscreen = wantsOffscreen ? recordedOffscreen() : Promise.resolve(null);
         var p = Promise.all([found, offscreen]).then(function (r) {
           var list = r[0] || [];
           var url = r[1];
