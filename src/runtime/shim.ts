@@ -46,6 +46,12 @@ export interface ShimConfig {
   declaredPermissions?: string[];
   /** The Chrome manifest's chrome_url_overrides.newtab: the add-on's own new tab page. */
   newTabPage?: string;
+  /**
+   * The Chrome manifest's externally_connectable.ids: the other extensions it
+   * lets in, [] when the key has no ids. Undefined without the key, where
+   * Chrome lets every extension in.
+   */
+  externalIds?: string[];
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
@@ -158,6 +164,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     // The add-on's own new tab page, which chrome://newtab shows in Chrome.
     newTabPage: usage.newTab ? (config.newTabPage ?? "").split(/[?#]/)[0].replace(/^\/+/, "") : "",
     shortcutsPage: usage.shortcutsPage,
+    externalIds: Array.isArray(config.externalIds) ? config.externalIds.filter((id) => typeof id === "string") : null,
     serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
     serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,

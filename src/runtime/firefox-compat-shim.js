@@ -2184,6 +2184,72 @@
     });
   }
 
+  // ── externally_connectable ids ─────────────────────────────────────────────
+  // In Chrome a manifest with externally_connectable lets in only the
+  // extensions its `ids` lists: none when the list is missing, every one for
+  // "*". Firefox has no such key and delivers every other add-on's messages
+  // and ports to runtime.onMessageExternal and onConnectExternal. The add-on's
+  // listeners now hear only the senders Chrome would let through. The list
+  // holds Chrome IDs, so a sender converted by lavaduct matches by the Chrome
+  // ID its add-on ID starts with. Only emitted for a manifest that declares
+  // externally_connectable; the page bridge feeds web pages' messages to the
+  // listeners directly, past this filter.
+  function allowedSender(sender) {
+    var ids = CONFIG.externalIds;
+    if (ids.indexOf("*") >= 0) return true;
+    var id = "";
+    try { id = String((sender && sender.id) || ""); } catch (e) {}
+    if (!id) return false;
+    for (var i = 0; i < ids.length; i++) {
+      var allowed = String(ids[i]);
+      if (id === allowed) return true;
+      if (id.indexOf(allowed.toLowerCase() + ".") === 0 && /@lavaduct$/.test(id)) return true;
+    }
+    return false;
+  }
+
+  function installExternalSenders() {
+    if (!Array.isArray(CONFIG.externalIds) || typeof WeakMap !== "function") return;
+    namespaces.forEach(function (ns) {
+      var rt = null;
+      try { rt = ns.runtime; } catch (e) {}
+      if (!rt) return;
+      [["onMessageExternal", 1], ["onConnectExternal", 0]].forEach(function (pair) {
+        var ev = null;
+        try { ev = rt[pair[0]]; } catch (e) {}
+        if (!ev || typeof ev.addListener !== "function") return;
+        var senderOf = pair[1] === 1 ? function (args) { return args[1]; } : function (args) { return args[0] && args[0].sender; };
+        var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+        var wrappers = new WeakMap();
+        function wrapperOf(fn) {
+          if (typeof fn !== "function") return fn;
+          var w = wrappers.get(fn);
+          if (!w) {
+            w = function () {
+              if (!allowedSender(senderOf(arguments))) {
+                dbg(pair[0] + ": dropped a sender externally_connectable doesn't list:", senderOf(arguments) && senderOf(arguments).id);
+                if (pair[1] === 0 && arguments[0] && typeof arguments[0].disconnect === "function") {
+                  try { arguments[0].disconnect(); } catch (e) {}
+                }
+                return undefined;
+              }
+              return fn.apply(this, arguments);
+            };
+            wrappers.set(fn, w);
+          }
+          return w;
+        }
+        replaceMember(ev, "addListener", function (fn) {
+          var args = Array.prototype.slice.call(arguments);
+          args[0] = wrapperOf(fn);
+          return add.apply(ev, args);
+        });
+        if (typeof remove === "function") replaceMember(ev, "removeListener", function (fn) { return remove.call(ev, wrappers.get(fn) || fn); });
+        if (typeof has === "function") replaceMember(ev, "hasListener", function (fn) { return has.call(ev, wrappers.get(fn) || fn); });
+      });
+    });
+  }
+
   // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
   // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
   // such as Cookie or Referer; Firefox shows every header without it, has no
@@ -2405,5 +2471,6 @@
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
+  try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
