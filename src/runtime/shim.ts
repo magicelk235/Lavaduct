@@ -4,6 +4,7 @@ import type { Manifest } from "../types.js";
 import { RUNTIME_DIR } from "../paths.js";
 import { NAME } from "../name.js";
 import { walkScripts } from "../input/stage.js";
+import { SHIMMED_PERMISSIONS, UNSUPPORTED_PERMISSIONS } from "../manifest/compat-data.js";
 
 /** Name of the compat shim inside the staged add-on. */
 export const SHIM_FILENAME = `${NAME}-compat-shim.js`;
@@ -41,6 +42,8 @@ export interface ShimConfig {
   webpackChunkGlobal?: string;
   /** The Chrome manifest asks for userScripts, which Firefox only grants at runtime. */
   userScripts?: boolean;
+  /** The Chrome manifest's permissions and optional_permissions, before the transform removes any. */
+  declaredPermissions?: string[];
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
@@ -63,6 +66,7 @@ const SW_CLIENTS_REF_RE = /\b(?:self|globalThis)\s*\.\s*clients\b|\bclients\s*\.
 const SW_REGISTRATION_REF_RE = /\b(?:self|globalThis)\s*\.\s*registration\s*(?:\?\.|\.)\s*(?:active|installing|waiting|scope|addEventListener|update|unregister)\b/;
 const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
 const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
+const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 
 interface Usage {
   favicon: boolean;
@@ -73,12 +77,13 @@ interface Usage {
   serviceWorkerRegistration: boolean;
   pushManager: boolean;
   locks: boolean;
+  permissions: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
-    serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false,
+    serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false, permissions: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -97,9 +102,22 @@ function scanUsage(dir: string): Usage {
       if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
       if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
+      if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
     }
   }
   return found;
+}
+
+/**
+ * What the shim answers in permissions.contains/request for each permission
+ * Firefox doesn't know, where Firefox itself would throw: granted when the
+ * Chrome manifest asked for it and the shim emulates its API, otherwise not.
+ */
+function permissionAnswers(declared: string[]): Record<string, boolean> {
+  const asked = new Set(declared);
+  const answers: Record<string, boolean> = {};
+  for (const perm of Object.keys(UNSUPPORTED_PERMISSIONS)) answers[perm] = asked.has(perm) && SHIMMED_PERMISSIONS.has(perm);
+  return answers;
 }
 
 function shimSource(dir: string, config: ShimConfig): string {
@@ -123,6 +141,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
+    permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so

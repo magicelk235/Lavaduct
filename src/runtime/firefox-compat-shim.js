@@ -1908,6 +1908,88 @@
     } catch (e) {}
   }
 
+  // ── permissions Firefox doesn't know ───────────────────────────────────────
+  // The conversion removes the permissions Firefox doesn't know, offscreen and
+  // sidePanel among them, and Firefox's permissions.contains, request and
+  // remove throw synchronously on such a name. Chrome answers, and code checks
+  // contains({ permissions: ["offscreen"] }) before it creates its document.
+  // CONFIG.permissionAnswers names each of them: true when the Chrome manifest
+  // asked for it and the shim emulates the API, so the add-on has it; false
+  // otherwise. Those names are answered here, the rest go to Firefox, and a
+  // call naming none of them goes to Firefox untouched. Only emitted for a
+  // bundle that calls permissions.*.
+  function installPermissions() {
+    var answers = CONFIG.permissionAnswers;
+    if (!answers || typeof answers !== "object") return;
+    var nativePerms = null;
+    try { nativePerms = api.permissions; } catch (e) {}
+    if (!nativePerms) return;
+    var granted = Object.keys(answers).filter(function (n) { return answers[n] === true; });
+
+    // { ok: every name answered here is granted, rest: the filter for Firefox,
+    // or null when nothing is left for it }; null when the filter names none.
+    function split(perms) {
+      var names = perms && typeof perms === "object" && Array.isArray(perms.permissions) ? perms.permissions : [];
+      var own = names.filter(function (n) { return Object.prototype.hasOwnProperty.call(answers, n); });
+      if (!own.length) return null;
+      var left = names.filter(function (n) { return own.indexOf(n) < 0; });
+      var rest = Object.assign({}, perms, { permissions: left });
+      var forFirefox = left.length > 0 || Object.keys(rest).some(function (k) {
+        return k !== "permissions" && Array.isArray(rest[k]) && rest[k].length > 0;
+      });
+      return {
+        ok: own.every(function (n) { return answers[n] === true; }),
+        rest: forFirefox ? rest : null,
+      };
+    }
+
+    namespaces.forEach(function (ns) {
+      var perms = null;
+      try { perms = ns.permissions; } catch (e) {}
+      if (!perms) return;
+      function wrap(name, answer) {
+        var original = perms[name];
+        var native = nativePerms[name];
+        if (typeof original !== "function" || typeof native !== "function") return;
+        replaceMember(perms, name, function (filter, cb) {
+          var parts = split(filter);
+          if (!parts) return original.apply(perms, arguments);
+          var p;
+          try { p = Promise.resolve(answer(parts, function (f) { return native.call(nativePerms, f); })); } catch (e) { p = Promise.reject(e); }
+          return respond(ns, p, cb);
+        });
+      }
+      wrap("contains", function (parts, firefox) {
+        if (!parts.ok) return false;
+        return parts.rest ? firefox(parts.rest) : true;
+      });
+      // Forwarded before anything is awaited: Firefox only prompts inside the
+      // user action. A request that can't be granted in full prompts for nothing.
+      wrap("request", function (parts, firefox) {
+        if (!parts.ok) return false;
+        return parts.rest ? firefox(parts.rest) : true;
+      });
+      // An emulated permission can't be taken away, and a removed one was never there.
+      wrap("remove", function (parts, firefox) {
+        return parts.rest ? Promise.resolve(firefox(parts.rest)).then(function () { return false; }) : false;
+      });
+      var getAll = perms.getAll;
+      var nativeGetAll = nativePerms.getAll;
+      if (granted.length && typeof getAll === "function" && typeof nativeGetAll === "function") {
+        replaceMember(perms, "getAll", function (cb) {
+          var p = Promise.resolve().then(function () { return nativeGetAll.call(nativePerms); }).then(function (all) {
+            var out = Object.assign({}, all);
+            var list = Array.isArray(out.permissions) ? out.permissions.slice() : [];
+            granted.forEach(function (n) { if (list.indexOf(n) < 0) list.push(n); });
+            out.permissions = list;
+            return out;
+          });
+          return respond(ns, p, cb);
+        });
+      }
+    });
+  }
+
   // ── storage.managed without a policy ───────────────────────────────────────
   // With no enterprise policy for the add-on, Chrome answers storage.managed.get()
   // as an empty area does: {}, or the defaults it was given. Firefox rejects it
@@ -2008,5 +2090,6 @@
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
+  try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
