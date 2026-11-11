@@ -103,10 +103,13 @@ export function sandboxHome(sandbox: Sandbox, home: string): string {
 
 /**
  * The profiles.ini directory an install reads. Firefox 147+ uses
- * $XDG_CONFIG_HOME/mozilla/firefox unless ~/.mozilla already exists or
- * MOZ_LEGACY_HOME=1. The snap keeps the legacy layout under its own $HOME.
- * The Flatpak persists ~/.mozilla in its app folder and points
- * XDG_CONFIG_HOME at the app's config folder.
+ * $XDG_CONFIG_HOME/mozilla/firefox unless the legacy root ~/.mozilla/firefox
+ * (or ~/mozilla, its MOZ_USER_DIR) already exists, or MOZ_LEGACY_HOME=1. A
+ * bare ~/.mozilla doesn't count: native messaging apps create
+ * ~/.mozilla/native-messaging-hosts, which Firefox still reads, on XDG
+ * machines too. The snap keeps the legacy layout under its own $HOME. The
+ * Flatpak persists ~/.mozilla in its app folder and points XDG_CONFIG_HOME at
+ * the app's config folder.
  */
 export function linuxProfileRoot(
   sandbox: Sandbox | undefined,
@@ -116,12 +119,12 @@ export function linuxProfileRoot(
   if (sandbox === "snap") return join(sandboxHome("snap", home), ".mozilla", "firefox");
   if (sandbox === "flatpak") {
     const app = sandboxHome("flatpak", home);
-    return existsSync(join(app, ".mozilla"))
-      ? join(app, ".mozilla", "firefox")
-      : join(app, "config", "mozilla", "firefox");
+    const legacy = join(app, ".mozilla", "firefox");
+    return existsSync(legacy) ? legacy : join(app, "config", "mozilla", "firefox");
   }
-  if (existsSync(join(home, ".mozilla")) || env.MOZ_LEGACY_HOME?.startsWith("1")) {
-    return join(home, ".mozilla", "firefox");
+  const legacy = join(home, ".mozilla", "firefox");
+  if (existsSync(legacy) || existsSync(join(home, "mozilla")) || env.MOZ_LEGACY_HOME?.startsWith("1")) {
+    return legacy;
   }
   // Firefox ignores a relative XDG_CONFIG_HOME, as the XDG spec says to.
   const xdg = env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : join(home, ".config");
