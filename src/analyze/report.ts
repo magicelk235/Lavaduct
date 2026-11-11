@@ -94,6 +94,11 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   if (before.incognito === "split" && after.incognito === undefined)
     out.push('Removed `incognito: "split"` (Firefox would fall back to not_allowed; the default is spanning).');
 
+  const sandboxCsp = (m: Manifest): unknown =>
+    typeof m.content_security_policy === "object" ? m.content_security_policy.sandbox : (m.sandbox as Record<string, unknown> | undefined)?.content_security_policy;
+  if (sandboxCsp(before) === undefined && sandboxCsp(after) !== undefined)
+    out.push("Added Chrome's default sandbox CSP (Firefox would apply script-src 'self' to the sandbox pages, blocking eval and inline scripts).");
+
   const overridesBefore = before.chrome_url_overrides;
   if (overridesBefore && typeof overridesBefore === "object") {
     const kept = after.chrome_url_overrides ?? {};

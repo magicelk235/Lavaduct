@@ -370,6 +370,21 @@ function analyzeCommands(commands: Record<string, unknown>): Issue[] {
   return issues;
 }
 
+// Chrome's CSP for manifest sandbox pages when the manifest sets none. Firefox
+// applies script-src 'self' to them instead, so eval() and inline scripts fail.
+const CHROME_SANDBOX_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' 'unsafe-eval'; child-src 'self';";
+
+// Sandbox pages with no sandbox CSP of their own: content_security_policy.sandbox in
+// Manifest V3, sandbox.content_security_policy in V2. An MV3 string CSP is invalid
+// in Chrome too and is left alone.
+function lacksSandboxCsp(m: Manifest): boolean {
+  if (strings(m.sandbox?.pages).length === 0) return false;
+  const csp = m.content_security_policy;
+  if ((m.manifest_version ?? 2) >= 3) return csp === undefined || (typeof csp === "object" && csp !== null && typeof csp.sandbox !== "string");
+  const sandbox: unknown = m.sandbox;
+  return typeof sandbox === "object" && sandbox !== null && typeof Reflect.get(sandbox, "content_security_policy") !== "string";
+}
+
 // Manifest keys Firefox added after its first Manifest V3 release, and what an older
 // Firefox does when it meets them.
 const KEY_GATES: Array<{ since: string; applies: (m: Manifest) => boolean; message: string; category: string }> = [
@@ -653,6 +668,16 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       message: `CSP script-src allows remote origin(s) (${[...remoteSrc].join(", ")}); Firefox refuses remote scripts in Manifest V3, and AMO's policies forbid loading remote code.`,
       file: "manifest.json",
       fix: "Bundle the script into the extension and load it locally.",
+    });
+  }
+
+  if (lacksSandboxCsp(m)) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "sandbox pages without a sandbox CSP get script-src 'self' in Firefox, which blocks eval() and inline scripts there; Chrome's default sandbox CSP, which allows both, is written into the manifest.",
+      file: "manifest.json",
+      autoFixed: true,
     });
   }
 
@@ -1034,6 +1059,15 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   // Firefox would treat "split" as "not_allowed"; without the key the add-on spans
   // normal and private windows.
   if (out.incognito === "split") delete out.incognito;
+
+  if (lacksSandboxCsp(out)) {
+    if ((out.manifest_version ?? 2) >= 3) {
+      const csp = out.content_security_policy;
+      out.content_security_policy = { ...(typeof csp === "object" && csp !== null ? csp : {}), sandbox: CHROME_SANDBOX_CSP };
+    } else {
+      out.sandbox = Object.assign({}, out.sandbox, { content_security_policy: CHROME_SANDBOX_CSP });
+    }
+  }
 
   // An extension that only adds rules at runtime may declare rule_resources: [],
   // which Chrome accepts. Firefox wants at least one ruleset there and refuses the

@@ -57,8 +57,8 @@ test("MV3 host permissions are flagged only when Firefox wouldn't grant them at 
 
 test("sandboxed pages are flagged on Firefox releases without the sandbox key", () => {
   const m = { sandbox: { pages: ["eval.html"] } };
-  assert.equal(find(analyze(m).issues, "sandbox").length, 1, "153 predates sandbox support");
-  assert.equal(find(analyze(m, "154.0").issues, "sandbox").length, 0);
+  assert.equal(find(analyze(m).issues, "sandbox pages need Firefox 154").length, 1, "153 predates sandbox support");
+  assert.equal(find(analyze(m, "154.0").issues, "sandbox pages need Firefox 154").length, 0);
 });
 
 test("incognito split is reported as removed", () => {
