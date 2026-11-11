@@ -140,6 +140,11 @@ export interface ConvertOptions {
    * Chrome ones; undefined = when installing.
    */
   nativeHosts?: boolean;
+  /**
+   * Real paths of the output folders earlier inputs of a batch wrote to. A default
+   * output already in the set moves to `<Name>_Firefox_<n>`; the folder used is added.
+   */
+  claimedOutputs?: Set<string>;
 }
 
 export interface ConvertResult {

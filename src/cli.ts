@@ -716,6 +716,8 @@ async function main(): Promise<void> {
 
   const batch = inputs.length > 1;
   let anyFailed = false;
+  // Two inputs of a batch can share a name; each still gets its own folder.
+  const claimedOutputs = batch ? new Set<string>() : undefined;
   // Download scratch dirs in flight. Each is removed when its input is done, but
   // process.exit() skips that, so one exit handler drains whatever is left.
   const liveScratch = new Set<string>();
@@ -790,6 +792,7 @@ async function main(): Promise<void> {
           launch: !values["no-launch"],
           headless: values.headless,
           nativeHosts: values["no-native-hosts"] ? false : values["native-hosts"] ? true : undefined,
+          claimedOutputs,
         });
       } catch (e) {
         fail((e as Error).message);

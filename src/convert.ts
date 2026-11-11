@@ -557,7 +557,12 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     const plan = planRoute(opts, src.minFirefox);
 
     const appName = deriveAppName(src.name);
-    const outputDir = resolve(opts.output ?? join(process.cwd(), `${appName}_Firefox`));
+    let outputDir = resolve(opts.output ?? join(process.cwd(), `${appName}_Firefox`));
+    if (opts.output === undefined && opts.claimedOutputs) {
+      const taken = outputDir;
+      for (let n = 2; opts.claimedOutputs.has(realPathOf(outputDir)); n++) outputDir = resolve(`${appName}_Firefox_${n}`);
+      if (outputDir !== taken) warn(`${taken} holds the add-on converted from an earlier input in this batch; writing this one to ${outputDir}.`);
+    }
     // Refuse overlapping input and output before anything destructive: staging
     // recreates its folder and --clean wipes the output directory.
     const [realExt, realOut] = [realPathOf(src.extPath), realPathOf(outputDir)];
@@ -591,6 +596,7 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
       ok(`Cleaned output dir → ${outputDir}`);
     }
     mkdirSync(outputDir, { recursive: true });
+    opts.claimedOutputs?.add(realPathOf(outputDir));
 
     // Kept in the output directory: a temporary install loads it in place.
     info("Staging clean extension assets …");
