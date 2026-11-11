@@ -1446,9 +1446,11 @@
   // Chrome worker restarted after its install is in. No update ever arrives, so
   // the registration's events never fire. Its postMessage reaches the worker
   // itself, with the worker as the source, as in Chrome. Only emitted for a
-  // bundle that reads them.
+  // bundle that reads them. A bundle with web push code gets the worker without
+  // the registration (see PUSH_MANAGER_REF_RE in shim.ts): MetaMask boots on
+  // `"activated" === self.serviceWorker.state` and carries Firebase's push code.
   function installServiceWorkerRegistration() {
-    if (!CONFIG.serviceWorkerRegistration || !isBackground || typeof EventTarget !== "function") return;
+    if (!CONFIG.serviceWorkerSelf || !isBackground || typeof EventTarget !== "function") return;
     var worker = makeServiceWorker(function postMessage(message, transfer) {
       var list = transferList(transfer);
       var copy = structuredClone({ m: message, t: list }, { transfer: list });
@@ -1463,7 +1465,7 @@
       }, 0);
     });
     defineMissing(G, "serviceWorker", worker);
-    defineMissing(G, "registration", makeRegistration(worker));
+    if (CONFIG.serviceWorkerRegistration) defineMissing(G, "registration", makeRegistration(worker));
   }
 
   // ── The worker's location in Web Lock names ────────────────────────────────
@@ -2150,6 +2152,93 @@
     });
   }
 
+  // ── Values Chrome's storage keeps and Firefox can't clone ───────────────────
+  // Chrome's storage.set serializes values: a function, or an object without
+  // own data such as a URL, is stored as {}. Firefox structured-clones them and
+  // refuses the whole call (in Firefox 160 for local, sync and session alike):
+  // the promise rejects with "DataCloneError: Function object could not be
+  // cloned.", the callback sees it as lastError, and nothing is stored. Rabby
+  // keeps rules with a getValue function in storage.local. A call Firefox
+  // takes stays Firefox's; one it refuses for a clone error is sent again with
+  // what it couldn't clone replaced the way Chrome stores it. Only emitted for
+  // a bundle that uses storage.
+  function chromeStorable(value, ancestors) {
+    if (typeof value === "function") return {};
+    if (typeof value === "symbol") return undefined;
+    if (value === null || typeof value !== "object") return value;
+    if (ancestors.indexOf(value) >= 0) return undefined;
+    var proto = Object.getPrototypeOf(value);
+    var plain = Array.isArray(value) || proto === Object.prototype || proto === null;
+    if (!plain && typeof structuredClone === "function") {
+      try {
+        structuredClone(value);
+        return value;
+      } catch (e) {
+        if (!isCloneError(e)) return value;
+      }
+    }
+    ancestors.push(value);
+    var out;
+    if (Array.isArray(value)) {
+      out = [];
+      for (var i = 0; i < value.length; i++) {
+        var item = chromeStorable(value[i], ancestors);
+        out.push(item === undefined ? null : item);
+      }
+    } else {
+      out = {};
+      Object.keys(value).forEach(function (k) {
+        var v = chromeStorable(value[k], ancestors);
+        if (v !== undefined) out[k] = v;
+      });
+    }
+    ancestors.pop();
+    return out;
+  }
+
+  function installStorageCloneFallback() {
+    if (!CONFIG.storageClone) return;
+    namespaces.forEach(function (ns) {
+      var storage = null;
+      try { storage = ns.storage; } catch (e) {}
+      if (!storage) return;
+      ["local", "sync", "session"].forEach(function (name) {
+        var area = null;
+        try { area = storage[name]; } catch (e) {}
+        var set = area && area.set;
+        if (typeof set !== "function") return;
+        replaceMember(area, "set", function (items) {
+          var args = Array.prototype.slice.call(arguments);
+          var storable = function () { return chromeStorable(items, []); };
+          var last = args.length - 1;
+          if (last >= 1 && typeof args[last] === "function") {
+            var cb = args[last];
+            args[last] = function () {
+              var err = null;
+              try { err = ns.runtime.lastError; } catch (e) {}
+              if (err && isCloneError(err)) {
+                var copy = null;
+                try { copy = storable(); } catch (e) {}
+                if (copy) return set.call(area, copy, cb);
+              }
+              return cb.apply(this, arguments);
+            };
+            return set.apply(area, args);
+          }
+          var retry = function (e) {
+            if (!isCloneError(e)) throw e;
+            var copy;
+            try { copy = storable(); } catch (x) { throw e; }
+            return set.call(area, copy);
+          };
+          var result;
+          try { result = set.apply(area, args); } catch (e) { return retry(e); }
+          return result && typeof result.then === "function" ? result.then(null, retry) : result;
+        });
+      });
+    });
+  }
+
   // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
   // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
   // such as Cookie or Referer; Firefox shows every header without it, has no
@@ -2372,5 +2461,6 @@
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
+  try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();

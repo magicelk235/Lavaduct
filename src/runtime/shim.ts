@@ -66,12 +66,18 @@ const SW_CLIENTS_REF_RE = /\b(?:self|globalThis)\s*\.\s*clients\b|\bclients\s*\.
 // Firefox gives add-ons no Push API, so it must keep finding none.
 const SW_REGISTRATION_REF_RE = /\b(?:self|globalThis)\s*\.\s*registration\s*(?:\?\.|\.)\s*(?:active|installing|waiting|scope|addEventListener|update|unregister)\b/;
 const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
+// The worker's own state (`self.serviceWorker.state`), read through any alias
+// of self, which minifiers introduce: `"activated" === a.serviceWorker.state`.
+// A ServiceWorker object has no pushManager, so web push doesn't rule it out.
+const SW_STATE_REF_RE = /\.\s*serviceWorker\s*(?:\?\.|\.)\s*state\b/;
 const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
 // The manifest's worker script read at runtime: bundles resolve it against their
 // own location to decide whether they run in the background.
 const SW_MANIFEST_REF_RE = /\bservice_worker\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
+// The storage areas whose set the clone fallback wraps.
+const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
@@ -86,11 +92,13 @@ interface Usage {
   serviceWorkerScope: boolean;
   serviceWorkerClients: boolean;
   serviceWorkerRegistration: boolean;
+  serviceWorkerState: boolean;
   pushManager: boolean;
   serviceWorkerManifest: boolean;
   locks: boolean;
   permissions: boolean;
   extraHeaders: boolean;
+  storage: boolean;
   messaging: boolean;
   storageGlobalsAssigned: string[];
 }
@@ -98,8 +106,8 @@ interface Usage {
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
-    serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
-    extraHeaders: false, messaging: false, storageGlobalsAssigned: [],
+    serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
+    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [],
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -116,11 +124,13 @@ function scanUsage(dir: string): Usage {
       if (!found.serviceWorkerScope) found.serviceWorkerScope = SW_SCOPE_REF_RE.test(src);
       if (!found.serviceWorkerClients) found.serviceWorkerClients = SW_CLIENTS_REF_RE.test(src);
       if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
+      if (!found.serviceWorkerState) found.serviceWorkerState = SW_STATE_REF_RE.test(src);
       if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
       if (!found.serviceWorkerManifest) found.serviceWorkerManifest = SW_MANIFEST_REF_RE.test(src);
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
+      if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
@@ -159,6 +169,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
     serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
+    serviceWorkerSelf: config.serviceWorker === true && (usage.serviceWorkerState || (usage.serviceWorkerRegistration && !usage.pushManager)),
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
     serviceWorkerManifest: config.serviceWorker === true && usage.serviceWorkerManifest,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
@@ -166,6 +177,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
     extraHeaders: usage.extraHeaders,
+    storageClone: usage.storage,
     messageJson: usage.messaging,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
