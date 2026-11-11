@@ -276,6 +276,23 @@ function remoteSearchFavicon(m: Manifest): string | null {
   return icon.startsWith("//") || URL.canParse(icon) ? icon : null;
 }
 
+// Firefox takes a search engine only from https:// or a local http:// address
+// (search_url and suggest_url patterns in chrome_settings_overrides.json) and refuses
+// the whole manifest otherwise; Chrome also takes http://. A __MSG_ value is checked
+// after Firefox localizes it, which needs the locale files, so it is left alone.
+const SECURE_SEARCH_URL_RE = /^(?:https:\/\/|http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d*)?(?:\/|$))/;
+function insecureSearchUrls(m: Manifest): Array<[string, string]> {
+  const overrides = m.chrome_settings_overrides;
+  const provider = typeof overrides === "object" && overrides !== null && "search_provider" in overrides ? overrides.search_provider : undefined;
+  if (typeof provider !== "object" || provider === null) return [];
+  const out: Array<[string, string]> = [];
+  for (const key of ["search_url", "suggest_url"]) {
+    const url: unknown = Reflect.get(provider, key);
+    if (typeof url === "string" && url !== "" && !url.includes("__MSG_") && !SECURE_SEARCH_URL_RE.test(url)) out.push([key, url]);
+  }
+  return out;
+}
+
 // Firefox accepts a port in a pattern but compares it as part of the host name, so a
 // pattern with a port never matches anything.
 function portIssue(pattern: string, where: string, category: string): Issue | null {
@@ -728,6 +745,16 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       file: "manifest.json",
       fix: "Firefox shows the add-on's icon for the search engine instead.",
       autoFixed: true,
+    });
+  }
+
+  for (const [key, url] of insecureSearchUrls(m)) {
+    issues.push({
+      severity: "error",
+      category: "manifest",
+      message: `chrome_settings_overrides.search_provider.${key} is ${url}; Firefox only takes https:// search engines (or a localhost address) and refuses to load a manifest with it.`,
+      file: "manifest.json",
+      fix: "Point it at the engine's https:// address.",
     });
   }
 
