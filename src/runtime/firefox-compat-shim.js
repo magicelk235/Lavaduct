@@ -1655,6 +1655,7 @@
           var matches = !filter || Object.keys(filter).every(function (key) {
             if (key === "contextTypes") return true;
             var want = filter[key];
+            if (typeof want === "boolean") return ctx[key] === want;
             return !Array.isArray(want) || want.indexOf(ctx[key.replace(/s$/, "")]) >= 0;
           });
           return matches ? list.concat([ctx]) : list;
