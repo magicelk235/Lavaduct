@@ -1399,6 +1399,7 @@
       delete sessions[tabId];
       persist();
       updateKeepAlive();
+      if (!anyNetwork()) hookNetwork(false);
       if (!reason) return;
       var source = { tabId: tabId };
       det.dispatch(source, reason);
@@ -1647,6 +1648,8 @@
       var wr = api.webRequest;
       if (!wr || networkHooked === on) return;
       networkHooked = on;
+      // Requests still in flight would never hear their end.
+      if (!on) requests = {};
       var filter = { urls: ["<all_urls>"] };
       var pairs = [
         ["onBeforeRequest", net.before, ["requestBody"]], ["onSendHeaders", net.headers, ["requestHeaders"]],
@@ -2012,7 +2015,6 @@
       var tabId = cdpTabOf(target);
       if (!sessions[tabId]) throw new Error("Debugger is not attached to the tab with id: " + tabId + ".");
       ended(tabId, null);
-      if (!anyNetwork()) hookNetwork(false);
       // Every frame got the dialog hook. A tab that has gone takes its hooks
       // with it.
       return everyFrame(tabId, "MAIN", cdpMain, ["unhook", { what: "all" }, CDP_PAGE_KEY]).then(noop, noop);
