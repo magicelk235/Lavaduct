@@ -1493,6 +1493,34 @@
     });
   }
 
+  // ── The worker's script in getManifest() ────────────────────────────────────
+  // Firefox returns the converted manifest, whose background has scripts and no
+  // service_worker. Bundles tell the worker from their pages by resolving that
+  // script against their own location (Loom):
+  //   new URL(getManifest().background.service_worker, location.origin).pathname === location.pathname
+  // Without the key the background answers no and sends what it would handle
+  // itself to itself with runtime.sendMessage, where nothing receives it. The
+  // background is told its own page is the worker's script, so the check says
+  // yes there; everywhere else the key is Chrome's, the worker's real script,
+  // which navigator.serviceWorker.register() in the pages matches.
+  function installServiceWorkerManifest() {
+    if (!CONFIG.serviceWorkerManifest || !CONFIG.serviceWorkerScript) return;
+    var script = isBackground ? stripSlashes(loc.pathname) : stripSlashes(CONFIG.serviceWorkerScript);
+    namespaces.forEach(function (ns) {
+      var rt = ns && ns.runtime;
+      var native = rt && rt.getManifest;
+      if (typeof native !== "function") return;
+      replaceMember(rt, "getManifest", function () {
+        var manifest = native.apply(rt, arguments);
+        var bg = manifest && manifest.background;
+        if (!bg || typeof bg !== "object" || typeof bg.service_worker === "string") return manifest;
+        var copy = Object.assign({}, manifest);
+        copy.background = Object.assign({}, bg, { service_worker: script });
+        return copy;
+      });
+    });
+  }
+
   // ── chrome://newtab ─────────────────────────────────────────────────────────
   // tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox
   // ("Illegal URL"). A bundle that opens Chrome's new tab page gets Firefox's,
@@ -2329,6 +2357,7 @@
   try { installServiceWorkerClients(); } catch (e) { dbg("clients shim failed:", errorMessage(e)); }
   try { installServiceWorkerContainer(); } catch (e) { dbg("navigator.serviceWorker shim failed:", errorMessage(e)); }
   try { installServiceWorkerLocks(); } catch (e) { dbg("Web Locks shim failed:", errorMessage(e)); }
+  try { installServiceWorkerManifest(); } catch (e) { dbg("getManifest service_worker shim failed:", errorMessage(e)); }
   try { installNewTabUrls(); } catch (e) { dbg("new tab URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
   try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
