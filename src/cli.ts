@@ -250,12 +250,15 @@ FIREFOX
       --version               Print the version and exit
 `;
 
-function writeAnalyzeReport(path: string, content: string): void {
+/** Write the --report file; false, with the reason printed, when it can't be written. */
+function writeAnalyzeReport(path: string, content: string): boolean {
   try {
     writeFileSync(resolve(path), content, "utf-8");
     ok(`Report written → ${path}`);
+    return true;
   } catch (e) {
-    warn(`Could not write report to ${path}: ${(e as Error).message}`);
+    fail(`Could not write report to ${path}: ${(e as Error).message}`);
+    return false;
   }
 }
 
@@ -274,6 +277,7 @@ function analyzeOnly(input: string, settings: Omit<AnalyzeOptions, "input">, jso
   if (!json) info(`${a.name} (MV${a.manifestVersion})`);
   // The same gate as a conversion: auto-fixed issues don't block.
   const blocking = countBlocking(a.issues, strict);
+  let reportWritten = true;
   if (json) {
     const counts = { error: 0, warning: 0, info: 0 };
     let autoFixed = 0;
@@ -304,7 +308,7 @@ function analyzeOnly(input: string, settings: Omit<AnalyzeOptions, "input">, jso
       2,
     );
     console.log(out);
-    if (reportPath) writeAnalyzeReport(reportPath, out);
+    if (reportPath) reportWritten = writeAnalyzeReport(reportPath, out);
   } else {
     printIssues(a.issues, strict);
     if (a.manifestChanges.length > 0) {
@@ -321,10 +325,10 @@ function analyzeOnly(input: string, settings: Omit<AnalyzeOptions, "input">, jso
         manifestChanges: a.manifestChanges,
         strict,
       };
-      writeAnalyzeReport(reportPath, buildReportMarkdown(meta, a.issues));
+      reportWritten = writeAnalyzeReport(reportPath, buildReportMarkdown(meta, a.issues));
     }
   }
-  return blocking > 0 ? 1 : 0;
+  return blocking > 0 || !reportWritten ? 1 : 0;
 }
 
 /** The profile --profile names; without a Firefox install only a directory works. */
