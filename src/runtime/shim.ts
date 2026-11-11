@@ -82,6 +82,9 @@ const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
+// Content scripts injected at runtime from files (scripting.executeScript,
+// registerContentScripts and updateContentScripts, MV2 tabs.executeScript).
+const INJECTS_FILES_RE = /\b(?:executeScript|registerContentScripts|updateContentScripts)\b/;
 
 interface Usage {
   favicon: boolean;
@@ -97,13 +100,14 @@ interface Usage {
   permissions: boolean;
   extraHeaders: boolean;
   messaging: boolean;
+  injectsFiles: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, messaging: false,
+    extraHeaders: false, messaging: false, injectsFiles: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -127,6 +131,7 @@ function scanUsage(dir: string): Usage {
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
+      if (!found.injectsFiles) found.injectsFiles = INJECTS_FILES_RE.test(src);
     }
   }
   return found;
@@ -165,6 +170,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     newTabPage: usage.newTab ? (config.newTabPage ?? "").split(/[?#]/)[0].replace(/^\/+/, "") : "",
     shortcutsPage: usage.shortcutsPage,
     externalIds: Array.isArray(config.externalIds) ? config.externalIds.filter((id) => typeof id === "string") : null,
+    injectShim: usage.injectsFiles ? SHIM_FILENAME : "",
     serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
     serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,

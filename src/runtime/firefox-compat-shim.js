@@ -2184,6 +2184,95 @@
     });
   }
 
+  // ── Content scripts injected at runtime ────────────────────────────────────
+  // The conversion puts the shim first in every manifest content script, but
+  // files injected later with scripting.executeScript, registered with
+  // registerContentScripts or updateContentScripts, or run with
+  // tabs.executeScript (MV2) ran without it in a tab no manifest script
+  // matched: no window.chrome, no JSON fallback for messages, no favicon URLs.
+  // The shim goes first in each such file list of the isolated world (the
+  // page's own world has no extension API); where it already ran in that
+  // frame, it returns at once. Injections of a function are left alone, and
+  // getRegisteredContentScripts leaves the shim out. Only emitted for a
+  // bundle that injects files.
+  function withShimFirst(files) {
+    var shim = CONFIG.injectShim;
+    if (!Array.isArray(files) || !files.length) return files;
+    var first = String(files[0]).replace(/^\/+/, "");
+    return first === shim ? files : [shim].concat(files);
+  }
+
+  function withoutShim(files) {
+    if (!Array.isArray(files) || !files.length || String(files[0]).replace(/^\/+/, "") !== CONFIG.injectShim) return files;
+    return files.slice(1);
+  }
+
+  function installInjectedScriptShim() {
+    if (typeof CONFIG.injectShim !== "string" || !CONFIG.injectShim || !isExtensionPage) return;
+    function copyWith(obj, key, value) {
+      var c = {};
+      for (var k in obj) c[k] = obj[k];
+      c[key] = value;
+      return c;
+    }
+    function isolated(o) { return o && typeof o === "object" && o.world !== "MAIN"; }
+    namespaces.forEach(function (ns) {
+      var scripting = null, tabs = null;
+      try { scripting = ns.scripting; } catch (e) {}
+      try { tabs = ns.tabs; } catch (e) {}
+      if (scripting && typeof scripting.executeScript === "function") {
+        var exec = scripting.executeScript;
+        replaceMember(scripting, "executeScript", function (details) {
+          var args = Array.prototype.slice.call(arguments);
+          if (isolated(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", withShimFirst(details.files));
+          return exec.apply(scripting, args);
+        });
+      }
+      ["registerContentScripts", "updateContentScripts"].forEach(function (name) {
+        if (!scripting || typeof scripting[name] !== "function") return;
+        var native = scripting[name];
+        replaceMember(scripting, name, function (scripts) {
+          var args = Array.prototype.slice.call(arguments);
+          if (Array.isArray(scripts)) {
+            args[0] = scripts.map(function (s) { return isolated(s) && Array.isArray(s.js) ? copyWith(s, "js", withShimFirst(s.js)) : s; });
+          }
+          return native.apply(scripting, args);
+        });
+      });
+      if (scripting && typeof scripting.getRegisteredContentScripts === "function") {
+        var getRegistered = scripting.getRegisteredContentScripts;
+        replaceMember(scripting, "getRegisteredContentScripts", function () {
+          var args = Array.prototype.slice.call(arguments);
+          var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+          var p = Promise.resolve(getRegistered.apply(scripting, args.length ? args : [])).then(function (list) {
+            return Array.isArray(list) ? list.map(function (s) { return s && Array.isArray(s.js) ? copyWith(s, "js", withoutShim(s.js)) : s; }) : list;
+          });
+          return respond(ns, p, cb);
+        });
+      }
+      // MV2: one file per call, so the shim goes in a call of its own first.
+      if (tabs && typeof tabs.executeScript === "function") {
+        var tabsExec = tabs.executeScript;
+        replaceMember(tabs, "executeScript", function () {
+          var args = Array.prototype.slice.call(arguments);
+          var at = typeof args[0] === "object" && args[0] !== null ? 0 : 1;
+          var details = args[at];
+          if (!details || typeof details.file !== "string" || String(details.file).replace(/^\/+/, "") === CONFIG.injectShim) return tabsExec.apply(tabs, args);
+          var shimDetails = { file: "/" + CONFIG.injectShim };
+          ["allFrames", "frameId", "matchAboutBlank", "runAt"].forEach(function (k) { if (details[k] !== undefined) shimDetails[k] = details[k]; });
+          var shimArgs = at === 1 ? [args[0], shimDetails] : [shimDetails];
+          var first;
+          try { first = Promise.resolve(api.tabs.executeScript.apply(api.tabs, shimArgs)); } catch (e) { first = Promise.reject(e); }
+          var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+          var p = first.catch(function (e) { dbg("shim injection failed:", errorMessage(e)); }).then(function () {
+            return tabsExec.apply(tabs, args);
+          });
+          return respond(ns, p, cb);
+        });
+      }
+    });
+  }
+
   // ── externally_connectable ids ─────────────────────────────────────────────
   // In Chrome a manifest with externally_connectable lets in only the
   // extensions its `ids` lists: none when the list is missing, every one for
@@ -2472,5 +2561,6 @@
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
+  try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
