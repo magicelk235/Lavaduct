@@ -1444,6 +1444,58 @@
     defineMissing(G, "registration", makeRegistration(worker));
   }
 
+  // ── The worker's install and activate events ───────────────────────────────
+  // Chrome installs an extension's service worker when the extension is
+  // installed or updated: the worker's script runs, `install` fires, then
+  // `activate`, each waiting on the promises its handlers pass to waitUntil.
+  // Workers boot from those events (MetaMask starts its app from `install`)
+  // and call skipWaiting() in them. The event page gets no such events, and a
+  // page has no skipWaiting, so both are given here: once per add-on version,
+  // after the background's scripts have run, `install` and then `activate`
+  // are dispatched on the global, oninstall and onactivate included. Without
+  // localStorage nothing is dispatched, since the version can't be told apart
+  // and an event page restarts every time it wakes. Only emitted for a bundle
+  // that listens for them or calls skipWaiting().
+  var SW_VERSION_KEY = "__lavaductServiceWorkerVersion";
+
+  function installServiceWorkerLifecycle() {
+    if (!CONFIG.serviceWorkerLifecycle || !isBackground) return;
+    defineMissing(G, "skipWaiting", function skipWaiting() { return Promise.resolve(); });
+    if (typeof G.addEventListener !== "function" || typeof G.dispatchEvent !== "function" || typeof Event !== "function") return;
+    ["install", "activate"].forEach(function (type) {
+      if (!("on" + type in G)) handlerProps(G, [type]);
+    });
+    if (!localStore) return;
+    var version = "";
+    try { version = String(api.runtime.getManifest().version || ""); } catch (e) {}
+    var last = null;
+    try { last = localStore.getItem(SW_VERSION_KEY); } catch (e) {}
+    if (last === version) return;
+
+    // An ExtendableEvent: resolves once every promise passed to waitUntil has
+    // settled, and keeps the event page awake until then.
+    function fire(type) {
+      var pending = [];
+      var evt = new Event(type);
+      try {
+        Object.defineProperty(evt, "waitUntil", {
+          configurable: true, writable: true,
+          value: function waitUntil(p) { pending.push(Promise.resolve(p).catch(noop)); },
+        });
+      } catch (e) {}
+      try { G.dispatchEvent(evt); } catch (e) { dbg("worker " + type + " event failed:", errorMessage(e)); }
+      var all = Promise.all(pending);
+      if (pending.length) keepAliveUntil(all);
+      return all;
+    }
+    function run() {
+      try { localStore.setItem(SW_VERSION_KEY, version); } catch (e) {}
+      fire("install").then(function () { return fire("activate"); });
+    }
+    if (hasDocument && document.readyState === "loading") document.addEventListener("DOMContentLoaded", run, { once: true });
+    else setTimeout(run, 0);
+  }
+
   // ── The worker's location in Web Lock names ────────────────────────────────
   // In Chrome the background's `location` is its script's (/sw.js); the event
   // page's is /_generated_background_page.html. A worker that holds a lock named
@@ -2293,6 +2345,7 @@
   try { installServiceWorkerRegistration(); } catch (e) { dbg("registration shim failed:", errorMessage(e)); }
   try { installServiceWorkerClients(); } catch (e) { dbg("clients shim failed:", errorMessage(e)); }
   try { installServiceWorkerContainer(); } catch (e) { dbg("navigator.serviceWorker shim failed:", errorMessage(e)); }
+  try { installServiceWorkerLifecycle(); } catch (e) { dbg("worker lifecycle shim failed:", errorMessage(e)); }
   try { installServiceWorkerLocks(); } catch (e) { dbg("Web Locks shim failed:", errorMessage(e)); }
   try { installNewTabUrls(); } catch (e) { dbg("new tab URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
