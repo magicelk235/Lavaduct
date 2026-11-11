@@ -11,6 +11,9 @@ var __SHIM_DEBUG_WRITE__ = (function () {
   try {
     var KEY = "__viaduct_debug_log__";
     var CAP = 2000;
+    // One entry's text, so a logged response body or a huge object can't make
+    // every flush read and rewrite megabytes, or push the log past its quota.
+    var MSG_CAP = 4000;
     var FLUSH_MS = 1000;
     var api = null;
     try {
@@ -92,7 +95,9 @@ var __SHIM_DEBUG_WRITE__ = (function () {
       try {
         var parts = [];
         for (var i = 0; i < args.length; i++) parts.push(fmt(args[i]));
-        pending.push({ t: Date.now(), ctx: ctx, msg: parts.join(" ") });
+        var msg = parts.join(" ");
+        if (msg.length > MSG_CAP) msg = msg.slice(0, MSG_CAP) + "... [" + (msg.length - MSG_CAP) + " more chars]";
+        pending.push({ t: Date.now(), ctx: ctx, msg: msg });
         if (pending.length > CAP) pending.splice(0, pending.length - CAP);
         if (timer == null) timer = setTimeout(flush, FLUSH_MS);
       } catch (e) {}
