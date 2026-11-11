@@ -1,7 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ConvertOptions, ConvertResult, Issue, Manifest, SignRoute } from "./types.js";
 import { ENV_PREFIX, NAME } from "./name.js";
 import { extractExtension } from "./input/extract.js";
@@ -81,6 +81,29 @@ export function findFirefox(selector?: string): FirefoxInstall {
 /** File and folder name for an extension: its name without spaces or punctuation. */
 function deriveAppName(name: string): string {
   return name.replace(/[^\p{L}\p{N}_-]+/gu, "") || "Extension";
+}
+
+/**
+ * The real path of `p`, with the case the file system stores. A path that doesn't
+ * exist yet, like a new output directory, is resolved through its nearest existing
+ * ancestor, so a symlink or a differently cased name above it can't hide where it lies.
+ */
+function realPathOf(p: string): string {
+  const tail: string[] = [];
+  for (let dir = resolve(p); ; dir = dirname(dir)) {
+    try {
+      return join(realpathSync.native(dir), ...tail);
+    } catch {
+      if (dirname(dir) === dir) return resolve(p);
+      tail.unshift(basename(dir));
+    }
+  }
+}
+
+/** True when `child` is `parent` or lies below it. */
+function isInside(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (rel.split(sep)[0] !== ".." && !isAbsolute(rel));
 }
 
 export interface RouteChoice {
@@ -537,15 +560,7 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     const outputDir = resolve(opts.output ?? join(process.cwd(), `${appName}_Firefox`));
     // Refuse overlapping input and output before anything destructive: staging
     // recreates its folder and --clean wipes the output directory.
-    const realOrSelf = (p: string) => {
-      try {
-        return realpathSync(p);
-      } catch {
-        return resolve(p);
-      }
-    };
-    const isInside = (child: string, parent: string) => child === parent || child.startsWith(parent + sep);
-    const [realExt, realOut] = [realOrSelf(src.extPath), realOrSelf(outputDir)];
+    const [realExt, realOut] = [realPathOf(src.extPath), realPathOf(outputDir)];
     if (isInside(realExt, realOut)) {
       fail(`Input extension (${src.extPath}) lives inside the output directory (${outputDir}); converting would delete it. Pass -o <dir> outside the input.`);
       return result;
@@ -560,9 +575,9 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     const xpiPath = join(outputDir, `${appName}.xpi`);
     const zipPath = opts.zip ? join(outputDir, `${appName}.zip`) : undefined;
     if (statSync(opts.input).isFile()) {
-      const realInput = realOrSelf(opts.input);
-      const target = [xpiPath, zipPath].find((p) => p !== undefined && realOrSelf(p) === realInput);
-      if (target || isInside(realInput, realOrSelf(stageDir))) {
+      const realInput = realPathOf(opts.input);
+      const target = [xpiPath, zipPath].find((p) => p !== undefined && realPathOf(p) === realInput);
+      if (target || isInside(realInput, realPathOf(stageDir))) {
         fail(`The output would overwrite the input ${opts.input}${target ? ` with ${basename(target)}` : ""}. Pass -o <dir> elsewhere.`);
         return result;
       }
