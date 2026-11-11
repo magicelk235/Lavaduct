@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { join, dirname, relative } from "node:path";
 import type { Manifest } from "../types.js";
 import { matchPatternError } from "../manifest/manifest.js";
+import { resolveInside } from "../manifest/dnr.js";
 import { TEMPLATE_DIR } from "../paths.js";
 import { NAME } from "../name.js";
 import { walkScripts } from "../input/stage.js";
@@ -256,7 +257,11 @@ export function applyOAuthBridge(stageDir: string, manifest: Manifest, chromeId?
   return notes;
 }
 
-/** Load the receiver before the extension's own background code. */
+/**
+ * Load the receiver before the extension's own background code. The worker and
+ * page paths come from the untrusted manifest, so a path that leads out of the
+ * staged directory is never written to.
+ */
 function wireReceiver(stageDir: string, manifest: Manifest): void {
   const bg = manifest.background;
   if (!bg) return;
@@ -266,8 +271,8 @@ function wireReceiver(stageDir: string, manifest: Manifest): void {
   }
   if (typeof bg.service_worker === "string") {
     const sw = bg.service_worker.replace(/^(?:\.?\/)+/, "");
-    const swPath = join(stageDir, sw);
-    if (!existsSync(swPath)) return;
+    const swPath = resolveInside(stageDir, sw);
+    if (!swPath || !existsSync(swPath)) return;
     const src = readFileSync(swPath, "utf-8");
     if (bg.type === "module") {
       // A module's imports run before its body.
@@ -285,8 +290,8 @@ function wireReceiver(stageDir: string, manifest: Manifest): void {
     return;
   }
   if (typeof bg.page === "string") {
-    const pagePath = join(stageDir, bg.page.replace(/^\/+/, ""));
-    if (!existsSync(pagePath)) return;
+    const pagePath = resolveInside(stageDir, bg.page);
+    if (!pagePath || !existsSync(pagePath)) return;
     const tag = `<script src="/${BRIDGE_BACKGROUND}"></script>`;
     const html = readFileSync(pagePath, "utf-8");
     if (!html.includes(tag)) writeFileSync(pagePath, insertAtHeadStart(html, tag), "utf-8");
