@@ -825,8 +825,11 @@
         var key = scopes.slice().sort().join(" ");
         var cached = tokens[key];
         if (cached && cached.expires - 60000 > Date.now()) return { token: cached.token, grantedScopes: cached.scopes };
-        if (inflight[key]) return inflight[key];
         var interactive = d.interactive === true;
+        // A silent flow fails where the user has to sign in, so an interactive
+        // call never joins one: each kind shares only its own in-flight flow.
+        var flowKey = (interactive ? "interactive " : "silent ") + key;
+        if (inflight[flowKey]) return inflight[flowKey];
         var query = [
           "client_id=" + encodeURIComponent(cfg.client_id),
           "response_type=token",
@@ -848,8 +851,8 @@
             return { token: p.access_token, grantedScopes: granted };
           });
         });
-        inflight[key] = flow;
-        var clear = function () { delete inflight[key]; };
+        inflight[flowKey] = flow;
+        var clear = function () { delete inflight[flowKey]; };
         flow.then(clear, clear);
         return flow;
       });
