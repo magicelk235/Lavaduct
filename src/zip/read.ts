@@ -227,6 +227,11 @@ export function extractZip(buf: Buffer, destDir: string): void {
   const root = resolve(destDir);
   const prefix = root.endsWith(sep) ? root : root + sep;
   const plan: Array<{ entry: CentralEntry; target: string; dir: boolean }> = [];
+  // A path an archive uses both as a file and as a folder ("a" and "a/b.js") can't
+  // be extracted; finding it here keeps the promise that a refused archive writes
+  // nothing, instead of failing with EEXIST or EISDIR halfway through.
+  const files = new Map<string, string>();
+  const folders = new Map<string, string>();
   for (const entry of entries) {
     // Unix file type in the high half of the external attributes; 0o120000 is a symlink.
     if (((entry.externalAttrs >>> 16) & 0o170000) === 0o120000) {
@@ -236,7 +241,18 @@ export function extractZip(buf: Buffer, destDir: string): void {
     if (segments.length === 0) continue;
     const target = join(root, ...segments);
     if (!target.startsWith(prefix)) throw new Error(`Refusing zip entry that escapes the extraction directory (zip-slip): ${entry.name}`);
-    plan.push({ entry, target, dir: isDirectoryEntry(entry) });
+    const dir = isDirectoryEntry(entry);
+    for (let i = 1; i <= segments.length; i++) {
+      if (i === segments.length && !dir) break;
+      const path = segments.slice(0, i).join("/");
+      if (!folders.has(path)) folders.set(path, entry.name);
+    }
+    if (!dir) files.set(segments.join("/"), entry.name);
+    plan.push({ entry, target, dir });
+  }
+  for (const [path, name] of files) {
+    const other = folders.get(path);
+    if (other !== undefined) throw new Error(`Refusing zip archive that uses "${path}" as both a file (${name}) and a folder (${other})`);
   }
 
   mkdirSync(root, { recursive: true });
