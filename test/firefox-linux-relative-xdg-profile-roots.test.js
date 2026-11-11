@@ -9,7 +9,10 @@ import { linux } from "../dist/firefox/platform/linux.js";
 // ~/.config/mozilla/firefox, so the roots --doctor lists profiles from must
 // too, rather than a folder relative to wherever lavaduct runs.
 
-test("Linux: a relative XDG_CONFIG_HOME doesn't move the XDG profile root --doctor reads", () => {
+// os.homedir() reads HOME only on POSIX; Windows takes USERPROFILE.
+const posixHome = process.platform === "win32" ? "os.homedir() ignores HOME on Windows" : false;
+
+test("Linux: a relative XDG_CONFIG_HOME doesn't move the XDG profile root --doctor reads", { skip: posixHome }, () => {
   const home = mkdtempSync(join(tmpdir(), "lavaduct-rel-xdg-"));
   const saved = { HOME: process.env.HOME, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME };
   process.env.HOME = home;
