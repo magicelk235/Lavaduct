@@ -33,7 +33,7 @@ import {
 } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
 import { deriveAddonId } from "./sign/addon-id.js";
-import { signWithAmo } from "./sign/amo.js";
+import { filesTooLargeForAmo, signWithAmo } from "./sign/amo.js";
 import { zipDirectory } from "./zip/write.js";
 import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firefox/locate.js";
 import { dedicatedProfile, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
@@ -279,6 +279,7 @@ function buildAddon(
   if (maps > 0) log.ok(`Stripped dangling sourcemap refs from ${maps} script(s)`);
 
   writeManifest(stageDir, out);
+  notes.push(...filesTooLargeForAmo(stageDir));
   return { manifest: out, staticRules: dnr.staticRules, notes };
 }
 
@@ -688,6 +689,15 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     if (route === "amo") {
       const credentials = opts.amo;
       if (!credentials) throw new Error(AMO_CREDENTIALS_MISSING);
+      // AMO's validator would reject the upload, and --force can't change that.
+      const tooLarge = notes.filter((i) => i.category === "amo");
+      if (tooLarge.length > 0) {
+        for (const i of tooLarge) i.severity = "error";
+        writeReportFile(outputDir, meta, issues);
+        printIssues(issues);
+        fail(`AMO won't sign an add-on with text files of 5 MiB or more (${tooLarge.map((i) => i.file).join(", ")}); nothing was uploaded.`);
+        return result;
+      }
       const outcome = await signWithAmo({ addonId, baseVersion: version, credentials, pack, outDir: outputDir });
       if (outcome.kind === "pending") {
         printIssues(issues);
