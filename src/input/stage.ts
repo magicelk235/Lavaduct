@@ -62,10 +62,13 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
   // realpath to /private/... and fail `startsWith(root)`, silently dropping the asset.
   let realRoot = root;
   try { realRoot = realpathSync(root); } catch { /* source missing → cpSync errors anyway */ }
-  cpSync(sourceDir, stageDir, {
+  // Copy from the real path: when the source folder itself is a symlink (a dist/
+  // link, bazel-bin), cpSync would try to recreate that link at stageDir instead of
+  // copying the tree, and fail with EEXIST on the stageDir just made.
+  cpSync(realRoot, stageDir, {
     recursive: true,
     filter: (src) => {
-      const rel = relative(root, resolve(src)).split(sep).join("/");
+      const rel = relative(realRoot, resolve(src)).split(sep).join("/");
       if (rel === "") return true; // the stage root itself
       // Never copy symlinks into the package. cpSync reproduces them verbatim, so a
       // link in the source (evil.txt -> /etc/hosts) would ship a dangling/absolute
