@@ -326,6 +326,16 @@ export function unregisterNativeHosts(addonId: string, sys: HostSystem = hostSys
       notes.push({ ok: false, detail: `${rec.file} can't be written: ${(e as Error).message}` });
     }
   }
-  writeState(RECORDS_FILE, records.filter((r) => r.addonId !== addonId));
+  const kept = records.filter((r) => r.addonId !== addonId);
+  // A manifest written for this add-on that other add-ons still use passes to
+  // one of them, so the last to go removes it (and its registry key).
+  for (const rec of records) {
+    if (rec.addonId !== addonId || !rec.created) continue;
+    const heir = kept.find((r) => r.file === rec.file);
+    if (!heir) continue;
+    heir.created = true;
+    if (rec.registryKey !== undefined) heir.registryKey = rec.registryKey;
+  }
+  writeState(RECORDS_FILE, kept);
   return notes;
 }
