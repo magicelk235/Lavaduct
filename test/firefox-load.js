@@ -1,5 +1,5 @@
 // Loads a manifest into a real Firefox, headless and on a throwaway profile, to
-// check whether Firefox accepts it. Not a test file itself.
+// check whether Firefox accepts it and what it makes of it. Not a test file itself.
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -10,10 +10,11 @@ import { startPrivilegedFirefox } from "./firefox-devtools.js";
 export const firefox = selectFirefox(findFirefoxInstalls());
 
 /**
- * Install `manifest` (plus `files`, path → contents) as a temporary add-on and
- * resolve with Firefox's refusal message, or null when it loads.
+ * Install `manifest` (plus `files`, path → contents) as a temporary add-on, then
+ * resolve with `inspect({ chrome, id })`, where `chrome(js)` runs `js` in Firefox's
+ * parent process. Rejects with Firefox's refusal when the add-on doesn't load.
  */
-export async function firefoxRefusal(manifest, files = {}) {
+export async function loadAddon(manifest, files, inspect) {
   const scratch = mkdtempSync(join(tmpdir(), "lavaduct-load-"));
   try {
     const ext = join(scratch, "ext");
@@ -27,14 +28,22 @@ export async function firefoxRefusal(manifest, files = {}) {
     mkdirSync(profile);
     const ff = await startPrivilegedFirefox(firefox, profile);
     try {
-      await ff.installAddon(ext);
-      return null;
-    } catch (e) {
-      return e.message;
+      const id = await ff.installAddon(ext);
+      return await inspect({ chrome: ff.chrome, id });
     } finally {
       await ff.close();
     }
   } finally {
     rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+/** Firefox's refusal message for `manifest`, or null when it loads. */
+export async function firefoxRefusal(manifest, files = {}) {
+  try {
+    await loadAddon(manifest, files, () => {});
+    return null;
+  } catch (e) {
+    return e.message;
   }
 }
