@@ -1055,8 +1055,12 @@ export interface TransformOptions {
   debuggerEmulation?: boolean;
 }
 
-/** What the chrome.debugger emulation drives tabs with. */
-export const DEBUGGER_EMULATION_PERMISSIONS = ["scripting", "tabs", "webNavigation", "webRequest"];
+/**
+ * What the chrome.debugger emulation drives tabs with. Blocking webRequest and a
+ * response filter (its own permission in Manifest V3) hold back each document an
+ * attached tab loads until the emulation's hooks are in it.
+ */
+export const DEBUGGER_EMULATION_PERMISSIONS = ["scripting", "tabs", "webNavigation", "webRequest", "webRequestBlocking", "webRequestFilterResponse"];
 
 // Add `query` to a page path ahead of its fragment, after any query it already has.
 function withQuery(path: string, query: string | undefined): string {
@@ -1125,6 +1129,7 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   const allSites = opts.debuggerEmulation === true;
   if (allSites) {
     for (const p of DEBUGGER_EMULATION_PERMISSIONS) {
+      if (p === "webRequestFilterResponse" && (out.manifest_version ?? 2) < 3) continue;
       if (!permissions.includes(p)) permissions.push(p);
       const i = optionalPermissions.indexOf(p);
       if (i >= 0) optionalPermissions.splice(i, 1);
