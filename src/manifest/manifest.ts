@@ -293,6 +293,19 @@ function insecureSearchUrls(m: Manifest): Array<[string, string]> {
   return out;
 }
 
+// Firefox's omnibox keyword (omnibox.json) has no whitespace or colon and doesn't
+// start with "?", and any other keyword refuses the whole manifest. Chrome takes
+// any non-empty one. A __MSG_ value is checked after Firefox localizes it, which
+// needs the locale files, so it is left alone. Returns the keyword Firefox takes
+// ("" when nothing is left), or null when the manifest's is fine.
+const FIREFOX_OMNIBOX_KEYWORD_RE = /^[^?\s:][^\s:]*$/;
+function firefoxOmniboxKeyword(m: Manifest): { from: string; to: string } | null {
+  const omnibox = m.omnibox;
+  const keyword: unknown = typeof omnibox === "object" && omnibox !== null ? Reflect.get(omnibox, "keyword") : undefined;
+  if (typeof keyword !== "string" || keyword === "" || keyword.includes("__MSG_") || FIREFOX_OMNIBOX_KEYWORD_RE.test(keyword)) return null;
+  return { from: keyword, to: keyword.replace(/[\s:]+/g, "").replace(/^\?+/, "") };
+}
+
 // Firefox accepts a port in a pattern but compares it as part of the host name, so a
 // pattern with a port never matches anything.
 function portIssue(pattern: string, where: string, category: string): Issue | null {
@@ -880,6 +893,19 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     });
   }
 
+  const omniboxKeyword = firefoxOmniboxKeyword(m);
+  if (omniboxKeyword) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: omniboxKeyword.to
+        ? `omnibox keyword "${omniboxKeyword.from}" has whitespace, a colon or a leading "?", which Firefox refuses along with the whole add-on; it becomes "${omniboxKeyword.to}".`
+        : `omnibox keyword "${omniboxKeyword.from}" has nothing Firefox takes as a keyword, and Firefox refuses the whole add-on over it; the omnibox key is removed, so chrome.omnibox gets no input.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
   if (typeof m.author === "object" && m.author !== null) {
     issues.push({
       severity: "info",
@@ -1206,6 +1232,10 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     const provider = overrides.search_provider;
     if (typeof provider === "object" && provider !== null) Reflect.deleteProperty(provider, "favicon_url");
   }
+
+  const omniboxKeyword = firefoxOmniboxKeyword(out);
+  if (omniboxKeyword?.to) Reflect.set(out.omnibox as object, "keyword", omniboxKeyword.to);
+  else if (omniboxKeyword) delete out.omnibox;
 
   if (typeof out.author === "object" && out.author !== null) {
     const email = "email" in out.author ? out.author.email : undefined;

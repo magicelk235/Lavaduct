@@ -115,6 +115,17 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   const localhost = cspLocalhostSources(pagesCsp(before)).filter((s) => !cspLocalhostSources(pagesCsp(after)).includes(s));
   if (localhost.length) out.push(`Removed the local development server source(s) ${quoted(localhost)} from \`content_security_policy.extension_pages\` (Firefox drops the whole policy over them on install).`);
 
+  const omniboxKeyword = (m: Manifest): unknown => (typeof m.omnibox === "object" && m.omnibox !== null ? Reflect.get(m.omnibox, "keyword") : undefined);
+  const keywordBefore = omniboxKeyword(before);
+  if (typeof keywordBefore === "string" && keywordBefore !== omniboxKeyword(after)) {
+    const keywordAfter = omniboxKeyword(after);
+    out.push(
+      typeof keywordAfter === "string"
+        ? `Changed the omnibox keyword \`${keywordBefore}\` to \`${keywordAfter}\` (Firefox refuses whitespace, colons and a leading "?" in it).`
+        : `Removed \`omnibox\`: Firefox can't take the keyword \`${keywordBefore}\`.`,
+    );
+  }
+
   const overridesBefore = before.chrome_url_overrides;
   if (overridesBefore && typeof overridesBefore === "object") {
     const kept = after.chrome_url_overrides ?? {};
