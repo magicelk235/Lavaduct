@@ -1450,6 +1450,11 @@
         return r;
       });
     }
+    // A frame Firefox won't script fails the whole all-frames injection; the
+    // top frame alone is still worth reaching then.
+    function everyFrame(tabId, world, func, args) {
+      return exec(tabId, 0, world, func, args, true).catch(function () { return exec(tabId, 0, world, func, args); });
+    }
     // The relay and the dialog hook go into every frame of the tab; the console
     // hook into the top frame, while Runtime is enabled.
     function hookPage(tabId, frameId) {
@@ -1457,11 +1462,8 @@
       if (!s) return Promise.resolve();
       var all = frameId === undefined;
       var relay = { key: CDP_PAGE_KEY, msgKey: CDP_KEY };
-      // A frame Firefox won't script fails the whole all-frames injection; the
-      // top frame alone is still worth hooking then.
       var target = function (func, args, world) {
-        if (!all) return exec(tabId, frameId, world, func, args);
-        return exec(tabId, 0, world, func, args, true).catch(function () { return exec(tabId, 0, world, func, args); });
+        return all ? everyFrame(tabId, world, func, args) : exec(tabId, frameId, world, func, args);
       };
       return target(cdpIsolated, ["relay", relay], "ISOLATED").then(function () {
         return target(cdpMain, ["hookDialogs", {}, CDP_PAGE_KEY], "MAIN");
@@ -2010,8 +2012,9 @@
       if (!sessions[tabId]) throw new Error("Debugger is not attached to the tab with id: " + tabId + ".");
       ended(tabId, null);
       if (!anyNetwork()) hookNetwork(false);
-      // A tab that has gone takes its hooks with it.
-      return main(tabId, "unhook", { what: "all" }).catch(noop);
+      // Every frame got the dialog hook. A tab that has gone takes its hooks
+      // with it.
+      return everyFrame(tabId, "MAIN", cdpMain, ["unhook", { what: "all" }, CDP_PAGE_KEY]).then(noop, noop);
     }
     function getTargets() {
       return Promise.resolve(api.tabs.query({})).then(function (tabs) {
