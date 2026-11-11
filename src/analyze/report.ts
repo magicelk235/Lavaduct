@@ -17,7 +17,7 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     if (before[key] !== undefined && after[key] === undefined) out.push(`Dropped \`${key}\` (Chrome-only).`);
   }
 
-  if (before.version !== after.version) out.push(`Version \`${before.version}\` → \`${after.version}\` (Firefox format).`);
+  if (before.version !== after.version) out.push(`Version ${before.version === undefined ? "(none)" : `\`${before.version}\``} → \`${after.version}\` (Firefox format).`);
 
   // A malformed manifest can set permissions to a non-array (a bare string,
   // an object); guard with Array.isArray so .filter()/.includes() never throw
