@@ -71,6 +71,9 @@ const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
+// A worker's own localStorage or sessionStorage, which it doesn't have:
+// `self.localStorage = polyfill`. The event page's are getter-only.
+const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
 
 interface Usage {
   favicon: boolean;
@@ -84,13 +87,14 @@ interface Usage {
   permissions: boolean;
   extraHeaders: boolean;
   messaging: boolean;
+  storageGlobalsAssigned: string[];
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false, permissions: false,
-    extraHeaders: false, messaging: false,
+    extraHeaders: false, messaging: false, storageGlobalsAssigned: [],
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -112,6 +116,9 @@ function scanUsage(dir: string): Usage {
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
+      for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
+        if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
+      }
     }
   }
   return found;
@@ -153,6 +160,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
     extraHeaders: usage.extraHeaders,
     messageJson: usage.messaging,
+    storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so

@@ -1104,6 +1104,28 @@
     defineMissing(G, "skipWaiting", function () { return Promise.resolve(); });
   }
 
+  // ── A worker's own localStorage ─────────────────────────────────────────────
+  // A service worker has no localStorage or sessionStorage, so a bundle may
+  // give itself one: `self.localStorage = polyfill`. In the event page both are
+  // getter-only accessors, and the assignment throws in strict and module code,
+  // ending the background there. The names the bundle assigns become plain
+  // writable properties holding Firefox's storage, so reads still reach it
+  // until the bundle replaces it. Only in the background of a converted worker.
+  function installAssignableStorageGlobals() {
+    var names = CONFIG.storageGlobalsAssigned;
+    if (!isBackground || !Array.isArray(names)) return;
+    names.forEach(function (name) {
+      var desc = null;
+      for (var o = G; o && !desc; o = Object.getPrototypeOf(o)) desc = Object.getOwnPropertyDescriptor(o, name) || null;
+      if (!desc || typeof desc.get !== "function" || desc.set) return;
+      var value;
+      try { value = G[name]; } catch (e) {}
+      try {
+        Object.defineProperty(G, name, { value: value, writable: true, configurable: true, enumerable: desc.enumerable === true });
+      } catch (e) { dbg("can't make " + name + " assignable:", errorMessage(e)); }
+    });
+  }
+
   // ── Service worker messaging ────────────────────────────────────────────────
   // A Chrome extension's pages reach its service worker through
   // navigator.serviceWorker (ready, controller, getRegistration), and the worker
@@ -1549,10 +1571,22 @@
   var DNR_DOMAIN_CONDITIONS = ["requestDomains", "excludedRequestDomains", "initiatorDomains", "excludedInitiatorDomains"];
   var DNR_MISSING_TYPES = { webbundle: true, webtransport: true };
 
+  // Chrome's extension ID is the host of its own origin, so code names it in a
+  // rule's domains to mean its own requests: initiatorDomains: [chrome.runtime.id].
+  // Firefox's add-on ID isn't a domain, and its pages' host is a per-install
+  // UUID, so the add-on's ID, and its Chrome ID written into the code, become
+  // that host.
+  var OWN_HOST = "";
+  try { OWN_HOST = new URL(ORIGIN + "/").host; } catch (e) {}
+  var ownIds = {};
+  try { ownIds[String(api.runtime.id).toLowerCase()] = true; } catch (e) {}
+  if (CONFIG.extensionId) ownIds[String(CONFIG.extensionId).toLowerCase()] = true;
+
   // Chrome lower-cases a rule's domains, and Firefox refuses an upper-case one.
   function firefoxDomain(d) {
     if (typeof d !== "string") return d;
     var lower = d.toLowerCase();
+    if (OWN_HOST && ownIds[lower] === true) return OWN_HOST;
     if (lower.indexOf(":") < 0 || lower.charAt(0) === "[") return lower;
     try { return new URL("http://[" + lower + "]/").hostname; } catch (e) { return d; }
   }
@@ -2290,6 +2324,7 @@
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
   try { installFavicon(); } catch (e) { dbg("favicon shim failed:", errorMessage(e)); }
   try { installServiceWorkerScope(); } catch (e) { dbg("ServiceWorkerGlobalScope shim failed:", errorMessage(e)); }
+  try { installAssignableStorageGlobals(); } catch (e) { dbg("assignable storage globals failed:", errorMessage(e)); }
   try { installServiceWorkerRegistration(); } catch (e) { dbg("registration shim failed:", errorMessage(e)); }
   try { installServiceWorkerClients(); } catch (e) { dbg("clients shim failed:", errorMessage(e)); }
   try { installServiceWorkerContainer(); } catch (e) { dbg("navigator.serviceWorker shim failed:", errorMessage(e)); }
