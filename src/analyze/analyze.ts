@@ -133,7 +133,7 @@ function majorVersion(v: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function scanJsContent(content: string, rel: string, issues: Issue[], isClassicServiceWorker: boolean, minFirefox: string): void {
+function scanJsContent(content: string, rel: string, issues: Issue[], isClassicServiceWorker: boolean, minFirefox: string, unloadingBackground: boolean): void {
   const lineAt = makeLineResolver(content);
 
   const hits: Array<{ name: string; at: number; info: (typeof API_PATTERNS)[number]["info"] }> = [];
@@ -173,7 +173,7 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isClassicS
     });
   }
 
-  if (BACKGROUND_FILE_RE.test(rel)) {
+  if (unloadingBackground && BACKGROUND_FILE_RE.test(rel)) {
     const m = TIMER_RE.exec(content);
     if (m) {
       issues.push({
@@ -395,6 +395,9 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
     ? manifest.background.service_worker.replace(/^\.?\//, "")
     : undefined;
   const checkMainWorld = majorVersion(opts.minFirefox) < MAIN_WORLD_MIN_FIREFOX;
+  // An MV2 background is persistent unless it says otherwise, and Firefox keeps it
+  // loaded; only an event page or a converted service worker drops its timers.
+  const unloadingBackground = (manifest.manifest_version ?? 2) >= 3 || manifest.background?.persistent === false;
 
   let faviconNoted = false;
   let extUrlNoted = false;
@@ -500,7 +503,7 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
       }
     }
 
-    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel, opts.minFirefox);
+    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel, opts.minFirefox, unloadingBackground);
   }
 
   return issues;
