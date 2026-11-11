@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, relative } from "node:path";
 import type { Manifest } from "../types.js";
-import { matchPatternError } from "../manifest/manifest.js";
+import { matchPatternError, withoutPortWildcard } from "../manifest/manifest.js";
 import { resolveInside } from "../manifest/dnr.js";
 import { TEMPLATE_DIR } from "../paths.js";
 import { NAME } from "../name.js";
@@ -78,7 +78,7 @@ function bridgedMatches(manifest: Manifest): { matches: string[]; dropped: strin
   const dropped: string[] = [];
   for (const m of Array.isArray(raw) ? raw : []) {
     if (typeof m !== "string" || m.length === 0) continue;
-    const pattern = m.replace(/^([^:/]*:\/\/[^/]*?):\*(?=\/)/, "$1");
+    const pattern = withoutPortWildcard(m);
     const error = matchPatternError(pattern);
     if (error === null) matches.push(pattern);
     else dropped.push(`"${m}" (${error})`);
