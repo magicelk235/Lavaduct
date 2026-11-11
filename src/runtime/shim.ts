@@ -68,6 +68,8 @@ const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
 const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
+// The MV2 menu context, which Firefox refuses from an MV3 add-on.
+const BROWSER_ACTION_CONTEXT_RE = /["'`]browser_action["'`]/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
@@ -83,6 +85,7 @@ interface Usage {
   locks: boolean;
   permissions: boolean;
   extraHeaders: boolean;
+  browserActionContext: boolean;
   messaging: boolean;
 }
 
@@ -90,7 +93,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false, permissions: false,
-    extraHeaders: false, messaging: false,
+    extraHeaders: false, browserActionContext: false, messaging: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -111,6 +114,7 @@ function scanUsage(dir: string): Usage {
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
+      if (!found.browserActionContext) found.browserActionContext = BROWSER_ACTION_CONTEXT_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
     }
   }
@@ -152,6 +156,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
     extraHeaders: usage.extraHeaders,
+    menuActionContext: usage.browserActionContext,
     messageJson: usage.messaging,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");

@@ -25,7 +25,8 @@
 //     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
 //   - webpack chunks of a worker bundle, listed ahead of the worker;
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
-//     temporarily again and again.
+//     temporarily again and again;
+//   - the "browser_action" menu context, which Firefox refuses from MV3.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -2088,6 +2089,50 @@
     });
   }
 
+  // ── the "browser_action" menu context in MV3 ────────────────────────────────
+  // Chrome's contextMenus takes "browser_action" from an MV3 extension and
+  // keeps the item for its other contexts. Firefox's menus schema offers it to
+  // MV2 only, so create() and update() throw a TypeError and the whole item is
+  // lost, page and selection contexts included. MV3 calls the toolbar button's
+  // menu "action"; code that still says browser_action means that menu, as a
+  // user-agent sniff that takes a Firefox branch written for MV2 does. The
+  // name is changed for the call, never in the add-on's object. Chrome itself
+  // shows such an item on no toolbar menu in MV3, so Firefox shows one Chrome
+  // doesn't when the code meant it for Chrome too. "page_action" is left as it
+  // is: Firefox's MV3 still has page actions. Only emitted for a bundle that
+  // names browser_action.
+  function installMenuActionContext() {
+    if (!CONFIG.menuActionContext) return;
+    var version = 0;
+    try { version = api.runtime.getManifest().manifest_version; } catch (e) {}
+    if (version !== 3) return;
+    function firefoxContexts(props) {
+      if (!props || typeof props !== "object" || !Array.isArray(props.contexts) || props.contexts.indexOf("browser_action") < 0) return props;
+      var contexts = [];
+      props.contexts.forEach(function (c) {
+        var name = c === "browser_action" ? "action" : c;
+        if (contexts.indexOf(name) < 0) contexts.push(name);
+      });
+      return Object.assign({}, props, { contexts: contexts });
+    }
+    namespaces.forEach(function (ns) {
+      ["menus", "contextMenus"].forEach(function (area) {
+        var menus = null;
+        try { menus = ns[area]; } catch (e) {}
+        if (!menus || typeof menus !== "object") return;
+        [["create", 0], ["update", 1]].forEach(function (m) {
+          var native = menus[m[0]];
+          if (typeof native !== "function") return;
+          replaceMember(menus, m[0], function () {
+            var args = Array.prototype.slice.call(arguments);
+            args[m[1]] = firefoxContexts(args[m[1]]);
+            return native.apply(menus, args);
+          });
+        });
+      });
+    });
+  }
+
   // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
   // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
   // such as Cookie or Referer; Firefox shows every header without it, has no
@@ -2307,6 +2352,7 @@
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
+  try { installMenuActionContext(); } catch (e) { dbg("menu action context shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
