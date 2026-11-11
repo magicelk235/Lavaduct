@@ -1,11 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { warn } from "../util.js";
 import type { FirefoxInstall } from "./locate.js";
 import { platform, type LockHolder, type ProfileLookup } from "./platform/index.js";
-import { pathKey, processAgeMs, processAlive } from "./platform/shared.js";
+import { pathKey, processAlive } from "./platform/shared.js";
 import { defaultProfileFor, profileInUse, profilesFor, type FirefoxProfile } from "./profiles.js";
 
 const QUIT_TIMEOUT_MS = 30_000;
@@ -54,10 +54,26 @@ function holderOf(install: FirefoxInstall, profilePath: string): LockHolder | un
 export async function waitForSettledFirefox(install: FirefoxInstall, profilePath: string): Promise<LockHolder | undefined> {
   const holder = holderOf(install, profilePath);
   if (holder && platform.quitMinAgeMs > 0) {
-    const age = processAgeMs(holder.pid);
+    const age = platform.processAgeMs(holder.pid);
     if (age !== undefined && age < platform.quitMinAgeMs) await sleep(platform.quitMinAgeMs - age);
   }
   return holder;
+}
+
+/**
+ * Whether the Firefox that has the profile open started before the profile's
+ * user.js was last written. Firefox reads user.js only when it starts, so that
+ * Firefox hasn't seen what the file says now. False when no Firefox has the
+ * profile open, there is no user.js, or the process's start can't be told.
+ */
+export function startedBeforeUserJs(install: FirefoxInstall, profilePath: string): boolean {
+  const written = statSync(join(profilePath, "user.js"), { throwIfNoEntry: false })?.mtimeMs;
+  if (written === undefined || !profileInUse(profilePath)) return false;
+  const holder = holderOf(install, profilePath);
+  const age = holder && platform.processAgeMs(holder.pid);
+  // ps rounds the age down to whole seconds, which puts the start late: a
+  // user.js written in the second Firefox started counts as read.
+  return age !== undefined && written > Date.now() - age;
 }
 
 /**

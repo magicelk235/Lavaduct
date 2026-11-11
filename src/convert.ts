@@ -37,7 +37,7 @@ import { signWithAmo } from "./sign/amo.js";
 import { zipDirectory } from "./zip/write.js";
 import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firefox/locate.js";
 import { dedicatedProfile, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
-import { openXpiInFirefox, quitFirefoxForProfile } from "./firefox/launch.js";
+import { openXpiInFirefox, quitFirefoxForProfile, startedBeforeUserJs } from "./firefox/launch.js";
 import { BidiSession } from "./firefox/bidi.js";
 import { RdpSession } from "./firefox/rdp.js";
 import {
@@ -505,21 +505,23 @@ async function installByPrompt(
 ): Promise<InstallOutcome> {
   if (route === "unsigned") {
     const running = profileInUse(profile.path);
-    if (allowUnsignedInProfile(profile.path).changed) {
-      ok(`Turned off signature checks in ${join(profile.path, "user.js")} (xpinstall.signatures.required = false)`);
-      if (running) {
-        if (!opts.firefoxRestart || !opts.launch) {
-          warn(
-            `Firefox has ${profile.path} open and reads that setting only when it starts. ` +
-              `Quit Firefox and start it again, then open ${xpi} in it to install the add-on.`,
-          );
-          return "skipped";
-        }
-        info("Restarting Firefox so the setting takes effect …");
-        if (!(await quitFirefoxForProfile(install, profile.path))) {
-          fail(`Couldn't quit the Firefox that has ${profile.path} open. Quit it yourself, then run this again.`);
-          return "failed";
-        }
+    const changed = allowUnsignedInProfile(profile.path).changed;
+    if (changed) ok(`Turned off signature checks in ${join(profile.path, "user.js")} (xpinstall.signatures.required = false)`);
+    // Also when the pref was already there but this Firefox started before it
+    // was written, e.g. by an earlier run under --no-firefox-restart or --no-launch.
+    if ((changed && running) || startedBeforeUserJs(install, profile.path)) {
+      if (!changed) info(`The Firefox that has ${profile.path} open started before signature checks were turned off in its user.js.`);
+      if (!opts.firefoxRestart || !opts.launch) {
+        warn(
+          `Firefox has ${profile.path} open and reads that setting only when it starts. ` +
+            `Quit Firefox and start it again, then open ${xpi} in it to install the add-on.`,
+        );
+        return "skipped";
+      }
+      info("Restarting Firefox so the setting takes effect …");
+      if (!(await quitFirefoxForProfile(install, profile.path))) {
+        fail(`Couldn't quit the Firefox that has ${profile.path} open. Quit it yourself, then run this again.`);
+        return "failed";
       }
     }
   }

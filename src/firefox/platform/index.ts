@@ -59,6 +59,8 @@ export interface Platform {
    * younger one may drop the request and then ignore every later one.
    */
   quitMinAgeMs: number;
+  /** How long a process has been running, in ms; undefined when that can't be told, e.g. the process is gone. */
+  processAgeMs(pid: number): number | undefined;
   /** Extra arguments for a Firefox the user will see. */
   visibleLaunchArgs(): string[];
 }
