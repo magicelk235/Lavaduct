@@ -1,6 +1,7 @@
 import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, statSync, realpathSync, copyFileSync } from "node:fs";
 import { join, dirname, resolve, relative, sep, posix } from "node:path";
 import type { Manifest } from "../types.js";
+import { mapManifestPaths, parseJsonc } from "../manifest/manifest.js";
 
 /** Names/globs excluded from the clean staged extension. */
 const EXCLUDE_EXACT = new Set([
@@ -17,9 +18,18 @@ const EXCLUDE_EXACT = new Set([
   "yarn.lock",
   "pnpm-lock.yaml",
   "tsconfig.json",
+  // Credentials and editor settings a source folder holds; never runtime files.
+  ".npmrc",
+  ".vscode",
+  ".idea",
+  // A Recommended add-on's AMO badge; addons-linter refuses the name anywhere.
+  "mozilla-recommendation.json",
 ]);
+// Excluded at the package root only: a signed .xpi's signature, which covers the
+// files and add-on ID the conversion changes.
+const SIGNATURE_DIR = "META-INF";
 
-const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log"];
+const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log", ".pem"];
 // Doc/config files: bare name or name + extension only (e.g. "LICENSE",
 // "LICENSE.txt"), never a prefix match — that would drop legit runtime files
 // like "LICENSE_KEY.js" or "READMExporter.js".
@@ -27,13 +37,16 @@ const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log"];
 // the name — changelog.html, license.js, Changelog.json — must ship, or it 404s
 // at runtime (only manifest-referenced paths are otherwise protected).
 const EXCLUDE_DOC_RE = /^(README|CHANGELOG|LICENSE)(\.(txt|md|markdown|rst|adoc))?$/i;
+// Tool dotfiles, and .env files with their secrets (.env, .env.local, …).
 const EXCLUDE_DOTFILE = [".eslint", ".prettier"];
+const ENV_FILE_RE = /^\.env(\..+)?$/;
 
 function shouldExclude(name: string): boolean {
   if (EXCLUDE_EXACT.has(name)) return true;
   if (EXCLUDE_SUFFIX.some((s) => name.endsWith(s))) return true;
   if (EXCLUDE_DOC_RE.test(name)) return true;
   if (EXCLUDE_DOTFILE.some((p) => name.startsWith(p))) return true;
+  if (ENV_FILE_RE.test(name)) return true;
   return false;
 }
 
@@ -84,7 +97,7 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
       // file like _metadata/junk.js (parent excluded) from riding in just because
       // its own basename is clean.
       const segments = rel.split("/");
-      if (segments.some(shouldExclude)) {
+      if (segments.some(shouldExclude) || segments[0] === SIGNATURE_DIR) {
         // Still allow an excluded directory to be entered when a kept path lives
         // inside it; cpSync won't recurse otherwise and the kept child is lost.
         const asDir = rel + "/";
@@ -234,6 +247,156 @@ function stageLoadedAssets(root: string, realRoot: string, stageDir: string): vo
       }
     }
   }
+}
+
+/**
+ * Whether Firefox's JSON reader (Extension.sys.mjs readJSON) takes `text`: it cuts
+ * `//` comments outside strings, throws on any other `/`, then calls JSON.parse.
+ */
+function firefoxReadsJson(text: string): boolean {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let end = i;
+      do {
+        end = text.indexOf('"', end + 1);
+        if (end === -1) return false;
+        let backslashes = 0;
+        for (let k = end - 1; text[k] === "\\"; k--) backslashes++;
+        if (backslashes % 2 === 0) break;
+      } while (true);
+      out += text.slice(i, end + 1);
+      i = end;
+    } else if (c === "/") {
+      if (text[i + 1] !== "/") return false;
+      const nl = text.indexOf("\n", i + 2);
+      i = (nl === -1 ? text.length : nl) - 1;
+    } else out += c;
+  }
+  try {
+    JSON.parse(out);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spell each path the manifest names the way the file is named on disk. Chrome on
+ * macOS and Windows reads an unpacked or installed extension from a case-insensitive
+ * disk, so "icons/a.png" finds Icons/A.png; Firefox reads a packed .xpi by exact
+ * name, and the icon, script or page is missing (the temporary route loads the folder
+ * and hides this on macOS and Windows). A path with no file, or more than one file
+ * differing only in case, is left as it is. Returns "old → new" for each change.
+ */
+export function matchManifestPathCase(stageDir: string, manifest: Manifest): string[] {
+  const listings = new Map<string, string[] | null>();
+  const namesIn = (dir: string) => {
+    if (!listings.has(dir)) {
+      try {
+        listings.set(dir, readdirSync(dir));
+      } catch {
+        listings.set(dir, null);
+      }
+    }
+    return listings.get(dir) ?? null;
+  };
+  const changed: string[] = [];
+  mapManifestPaths(manifest, (path) => {
+    if (path.includes("*")) return path;
+    const cut = path.search(/[#?]/);
+    const filePart = cut === -1 ? path : path.slice(0, cut);
+    const lead = /^\.?\//.exec(filePart)?.[0] ?? "";
+    const actual: string[] = [];
+    let dir = stageDir;
+    for (const segment of filePart.slice(lead.length).split("/")) {
+      const names = namesIn(dir);
+      if (!names) return path;
+      let name = segment;
+      if (!names.includes(segment)) {
+        const matches = names.filter((n) => n.toLowerCase() === segment.toLowerCase());
+        if (matches.length !== 1) return path;
+        name = matches[0];
+      }
+      actual.push(name);
+      dir = join(dir, name);
+    }
+    const fixed = lead + actual.join("/") + (cut === -1 ? "" : path.slice(cut));
+    if (fixed !== path) changed.push(`${path} → ${fixed}`);
+    return fixed;
+  });
+  return changed;
+}
+
+/**
+ * Remove each _locales subfolder without a messages.json Chrome can read, except
+ * the default locale's (the analyzer reports that one). Chrome ignores a folder
+ * whose name isn't one of its locales and refuses an extension whose locale
+ * folder lacks a readable catalog, so a working Chrome extension can only carry
+ * such a folder as junk Chrome skips (`_locales/xx/`, an empty folder). Firefox
+ * reads every subfolder and refuses the whole add-on over one it can't load.
+ * Returns the removed folders.
+ */
+export function removeUnreadableLocales(stageDir: string, defaultLocale: string | undefined): string[] {
+  const localesDir = join(stageDir, "_locales");
+  let locales;
+  try {
+    locales = readdirSync(localesDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const locale of locales) {
+    if (!locale.isDirectory() || locale.name === defaultLocale) continue;
+    try {
+      parseJsonc(readFileSync(join(localesDir, locale.name, "messages.json"), "utf-8"));
+    } catch {
+      rmSync(join(localesDir, locale.name), { recursive: true, force: true });
+      removed.push(`_locales/${locale.name}`);
+    }
+  }
+  return removed;
+}
+
+/**
+ * Rewrite as plain JSON each _locales/<locale>/messages.json that Chrome reads and
+ * Firefox doesn't. Chrome's reader also takes block comments, line breaks inside
+ * strings and \x escapes; Firefox's only cuts // comments, and it refuses the whole
+ * add-on when any locale's catalog fails to parse. A catalog Firefox reads is left
+ * byte for byte, and one Chrome can't read either is left for the analyzer to
+ * report. Returns the rewritten paths.
+ */
+export function normalizeLocaleCatalogs(stageDir: string): string[] {
+  const localesDir = join(stageDir, "_locales");
+  let locales;
+  try {
+    locales = readdirSync(localesDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const rewritten: string[] = [];
+  for (const locale of locales) {
+    if (!locale.isDirectory()) continue;
+    const file = join(localesDir, locale.name, "messages.json");
+    let text: string;
+    try {
+      text = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (firefoxReadsJson(text)) continue;
+    let messages: unknown;
+    try {
+      messages = parseJsonc(text);
+    } catch {
+      continue;
+    }
+    writeFileSync(file, JSON.stringify(messages, null, 2) + "\n", "utf-8");
+    rewritten.push(`_locales/${locale.name}/messages.json`);
+  }
+  return rewritten;
 }
 
 const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;

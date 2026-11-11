@@ -74,6 +74,10 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     const required = gecko.data_collection_permissions?.required;
     if (Array.isArray(required)) parts.push(`data_collection_permissions.required \`${required.join(", ")}\``);
     out.push(`Set \`browser_specific_settings.gecko\`${parts.length ? `: ${parts.join(", ")}` : ""}.`);
+    const max = before.browser_specific_settings?.gecko?.strict_max_version;
+    if (typeof max === "string" && gecko.strict_max_version === undefined) {
+      out.push(`Removed \`browser_specific_settings.gecko.strict_max_version\` \`${max}\`, below the minimum Firefox version; no Firefox would install the add-on.`);
+    }
   } else if (!gecko && before.browser_specific_settings?.gecko) {
     out.push("Removed `browser_specific_settings.gecko` (Android-only build).");
   }

@@ -16,7 +16,9 @@ import { FIREFOX_PERMISSION_SUPPORT } from "./compat-generated.js";
  * illegal in strict JSON but common in hand-edited Chrome manifests (Chrome's own
  * loader tolerates comments). A single character-state scan skips comment runs and
  * trailing commas WITHOUT touching their look-alikes inside string literals (e.g.
- * the "//" in an "https://…" URL), then hands clean JSON to JSON.parse.
+ * the "//" in an "https://…" URL), then hands clean JSON to JSON.parse. Inside
+ * strings it also takes the rest of what Chrome's reader allows
+ * (JSON_PARSE_CHROMIUM_EXTENSIONS): raw line breaks and \xNN escapes.
  */
 export function parseJsonc<T = unknown>(text: string): T {
   // Strip a leading UTF-8 BOM (U+FEFF). Node's readFileSync('utf-8') leaves it in
@@ -31,10 +33,16 @@ export function parseJsonc<T = unknown>(text: string): T {
     const c = text[i];
     const next = text[i + 1];
     if (inString) {
-      out += c;
-      if (escaped) escaped = false;
-      else if (c === "\\") escaped = true;
-      else if (c === '"') inString = false;
+      if (escaped) {
+        escaped = false;
+        out += c === "x" ? "u00" : c;
+      } else if (c === "\n") out += "\\n";
+      else if (c === "\r") out += "\\r";
+      else {
+        out += c;
+        if (c === "\\") escaped = true;
+        else if (c === '"') inString = false;
+      }
       continue;
     }
     if (c === '"') {
@@ -414,7 +422,11 @@ const KEY_GATES: Array<{ since: string; applies: (m: Manifest) => boolean; messa
   },
 ];
 
-export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): ManifestAnalysis {
+/**
+ * `shim: false` (--no-shim) and `oauthBridge: false` (--no-oauth-bridge) describe a
+ * build without that emulation, so nothing it would cover is reported as shimmed.
+ */
+export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: boolean; oauthBridge?: boolean }): ManifestAnalysis {
   const issues: Issue[] = [];
   const permissionsToRemove: string[] = [];
   const before = (version: string) => compareFirefoxVersions(opts.minFirefox, version) < 0;
@@ -492,7 +504,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     if (perm === "<all_urls>" || perm.includes("://") || !Object.hasOwn(FIREFOX_PERMISSION_SUPPORT, perm)) continue;
     const since = FIREFOX_PERMISSION_SUPPORT[perm];
     if (since === null) {
-      const shimmed = SHIMMED_PERMISSIONS.has(perm);
+      const shimmed = opts.shim !== false && SHIMMED_PERMISSIONS.has(perm);
       issues.push({
         severity: shimmed ? "info" : "warning",
         category: "permission",
@@ -500,7 +512,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
           ? `Permission "${perm}" is removed (Firefox doesn't know it), but the shim keeps the feature working.`
           : `Unsupported permission "${perm}" will be removed; Firefox doesn't have it.`,
         file: "manifest.json",
-        fix: UNSUPPORTED_PERMISSIONS[perm],
+        fix: shimmed || !SHIMMED_PERMISSIONS.has(perm) ? UNSUPPORTED_PERMISSIONS[perm] : `--no-shim leaves out the emulation, so the "${perm}" features don't work.`,
         autoFixed: true,
         ...(shimmed ? { shimmed: true } : {}),
       });
@@ -549,7 +561,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       if (perm !== "<all_urls>" && !perm.includes("://")) continue;
       const err = patternError(perm);
       if (err !== null) {
-        const favicon = perm.startsWith("chrome://favicon");
+        const favicon = opts.shim !== false && perm.startsWith("chrome://favicon");
         issues.push({
           severity: favicon ? "info" : "warning",
           category: "permission",
@@ -795,14 +807,24 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
 
   const ec = m.externally_connectable;
   if (strings(ec?.matches).length > 0) {
-    issues.push({
-      severity: "info",
-      category: "manifest",
-      message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage calls (a port from runtime.connect never connects).",
-      file: "manifest.json",
-      fix: "Re-test sign-in and site integrations; --no-oauth-bridge turns the bridge off.",
-      shimmed: true,
-    });
+    issues.push(
+      opts.oauthBridge === false
+        ? {
+            severity: "warning",
+            category: "manifest",
+            message: "Firefox doesn't support externally_connectable, and --no-oauth-bridge leaves out the page bridge, so the listed sites can't message the extension.",
+            file: "manifest.json",
+            fix: "Convert without --no-oauth-bridge to relay their runtime.sendMessage calls.",
+          }
+        : {
+            severity: "info",
+            category: "manifest",
+            message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage calls (a port from runtime.connect never connects).",
+            file: "manifest.json",
+            fix: "Re-test sign-in and site integrations; --no-oauth-bridge turns the bridge off.",
+            shimmed: true,
+          },
+    );
   }
   const ids = strings(ec?.ids).filter((id) => id !== "*");
   if (ids.length > 0) {
@@ -858,8 +880,69 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
 }
 
 /**
- * Collect every concrete file path the manifest references as a runtime asset
- * (scripts, pages, css, icons, web_accessible_resources, DNR rulesets, …),
+ * Call `map` with each file path the manifest names as a runtime asset (scripts,
+ * pages, css, icons, web_accessible_resources, DNR rulesets, …) and store what it
+ * returns in its place. The one list of path-bearing keys, shared by staging and by
+ * the rewrites that edit those paths.
+ */
+export function mapManifestPaths(m: Manifest, map: (path: string) => string): void {
+  const slot = (holder: unknown, key: string | number) => {
+    if (typeof holder !== "object" || holder === null) return;
+    const record = holder as Record<string | number, unknown>;
+    const value = record[key];
+    if (typeof value !== "string" || !value) return;
+    const mapped = map(value);
+    if (mapped !== value) record[key] = mapped;
+  };
+  const each = (list: unknown) => {
+    if (Array.isArray(list)) for (let i = 0; i < list.length; i++) slot(list, i);
+  };
+  const values = (holder: unknown) => {
+    if (typeof holder === "object" && holder !== null && !Array.isArray(holder)) for (const key of Object.keys(holder)) slot(holder, key);
+  };
+
+  if (Array.isArray(m.content_scripts)) {
+    for (const cs of m.content_scripts) {
+      if (typeof cs !== "object" || cs === null) continue;
+      if ("js" in cs) each(cs.js);
+      if ("css" in cs) each(cs.css);
+    }
+  }
+  each(m.background?.scripts);
+  slot(m.background, "service_worker");
+  slot(m.background, "page");
+  for (const a of [m.action, m.browser_action, m.page_action]) {
+    slot(a, "default_popup");
+    if (typeof a?.default_icon === "string") slot(a, "default_icon");
+    else values(a?.default_icon);
+  }
+  values(m.icons);
+  slot(m, "options_page");
+  slot(m.options_ui, "page");
+  slot(m, "devtools_page");
+  values(m.chrome_url_overrides);
+  each(m.sandbox?.pages);
+  if (Array.isArray(m.declarative_net_request?.rule_resources)) for (const r of m.declarative_net_request.rule_resources) slot(r, "path");
+  // side_panel.default_path becomes the Firefox sidebar page, so a miss here leaves an
+  // empty sidebar.
+  slot(m.side_panel, "default_path");
+  slot(m.sidebar_action, "default_panel");
+  slot(m.storage, "managed_schema");
+
+  // web_accessible_resources: MV2 string[], MV3 [{resources: string[]}], or a bare
+  // string (invalid, but hand-edited manifests produce it).
+  slot(m, "web_accessible_resources");
+  if (Array.isArray(m.web_accessible_resources)) {
+    for (let i = 0; i < m.web_accessible_resources.length; i++) {
+      const entry: unknown = m.web_accessible_resources[i];
+      if (typeof entry === "string") slot(m.web_accessible_resources, i);
+      else if (typeof entry === "object" && entry !== null && "resources" in entry) each(entry.resources);
+    }
+  }
+}
+
+/**
+ * Collect every concrete file path the manifest references as a runtime asset,
  * normalized to forward-slash relative paths. Glob/wildcard resource entries
  * (containing '*') are skipped — only literal paths are returned. Used by the
  * stager so a declared resource is never dropped as "dev cruft" (e.g. a
@@ -868,53 +951,15 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
  */
 export function collectReferencedPaths(m: Manifest): Set<string> {
   const paths = new Set<string>();
-  const add = (p: unknown) => {
-    if (typeof p === "string" && p && !p.includes("*")) {
+  mapManifestPaths(m, (p) => {
+    if (!p.includes("*")) {
       // Drop any #fragment/?query (e.g. "devpanel.html#popup") so the concrete
       // file on disk is preserved during staging, not a phantom "…#popup" name.
       const filePart = p.split(/[#?]/)[0];
       if (filePart) paths.add(filePart.replace(/^\.?\//, "").replace(/\\/g, "/"));
     }
-  };
-  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
-
-  for (const cs of arr(m.content_scripts)) {
-    if (typeof cs !== "object" || cs === null) continue;
-    if ("js" in cs) for (const j of arr(cs.js)) add(j);
-    if ("css" in cs) for (const c of arr(cs.css)) add(c);
-  }
-  for (const b of arr(m.background?.scripts)) add(b);
-  add(m.background?.service_worker);
-  add(m.background?.page);
-  for (const a of [m.action, m.browser_action, m.page_action]) {
-    add(a?.default_popup);
-    const di = a?.default_icon;
-    if (typeof di === "string") add(di);
-    else if (di && typeof di === "object") for (const p of Object.values(di)) add(p);
-  }
-  for (const p of Object.values(m.icons ?? {})) add(p);
-  add(m.options_page);
-  add(m.options_ui?.page);
-  add(m.devtools_page);
-  for (const p of Object.values(m.chrome_url_overrides ?? {})) add(p);
-  for (const p of arr(m.sandbox?.pages)) add(p);
-  for (const r of arr(m.declarative_net_request?.rule_resources)) {
-    if (typeof r === "object" && r !== null && "path" in r) add(r.path);
-  }
-  // side_panel.default_path becomes the Firefox sidebar page, so a miss here leaves an
-  // empty sidebar.
-  add(m.side_panel?.default_path);
-  add(m.sidebar_action?.default_panel);
-  const storage = m.storage;
-  if (typeof storage === "object" && storage !== null && "managed_schema" in storage) add(storage.managed_schema);
-
-  // web_accessible_resources: MV2 string[], MV3 [{resources: string[]}], or a bare
-  // string (invalid, but hand-edited manifests produce it).
-  if (typeof m.web_accessible_resources === "string") add(m.web_accessible_resources);
-  for (const entry of arr(m.web_accessible_resources)) {
-    if (typeof entry === "string") add(entry);
-    else if (typeof entry === "object" && entry !== null && "resources" in entry) for (const r of arr(entry.resources)) add(r);
-  }
+    return p;
+  });
   return paths;
 }
 
@@ -953,6 +998,21 @@ function withQuery(path: string, query: string | undefined): string {
   const fragment = hash === -1 ? "" : path.slice(hash);
   const sep = !page.includes("?") ? "?" : /[?&]$/.test(page) ? "" : "&";
   return page + sep + q + fragment;
+}
+
+/**
+ * Give each of `actions` (a page action, a sidebar) the add-on's icons when it
+ * declares none. Chrome shows the extension's icons on an action without
+ * default_icon; Firefox's page action and sidebar show a generic puzzle piece
+ * instead (its browser_action and action fall back to the icons on their own).
+ */
+export function wireActionIcons(actions: Array<Record<string, unknown> | undefined>, icons: Record<string, string>): void {
+  for (const a of actions) {
+    if (!a || typeof a !== "object") continue;
+    const own = a.default_icon;
+    if (typeof own === "string" ? own !== "" : own && typeof own === "object" && Object.keys(own).length > 0) continue;
+    a.default_icon = { ...icons };
+  }
 }
 
 /**
@@ -1028,7 +1088,12 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   };
   // For Android alone, a desktop minimum would gate Firefox for Android as well.
   if (opts.platforms === "android") delete gecko.strict_min_version;
-  else gecko.strict_min_version = opts.minFirefoxVersion;
+  else {
+    gecko.strict_min_version = opts.minFirefoxVersion;
+    // The author's cap below the minimum leaves no Firefox the add-on installs on.
+    const max = gecko.strict_max_version;
+    if (typeof max === "string" && compareFirefoxVersions(max, opts.minFirefoxVersion) < 0) delete gecko.strict_max_version;
+  }
   if (opts.dataCollection) {
     const declared = typeof gecko.data_collection_permissions === "object" ? gecko.data_collection_permissions : {};
     gecko.data_collection_permissions = { ...declared, required: [...opts.dataCollection] };
@@ -1044,17 +1109,18 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   // never does.
   const sidePanelPath = typeof out.side_panel?.default_path === "string" ? out.side_panel.default_path : "";
   const panel = out.side_panel !== undefined ? sidePanelPath : (opts.sidebarPanel ?? "");
+  const icons = out.icons && typeof out.icons === "object" && Object.keys(out.icons).length ? out.icons : undefined;
   if (!out.sidebar_action && panel) {
     const actionTitle = (out.action ?? out.browser_action ?? out.page_action)?.default_title;
     const title = typeof actionTitle === "string" && actionTitle ? actionTitle : out.name;
     const sidebar: NonNullable<Manifest["sidebar_action"]> = { default_panel: withQuery(panel, opts.sidebarPanelQuery) };
     if (title) sidebar.default_title = title;
-    const icons = out.icons;
-    if (icons && typeof icons === "object" && Object.keys(icons).length) sidebar.default_icon = { ...icons };
+    if (icons) sidebar.default_icon = { ...icons };
     sidebar.open_at_install = false;
     out.sidebar_action = sidebar;
   }
   delete out.side_panel;
+  if (icons) wireActionIcons([out.page_action], icons);
 
   // Firefox would treat "split" as "not_allowed"; without the key the add-on spans
   // normal and private windows.

@@ -2,6 +2,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import type { Manifest } from "../types.js";
+import { wireActionIcons } from "../manifest/manifest.js";
 
 const SIZES = [48, 128, 256, 512];
 
@@ -94,7 +95,8 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
  * When the extension ships no icons, Firefox shows a generic puzzle-piece glyph
  * in the toolbar and the add-ons manager. Synthesize a solid-color placeholder set so the
  * build is usable; the color is derived from the app name so it's at least
- * distinguishable. Mutates `manifest.icons` (and the action's default_icon).
+ * distinguishable. Mutates `manifest.icons` (and the default_icon of the action,
+ * the page action and the sidebar).
  * No-op when the manifest already declares any icon. Returns the sizes written.
  */
 export function synthesizePlaceholderIcons(stageDir: string, manifest: Manifest, appName: string): number[] {
@@ -120,6 +122,8 @@ export function synthesizePlaceholderIcons(stageDir: string, manifest: Manifest,
   // means the line-105 guard found no usable default_icon (absent, or an empty
   // {}), so assign unconditionally — a truthiness check would skip the {} case.
   if (existingAction) existingAction.default_icon = { ...icons };
+  // The author declared no icon anywhere, so a sidebar without one is filled too.
+  wireActionIcons([manifest.page_action, manifest.sidebar_action], icons);
 
   return SIZES;
 }

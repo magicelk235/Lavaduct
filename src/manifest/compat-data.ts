@@ -8,8 +8,10 @@ import { FIREFOX_API_SUPPORT, FIREFOX_PERMISSION_SUPPORT } from "./compat-genera
 // both read these tables, so the report and the output agree.
 
 // One dot-separated part of a Mozilla version: a number, then an optional string,
-// number and remainder ("0a1" is 0, "a", 1, ""). nsVersionComparator's rules.
+// number and remainder ("0a1" is 0, "a", 1, ""). nsVersionComparator's rules,
+// including a lone "*" (strict_max_version "153.*") sorting above every number.
 function versionPart(part: string | undefined): [number, string, number, string] {
+  if (part === "*") return [Number.POSITIVE_INFINITY, "", 0, ""];
   const m = /^(\d*)([^\d]*)(\d*)(.*)$/s.exec(part ?? "") as RegExpExecArray;
   return [Number.parseInt(m[1], 10) || 0, m[2], Number.parseInt(m[3], 10) || 0, m[4]];
 }
@@ -142,6 +144,8 @@ type ApiNote = {
   message: string;
   fix: string;
   shimmed?: boolean;
+  /** For a shimmed entry: what happens in a build without the shim (--no-shim). */
+  unshimmed?: string;
   /** First Firefox release with the API; the analyzer skips the entry when --min-firefox is at least this. */
   since?: string;
 };
@@ -300,6 +304,7 @@ const HAND_NOTES: Record<string, ApiNote> = {
     message: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT", which Firefox\'s context types lack, is answered by the shim from its offscreen emulation, which also adds the member to runtime.ContextType.',
     fix: "No action needed.",
     shimmed: true,
+    unshimmed: 'runtime.getContexts() with contextTypes "OFFSCREEN_DOCUMENT" fails, because Firefox\'s context types lack it.',
   },
 };
 
@@ -371,7 +376,7 @@ function buildApiTable(): Record<string, ApiNote> {
     };
   }
   for (const [name, note] of Object.entries(SHIMMED_APIS)) {
-    table[apiKey(name)] = { severity: "info", ...note, shimmed: true };
+    table[apiKey(name)] = { severity: "info", ...note, shimmed: true, unshimmed: missingMessage(name, !name.includes(".")) };
   }
   return { ...table, ...HAND_NOTES };
 }
