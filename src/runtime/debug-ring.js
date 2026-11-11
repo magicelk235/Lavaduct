@@ -11,6 +11,9 @@ var __SHIM_DEBUG_WRITE__ = (function () {
   try {
     var KEY = "__viaduct_debug_log__";
     var CAP = 2000;
+    // One entry's text, so a logged response body or a huge object can't make
+    // every flush read and rewrite megabytes, or push the log past its quota.
+    var MSG_CAP = 4000;
     var FLUSH_MS = 1000;
     var api = null;
     try {
@@ -92,17 +95,22 @@ var __SHIM_DEBUG_WRITE__ = (function () {
       try {
         var parts = [];
         for (var i = 0; i < args.length; i++) parts.push(fmt(args[i]));
-        pending.push({ t: Date.now(), ctx: ctx, msg: parts.join(" ") });
+        var msg = parts.join(" ");
+        if (msg.length > MSG_CAP) msg = msg.slice(0, MSG_CAP) + "... [" + (msg.length - MSG_CAP) + " more chars]";
+        pending.push({ t: Date.now(), ctx: ctx, msg: msg });
         if (pending.length > CAP) pending.splice(0, pending.length - CAP);
         if (timer == null) timer = setTimeout(flush, FLUSH_MS);
       } catch (e) {}
     };
     // An uncaught error in the host script is the most useful thing to see and the
     // hardest to reach: it aborts the rest of that script (a background stops
-    // registering its listeners, a content script never runs). Tee both failure
-    // channels into the ring so `--logs` shows them.
+    // registering its listeners). Tee both failure channels into the ring so
+    // `--logs` shows them. Not in a content script: there `self` is the web page's
+    // window, which hears the page's own errors and rejections, and Firefox never
+    // dispatches a content script's there, so every entry would be the site's.
     try {
-      var target = (typeof self !== "undefined" && self && self.addEventListener) ? self
+      var target = ctx === "content" ? null
+        : (typeof self !== "undefined" && self && self.addEventListener) ? self
         : ((typeof window !== "undefined" && window && window.addEventListener) ? window : null);
       if (target) {
         target.addEventListener("error", function (e) {

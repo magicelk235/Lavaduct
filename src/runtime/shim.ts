@@ -1,5 +1,5 @@
 import { writeFileSync, readFileSync, readdirSync, existsSync, statSync } from "node:fs";
-import { join, dirname, relative, basename } from "node:path";
+import { join, dirname, relative, basename, resolve, isAbsolute, sep } from "node:path";
 import type { Manifest } from "../types.js";
 import { RUNTIME_DIR } from "../paths.js";
 import { NAME } from "../name.js";
@@ -305,13 +305,17 @@ function headInsertIndex(html: string): number {
  * Insert markup at the top of the page's head. A page with no `<head>` tag gets it
  * after its doctype: anything but whitespace or comments ahead of `<!DOCTYPE html>`
  * drops the page into quirks mode, which reflows layout built for standards mode.
+ * A UTF-8 byte order mark may lead, decoded (U+FEFF) or as latin1 bytes.
  */
+const BOM_RE = /^(?:\uFEFF|\u00EF\u00BB\u00BF)/;
 export function insertAtHeadStart(html: string, markup: string): string {
   const at = headInsertIndex(html);
   if (at >= 0) return html.slice(0, at) + "\n    " + markup + html.slice(at);
-  const doctype = /^(?:\uFEFF)?(?:\s|<!--[\s\S]*?-->)*<!doctype\b[^>]*>/i.exec(html);
+  const doctype = new RegExp(BOM_RE.source + "?(?:\\s|<!--[\\s\\S]*?-->)*<!doctype\\b[^>]*>", "i").exec(html);
   if (doctype) return html.slice(0, doctype[0].length) + "\n" + markup + html.slice(doctype[0].length);
-  return markup + "\n" + html;
+  // The byte order mark only declares UTF-8 at the very start of the file.
+  const bom = BOM_RE.exec(html)?.[0] ?? "";
+  return bom + markup + "\n" + html.slice(bom.length);
 }
 
 function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
@@ -337,14 +341,24 @@ function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
  * root-absolute so it resolves from any depth. Classic scripts in <head> run
  * before deferred and module scripts, so the shim is in place before the page's
  * bundle evaluates. Returns the number of pages changed.
+ *
+ * Pages are read and written as latin1, one character per byte, so a page in
+ * windows-1252 or another non-UTF-8 charset keeps its bytes: the tags looked
+ * for and the markup inserted are ASCII either way.
+ *
+ * A file with no doctype, no `<html>`, `<head>` or `<body>` and no script of its
+ * own is a fragment the add-on fetches and inserts with innerHTML, not a page
+ * Firefox loads: a <script> put at its top would become the fragment's first
+ * element in the add-on's DOM, and code that never runs anything needs no shim.
  */
+const PAGE_MARKER_RE = /<!doctype\b|<(?:html|head|body|script)(?=[\s/>])/i;
 export function injectShimIntoHtmlPages(dir: string, shimFile: string): number {
   const tag = `<script src="/${shimFile}"></script>`;
   let count = 0;
   for (const file of walkHtmlFiles(dir)) {
-    const html = readFileSync(file, "utf-8");
-    if (html.includes(tag)) continue;
-    writeFileSync(file, insertAtHeadStart(html, tag), "utf-8");
+    const html = readFileSync(file, "latin1");
+    if (html.includes(tag) || !PAGE_MARKER_RE.test(html)) continue;
+    writeFileSync(file, insertAtHeadStart(html, tag), "latin1");
     count++;
   }
   return count;
@@ -385,7 +399,9 @@ export function wireBackground(dir: string, manifest: Manifest, shimFile?: strin
   }
 
   const sw = typeof bg.service_worker === "string" ? bg.service_worker.replace(/^(?:\.?\/)+/, "") : "";
-  if (!sw) return { converted: false, hoisted: [] };
+  // A path that climbs out of the staged add-on names a file of the user's,
+  // which must never be read or rewritten as part of it; Firefox refuses it anyway.
+  if (!sw || !insideStage(dir, sw)) return { converted: false, hoisted: [] };
 
   const isModule = bg.type === "module";
   let hoisted: string[] = [];
@@ -593,6 +609,7 @@ export function rootLiteralsFromGetURL(argList: string): string {
  * plus whether any call had a runtime-computed argument.
  */
 function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: string): { targets: string[]; dynamic: boolean } {
+  if (!insideStage(dir, rootRel)) return { targets: [], dynamic: false };
   const filePath = join(dir, rootRel);
   let src: string;
   try {
@@ -630,7 +647,7 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
       const fromRoot = (literal.startsWith("/") ? literal.slice(1) : join(resolveDir, literal))
         .split("\\").join("/");
       // Unresolved, or not a file → no script entry; the call is still neutralised.
-      if (isFile(join(dir, fromRoot))) targets.push(fromRoot);
+      if (insideStage(dir, fromRoot) && isFile(join(dir, fromRoot))) targets.push(fromRoot);
     }
     out += src.slice(last, mm.index) + "void 0 /* importScripts hoisted to background.scripts */";
     last = end;
@@ -673,6 +690,13 @@ export function importScriptsTargets(src: string, callAt: number, argList: strin
     else dynamic = true;
   }
   return { literals, dynamic };
+}
+
+/** Whether a root-relative path stays inside the staged add-on (no `..` escape). */
+function insideStage(dir: string, rootRel: string): boolean {
+  const root = resolve(dir);
+  const rel = relative(root, resolve(root, rootRel.replace(/^\/+/, "")));
+  return rel !== "" && rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel);
 }
 
 function isFile(path: string): boolean {
@@ -813,7 +837,7 @@ export function workerChunkGlobal(dir: string, manifest: Manifest): string {
   const bg = manifest.background;
   if (!bg || typeof bg !== "object" || Array.isArray(bg.scripts) || bg.type === "module") return "";
   const sw = typeof bg.service_worker === "string" ? bg.service_worker.replace(/^(?:\.?\/)+/, "") : "";
-  if (!sw) return "";
+  if (!sw || !insideStage(dir, sw)) return "";
   let src: string;
   try {
     src = readFileSync(join(dir, sw), "utf-8");
