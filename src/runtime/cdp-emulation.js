@@ -566,7 +566,7 @@
         case "getDocument":
           return { root: nodeInfo(W.document, q.depth === -1 ? 1000 : q.depth == null ? 1 : q.depth, { left: 5000 }) };
         case "describeNode":
-          return { node: nodeInfo(nodeOf(q), q.depth === -1 ? 1000 : q.depth || 0, { left: 5000 }) };
+          return { node: nodeInfo(nodeOf(q), q.depth === -1 ? 1000 : q.depth == null ? 1 : q.depth, { left: 5000 }) };
         case "querySelector":
           root = nodeOf(q);
           var hit = root.querySelector(String(q.selector));
