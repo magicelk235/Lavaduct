@@ -1,5 +1,5 @@
 import { writeFileSync, readFileSync, readdirSync, existsSync, statSync } from "node:fs";
-import { join, dirname, relative, basename } from "node:path";
+import { join, dirname, relative, basename, resolve, isAbsolute, sep } from "node:path";
 import type { Manifest } from "../types.js";
 import { RUNTIME_DIR } from "../paths.js";
 import { NAME } from "../name.js";
@@ -399,7 +399,9 @@ export function wireBackground(dir: string, manifest: Manifest, shimFile?: strin
   }
 
   const sw = typeof bg.service_worker === "string" ? bg.service_worker.replace(/^(?:\.?\/)+/, "") : "";
-  if (!sw) return { converted: false, hoisted: [] };
+  // A path that climbs out of the staged add-on names a file of the user's,
+  // which must never be read or rewritten as part of it; Firefox refuses it anyway.
+  if (!sw || !insideStage(dir, sw)) return { converted: false, hoisted: [] };
 
   const isModule = bg.type === "module";
   let hoisted: string[] = [];
@@ -607,6 +609,7 @@ export function rootLiteralsFromGetURL(argList: string): string {
  * plus whether any call had a runtime-computed argument.
  */
 function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: string): { targets: string[]; dynamic: boolean } {
+  if (!insideStage(dir, rootRel)) return { targets: [], dynamic: false };
   const filePath = join(dir, rootRel);
   let src: string;
   try {
@@ -644,7 +647,7 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
       const fromRoot = (literal.startsWith("/") ? literal.slice(1) : join(resolveDir, literal))
         .split("\\").join("/");
       // Unresolved, or not a file → no script entry; the call is still neutralised.
-      if (isFile(join(dir, fromRoot))) targets.push(fromRoot);
+      if (insideStage(dir, fromRoot) && isFile(join(dir, fromRoot))) targets.push(fromRoot);
     }
     out += src.slice(last, mm.index) + "void 0 /* importScripts hoisted to background.scripts */";
     last = end;
@@ -687,6 +690,13 @@ export function importScriptsTargets(src: string, callAt: number, argList: strin
     else dynamic = true;
   }
   return { literals, dynamic };
+}
+
+/** Whether a root-relative path stays inside the staged add-on (no `..` escape). */
+function insideStage(dir: string, rootRel: string): boolean {
+  const root = resolve(dir);
+  const rel = relative(root, resolve(root, rootRel.replace(/^\/+/, "")));
+  return rel !== "" && rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel);
 }
 
 function isFile(path: string): boolean {
@@ -827,7 +837,7 @@ export function workerChunkGlobal(dir: string, manifest: Manifest): string {
   const bg = manifest.background;
   if (!bg || typeof bg !== "object" || Array.isArray(bg.scripts) || bg.type === "module") return "";
   const sw = typeof bg.service_worker === "string" ? bg.service_worker.replace(/^(?:\.?\/)+/, "") : "";
-  if (!sw) return "";
+  if (!sw || !insideStage(dir, sw)) return "";
   let src: string;
   try {
     src = readFileSync(join(dir, sw), "utf-8");
