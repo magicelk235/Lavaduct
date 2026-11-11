@@ -345,13 +345,19 @@ function walkHtmlFiles(dir: string, acc: string[] = []): string[] {
  * Pages are read and written as latin1, one character per byte, so a page in
  * windows-1252 or another non-UTF-8 charset keeps its bytes: the tags looked
  * for and the markup inserted are ASCII either way.
+ *
+ * A file with no doctype, no `<html>`, `<head>` or `<body>` and no script of its
+ * own is a fragment the add-on fetches and inserts with innerHTML, not a page
+ * Firefox loads: a <script> put at its top would become the fragment's first
+ * element in the add-on's DOM, and code that never runs anything needs no shim.
  */
+const PAGE_MARKER_RE = /<!doctype\b|<(?:html|head|body|script)(?=[\s/>])/i;
 export function injectShimIntoHtmlPages(dir: string, shimFile: string): number {
   const tag = `<script src="/${shimFile}"></script>`;
   let count = 0;
   for (const file of walkHtmlFiles(dir)) {
     const html = readFileSync(file, "latin1");
-    if (html.includes(tag)) continue;
+    if (html.includes(tag) || !PAGE_MARKER_RE.test(html)) continue;
     writeFileSync(file, insertAtHeadStart(html, tag), "latin1");
     count++;
   }
