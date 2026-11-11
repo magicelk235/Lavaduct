@@ -34,6 +34,26 @@ function u64(buf: Buffer, at: number): number {
   return Number(v);
 }
 
+// The zip format says a name without the UTF-8 flag (bit 11) is code page 437,
+// which is what Windows' built-in zipper and older tools write. Many other tools
+// write UTF-8 without setting the flag, so a name that decodes as UTF-8 is taken
+// as UTF-8 and only the rest as CP437; decoding those as UTF-8 too turned every
+// byte above 0x7f into U+FFFD, and a manifest naming the file never found it.
+const CP437_HIGH =
+  "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u00a0";
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
+
+function entryName(raw: Buffer, flags: number): string {
+  if (flags & 0x0800) return raw.toString("utf-8");
+  try {
+    return UTF8.decode(raw);
+  } catch {
+    let s = "";
+    for (const b of raw) s += b < 0x80 ? String.fromCharCode(b) : CP437_HIGH[b - 0x80];
+    return s;
+  }
+}
+
 /** Offset of the end-of-central-directory record, searched backwards over the comment window. */
 function findEocd(buf: Buffer): number {
   const stop = Math.max(0, buf.length - EOCD_SIZE - MAX_COMMENT);
@@ -57,20 +77,22 @@ function readCentralDirectory(buf: Buffer): CentralEntry[] {
   let cdOffset = buf.readUInt32LE(eocd + 16);
   let cdEnd = eocd;
 
+  // A zip64 end record sits right before its locator, which sits right before
+  // the EOCD. The locator's offset is as written, so bytes prepended to the
+  // archive leave it short; the record's fixed-size form then ends exactly at
+  // the locator. Either way the central directory ends where the record starts.
   const locator = eocd - 20;
-  if (
-    (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) &&
-    locator >= 0 &&
-    buf.readUInt32LE(locator) === SIG_ZIP64_LOCATOR
-  ) {
-    const z = u64(buf, locator + 8);
-    if (z + 56 > buf.length || buf.readUInt32LE(z) !== SIG_ZIP64_EOCD) {
-      throw new Error("Corrupt zip64 archive (bad zip64 end-of-central-directory record)");
+  if (locator >= 0 && buf.readUInt32LE(locator) === SIG_ZIP64_LOCATOR) {
+    let z = u64(buf, locator + 8);
+    if (z + 56 > locator || buf.readUInt32LE(z) !== SIG_ZIP64_EOCD) z = locator - 56;
+    const found = z >= 0 && buf.readUInt32LE(z) === SIG_ZIP64_EOCD;
+    if (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+      if (!found) throw new Error("Corrupt zip64 archive (bad zip64 end-of-central-directory record)");
+      count = u64(buf, z + 32);
+      cdSize = u64(buf, z + 40);
+      cdOffset = u64(buf, z + 48);
     }
-    count = u64(buf, z + 32);
-    cdSize = u64(buf, z + 40);
-    cdOffset = u64(buf, z + 48);
-    cdEnd = z;
+    if (found) cdEnd = z;
   }
 
   // Offsets normally count from the start of the buffer. omni.ja puts its
@@ -107,7 +129,7 @@ function readCentralDirectory(buf: Buffer): CentralEntry[] {
     const nameStart = p + 46;
     const extraStart = nameStart + nameLen;
     if (extraStart + extraLen > buf.length) throw new Error("Corrupt zip archive (truncated central directory)");
-    const name = buf.toString("utf-8", nameStart, extraStart);
+    const name = entryName(buf.subarray(nameStart, extraStart), flags);
 
     // The zip64 extra field carries only the values whose 32-bit slot is maxed out, in this order.
     if (size === 0xffffffff || compressedSize === 0xffffffff || localOffset === 0xffffffff) {
@@ -205,6 +227,11 @@ export function extractZip(buf: Buffer, destDir: string): void {
   const root = resolve(destDir);
   const prefix = root.endsWith(sep) ? root : root + sep;
   const plan: Array<{ entry: CentralEntry; target: string; dir: boolean }> = [];
+  // A path an archive uses both as a file and as a folder ("a" and "a/b.js") can't
+  // be extracted; finding it here keeps the promise that a refused archive writes
+  // nothing, instead of failing with EEXIST or EISDIR halfway through.
+  const files = new Map<string, string>();
+  const folders = new Map<string, string>();
   for (const entry of entries) {
     // Unix file type in the high half of the external attributes; 0o120000 is a symlink.
     if (((entry.externalAttrs >>> 16) & 0o170000) === 0o120000) {
@@ -214,7 +241,18 @@ export function extractZip(buf: Buffer, destDir: string): void {
     if (segments.length === 0) continue;
     const target = join(root, ...segments);
     if (!target.startsWith(prefix)) throw new Error(`Refusing zip entry that escapes the extraction directory (zip-slip): ${entry.name}`);
-    plan.push({ entry, target, dir: isDirectoryEntry(entry) });
+    const dir = isDirectoryEntry(entry);
+    for (let i = 1; i <= segments.length; i++) {
+      if (i === segments.length && !dir) break;
+      const path = segments.slice(0, i).join("/");
+      if (!folders.has(path)) folders.set(path, entry.name);
+    }
+    if (!dir) files.set(segments.join("/"), entry.name);
+    plan.push({ entry, target, dir });
+  }
+  for (const [path, name] of files) {
+    const other = folders.get(path);
+    if (other !== undefined) throw new Error(`Refusing zip archive that uses "${path}" as both a file (${name}) and a folder (${other})`);
   }
 
   mkdirSync(root, { recursive: true });
