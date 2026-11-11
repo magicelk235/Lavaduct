@@ -91,7 +91,7 @@ function crxPublicKeyBase64(crxPath: string): string | undefined {
  * Resolve the directory that actually contains manifest.json.
  * Many zips wrap the extension in a single top-level folder.
  */
-function resolveExtensionRoot(dir: string): string {
+function resolveExtensionRoot(dir: string, depth = 0): string {
   if (existsSync(join(dir, "manifest.json"))) return dir;
   const entries = readdirSync(dir).filter((e) => !e.startsWith("__MACOSX") && e !== ".DS_Store");
   const subdirs = entries.filter((e) => {
@@ -114,6 +114,14 @@ function resolveExtensionRoot(dir: string): string {
   const manifestSubdirs = subdirs.filter((e) => existsSync(join(dir, e, "manifest.json")));
   if (manifestSubdirs.length === 1) {
     return join(dir, manifestSubdirs[0]);
+  }
+  // A lone wrapper folder around such a layout: GitHub's "Download ZIP" puts the
+  // whole repo in <repo>-<branch>/, so the extension sits two levels down, next
+  // to its siblings. Apply the same rules inside the wrapper; when they find
+  // nothing either, stay put as before.
+  if (subdirs.length === 1 && depth < 2) {
+    const inner = resolveExtensionRoot(join(dir, subdirs[0]), depth + 1);
+    if (existsSync(join(inner, "manifest.json"))) return inner;
   }
   return dir;
 }
