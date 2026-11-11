@@ -1535,9 +1535,14 @@
         if (waiter) waiter(d.error || "Navigation failed");
         if (pageOn(d)) emit(d.tabId, "Page.frameStoppedLoading", { frameId: String(d.tabId) });
       });
+      // A fragment or history navigation never commits; it answers a
+      // Page.navigate to that URL.
       var sameDocument = function (type) {
         return function (d) {
-          if (d.frameId === 0 && pageOn(d)) emit(d.tabId, "Page.navigatedWithinDocument", { frameId: String(d.tabId), url: d.url, navigationType: type });
+          if (d.frameId !== 0) return;
+          var waiter = commitWaiters[d.tabId];
+          if (waiter && waiter.url === d.url) waiter(null, true);
+          if (pageOn(d)) emit(d.tabId, "Page.navigatedWithinDocument", { frameId: String(d.tabId), url: d.url, navigationType: type });
         };
       };
       if (nav.onHistoryStateUpdated) nav.onHistoryStateUpdated.addListener(sameDocument("historyApi"));
@@ -1786,14 +1791,17 @@
         return { frameTree: root };
       });
     }
-    function waitForCommit(tabId, ms) {
+    // Resolves with { error, sameDocument } once the tab's top frame commits a
+    // navigation, fails, or moves within the document to `url`.
+    function waitForCommit(tabId, url, ms) {
       return new Promise(function (resolve) {
         var timer = setTimeout(function () { finish(null); }, ms);
-        function finish(error) {
+        function finish(error, sameDocument) {
           clearTimeout(timer);
           if (commitWaiters[tabId] === finish) delete commitWaiters[tabId];
-          resolve(error);
+          resolve({ error: error, sameDocument: !!sameDocument });
         }
+        finish.url = url;
         commitWaiters[tabId] = finish;
       });
     }
@@ -1845,16 +1853,20 @@
       "Page.getFrameTree": function (tabId) { return frameTree(tabId); },
       "Page.navigate": function (tabId, s, p) {
         if (typeof p.url !== "string" || !p.url) return Promise.reject(protocolError("Invalid parameters: url", -32602));
-        var committed = waitForCommit(tabId, 30000);
+        var url = p.url;
+        try { url = new URL(p.url).href; } catch (e) {}
+        var committed = waitForCommit(tabId, url, 30000);
         return Promise.resolve(api.tabs.update(tabId, { url: p.url })).then(function () {
           return committed;
         }, function (err) {
           var waiter = commitWaiters[tabId];
           if (waiter) waiter(null);
           throw protocolError(errorMessage(err));
-        }).then(function (error) {
-          var out = { frameId: String(tabId), loaderId: String(tabId) };
-          if (error) out.errorText = error;
+        }).then(function (outcome) {
+          // Chrome leaves out the loaderId of a same-document navigation.
+          var out = { frameId: String(tabId) };
+          if (!outcome.sameDocument) out.loaderId = String(tabId);
+          if (outcome.error) out.errorText = outcome.error;
           return out;
         });
       },
