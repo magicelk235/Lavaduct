@@ -74,18 +74,20 @@ test(
       // Selecting a tab does nothing while the new profile's onboarding dialog
       // is up, which can come up late; it goes first.
       const select = async (which) => {
+        let last = null;
         for (let i = 0; i < 50; i++) {
-          const selected = await ff.chrome(`(() => {
+          last = JSON.parse(await ff.chrome(`(() => {
             const win = Services.wm.getMostRecentWindow("navigator:browser");
-            if (win.gDialogBox?.isOpen) win.gDialogBox.dialog?.close();
+            const dialog = !!win.gDialogBox?.isOpen;
+            if (dialog) win.gDialogBox.dialog?.close();
             const tab = win.gBrowser.tabs.find((t) => t.linkedBrowser.currentURI.spec.endsWith("/${which}"));
             if (tab) win.gBrowser.selectedTab = tab;
-            return win.gBrowser.selectedTab === tab;
-          })()`);
-          if (selected) return;
+            return JSON.stringify({ selected: !!tab && win.gBrowser.selectedTab === tab, found: !!tab, dialog, urls: win.gBrowser.tabs.map((t) => t.linkedBrowser.currentURI.spec), current: win.gBrowser.selectedTab.linkedBrowser.currentURI.spec });
+          })()`));
+          if (last.selected) return;
           await sleep(100);
         }
-        assert.fail(`couldn't select the tab at /${which}`);
+        assert.fail(`couldn't select the tab at /${which}: ${JSON.stringify(last)}`);
       };
       await select("one");
       // The page in the sidebar, and which document it is.
