@@ -78,9 +78,13 @@ export function findFirefox(selector?: string): FirefoxInstall {
   return install;
 }
 
-/** File and folder name for an extension: its name without spaces or punctuation. */
+/**
+ * File and folder name for an extension: its name without spaces or punctuation.
+ * Combining marks stay with their letters (Indic vowel signs, accents), and the
+ * name is composed first, so a decomposed spelling gives the same name.
+ */
 function deriveAppName(name: string): string {
-  return name.replace(/[^\p{L}\p{N}_-]+/gu, "") || "Extension";
+  return name.normalize("NFC").replace(/[^\p{L}\p{M}\p{N}_-]+/gu, "") || "Extension";
 }
 
 /**
