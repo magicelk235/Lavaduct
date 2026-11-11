@@ -249,6 +249,12 @@ async function submitVersion(amo: Amo, addonId: string, uuid: string): Promise<S
   if (res.status === 409 && messages.some((m) => /already exists|uploaded before/i.test(m))) {
     return { kind: "version-used" };
   }
+  // A 403 for an add-on Mozilla disabled says so in is_disabled_by_mozilla; the
+  // permission message itself is the same as for someone else's ID.
+  if (res.status === 403 && field(body, "is_disabled_by_mozilla") === true) {
+    const message = `Mozilla disabled the add-on ${addonId} on AMO, so it takes no new versions.`;
+    return { kind: "refused", issues: [amoIssue(message, "Pass --addon-id with a new ID to sign it as a separate add-on.")] };
+  }
   if (res.status === 403) {
     const message = `The add-on ID ${addonId} belongs to another AMO account, so these credentials can't submit versions of it.`;
     const fix = "Use the credentials of the account that owns it, or pass --addon-id with a different ID.";
