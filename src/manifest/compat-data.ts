@@ -7,12 +7,32 @@ import { FIREFOX_API_SUPPORT, FIREFOX_PERMISSION_SUPPORT } from "./compat-genera
 // stripped, and the advice the analyzer prints. The analyzer and the manifest transform
 // both read these tables, so the report and the output agree.
 
-/** Compare dotted version strings numerically: `compareFirefoxVersions("128.0", "139") < 0`. */
+// One dot-separated part of a Mozilla version: a number, then an optional string,
+// number and remainder ("0a1" is 0, "a", 1, ""). nsVersionComparator's rules.
+function versionPart(part: string | undefined): [number, string, number, string] {
+  const m = /^(\d*)([^\d]*)(\d*)(.*)$/s.exec(part ?? "") as RegExpExecArray;
+  return [Number.parseInt(m[1], 10) || 0, m[2], Number.parseInt(m[3], 10) || 0, m[4]];
+}
+
+// A part's string sorts before none at all: 161.0a1 comes before 161.0.
+function compareVersionStrings(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a === "") return 1;
+  if (b === "") return -1;
+  return a < b ? -1 : 1;
+}
+
+/**
+ * Compare Firefox versions the way Firefox does (Services.vc.compare), so a Nightly
+ * or Beta sorts before its release: `compareFirefoxVersions("161.0a1", "161.0") < 0`.
+ */
 export function compareFirefoxVersions(a: string, b: string): number {
   const pa = String(a).split(".");
   const pb = String(b).split(".");
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (Number.parseInt(pa[i] ?? "0", 10) || 0) - (Number.parseInt(pb[i] ?? "0", 10) || 0);
+    const [numA, strA, numC, extraA] = versionPart(pa[i]);
+    const [numB, strB, numD, extraB] = versionPart(pb[i]);
+    const d = numA - numB || compareVersionStrings(strA, strB) || numC - numD || compareVersionStrings(extraA, extraB);
     if (d !== 0) return d;
   }
   return 0;
