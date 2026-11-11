@@ -8,8 +8,10 @@ import { FIREFOX_API_SUPPORT, FIREFOX_PERMISSION_SUPPORT } from "./compat-genera
 // both read these tables, so the report and the output agree.
 
 // One dot-separated part of a Mozilla version: a number, then an optional string,
-// number and remainder ("0a1" is 0, "a", 1, ""). nsVersionComparator's rules.
+// number and remainder ("0a1" is 0, "a", 1, ""). nsVersionComparator's rules,
+// including a lone "*" (strict_max_version "153.*") sorting above every number.
 function versionPart(part: string | undefined): [number, string, number, string] {
+  if (part === "*") return [Number.POSITIVE_INFINITY, "", 0, ""];
   const m = /^(\d*)([^\d]*)(\d*)(.*)$/s.exec(part ?? "") as RegExpExecArray;
   return [Number.parseInt(m[1], 10) || 0, m[2], Number.parseInt(m[3], 10) || 0, m[4]];
 }

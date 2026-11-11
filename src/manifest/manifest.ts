@@ -1028,7 +1028,12 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   };
   // For Android alone, a desktop minimum would gate Firefox for Android as well.
   if (opts.platforms === "android") delete gecko.strict_min_version;
-  else gecko.strict_min_version = opts.minFirefoxVersion;
+  else {
+    gecko.strict_min_version = opts.minFirefoxVersion;
+    // The author's cap below the minimum leaves no Firefox the add-on installs on.
+    const max = gecko.strict_max_version;
+    if (typeof max === "string" && compareFirefoxVersions(max, opts.minFirefoxVersion) < 0) delete gecko.strict_max_version;
+  }
   if (opts.dataCollection) {
     const declared = typeof gecko.data_collection_permissions === "object" ? gecko.data_collection_permissions : {};
     gecko.data_collection_permissions = { ...declared, required: [...opts.dataCollection] };
