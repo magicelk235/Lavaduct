@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { ConvertOptions, ConvertResult, Issue, Manifest, SignRoute } from "./types.js";
 import { ENV_PREFIX, NAME } from "./name.js";
 import { extractExtension } from "./input/extract.js";
-import { applySourceRewrites, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
+import { applySourceRewrites, normalizeLocaleCatalogs, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import {
   analyzeManifest,
@@ -199,6 +199,8 @@ function buildAddon(
   for (const asset of stageExtension(src.extPath, stageDir, collectReferencedPaths(manifest))) {
     log.warn(`Manifest-referenced asset not staged (broken/external symlink or copy error): ${asset}. It will 404 in Firefox.`);
   }
+  const catalogs = normalizeLocaleCatalogs(stageDir);
+  if (catalogs.length > 0) log.ok(`Rewrote ${catalogs.length} locale catalog(s) as plain JSON, which Firefox's reader needs: ${catalogs.join(", ")}`);
   for (const r of applySourceRewrites(stageDir, manifest)) {
     if (r.count > 0) log.ok(`${r.name} in ${r.count} file(s)`);
   }

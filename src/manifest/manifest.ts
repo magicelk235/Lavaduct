@@ -16,7 +16,9 @@ import { FIREFOX_PERMISSION_SUPPORT } from "./compat-generated.js";
  * illegal in strict JSON but common in hand-edited Chrome manifests (Chrome's own
  * loader tolerates comments). A single character-state scan skips comment runs and
  * trailing commas WITHOUT touching their look-alikes inside string literals (e.g.
- * the "//" in an "https://…" URL), then hands clean JSON to JSON.parse.
+ * the "//" in an "https://…" URL), then hands clean JSON to JSON.parse. Inside
+ * strings it also takes the rest of what Chrome's reader allows
+ * (JSON_PARSE_CHROMIUM_EXTENSIONS): raw line breaks and \xNN escapes.
  */
 export function parseJsonc<T = unknown>(text: string): T {
   // Strip a leading UTF-8 BOM (U+FEFF). Node's readFileSync('utf-8') leaves it in
@@ -31,10 +33,16 @@ export function parseJsonc<T = unknown>(text: string): T {
     const c = text[i];
     const next = text[i + 1];
     if (inString) {
-      out += c;
-      if (escaped) escaped = false;
-      else if (c === "\\") escaped = true;
-      else if (c === '"') inString = false;
+      if (escaped) {
+        escaped = false;
+        out += c === "x" ? "u00" : c;
+      } else if (c === "\n") out += "\\n";
+      else if (c === "\r") out += "\\r";
+      else {
+        out += c;
+        if (c === "\\") escaped = true;
+        else if (c === '"') inString = false;
+      }
       continue;
     }
     if (c === '"') {

@@ -1,6 +1,7 @@
 import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, statSync, realpathSync, copyFileSync } from "node:fs";
 import { join, dirname, resolve, relative, sep, posix } from "node:path";
 import type { Manifest } from "../types.js";
+import { parseJsonc } from "../manifest/manifest.js";
 
 /** Names/globs excluded from the clean staged extension. */
 const EXCLUDE_EXACT = new Set([
@@ -246,6 +247,79 @@ function stageLoadedAssets(root: string, realRoot: string, stageDir: string): vo
       }
     }
   }
+}
+
+/**
+ * Whether Firefox's JSON reader (Extension.sys.mjs readJSON) takes `text`: it cuts
+ * `//` comments outside strings, throws on any other `/`, then calls JSON.parse.
+ */
+function firefoxReadsJson(text: string): boolean {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let end = i;
+      do {
+        end = text.indexOf('"', end + 1);
+        if (end === -1) return false;
+        let backslashes = 0;
+        for (let k = end - 1; text[k] === "\\"; k--) backslashes++;
+        if (backslashes % 2 === 0) break;
+      } while (true);
+      out += text.slice(i, end + 1);
+      i = end;
+    } else if (c === "/") {
+      if (text[i + 1] !== "/") return false;
+      const nl = text.indexOf("\n", i + 2);
+      i = (nl === -1 ? text.length : nl) - 1;
+    } else out += c;
+  }
+  try {
+    JSON.parse(out);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rewrite as plain JSON each _locales/<locale>/messages.json that Chrome reads and
+ * Firefox doesn't. Chrome's reader also takes block comments, line breaks inside
+ * strings and \x escapes; Firefox's only cuts // comments, and it refuses the whole
+ * add-on when any locale's catalog fails to parse. A catalog Firefox reads is left
+ * byte for byte, and one Chrome can't read either is left for the analyzer to
+ * report. Returns the rewritten paths.
+ */
+export function normalizeLocaleCatalogs(stageDir: string): string[] {
+  const localesDir = join(stageDir, "_locales");
+  let locales;
+  try {
+    locales = readdirSync(localesDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const rewritten: string[] = [];
+  for (const locale of locales) {
+    if (!locale.isDirectory()) continue;
+    const file = join(localesDir, locale.name, "messages.json");
+    let text: string;
+    try {
+      text = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (firefoxReadsJson(text)) continue;
+    let messages: unknown;
+    try {
+      messages = parseJsonc(text);
+    } catch {
+      continue;
+    }
+    writeFileSync(file, JSON.stringify(messages, null, 2) + "\n", "utf-8");
+    rewritten.push(`_locales/${locale.name}/messages.json`);
+  }
+  return rewritten;
 }
 
 const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
