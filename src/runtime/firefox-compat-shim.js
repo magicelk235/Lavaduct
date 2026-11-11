@@ -1117,12 +1117,13 @@
   //     for the page as the source;
   //   - Client.postMessage fires `message` on the page's navigator.serviceWorker,
   //     queued until the page starts its messages, as in Chrome.
-  // The event page can't answer the pages' requests the way a worker's fetch
-  // handler does, so no page is controlled: `controller` is null and `ready`
-  // gives the worker, as for a page Chrome loaded without its worker. Code that
-  // reads `controller` as "my requests went through the worker" then asks the
-  // worker instead. For the same reason clients.matchAll() lists every page of
-  // the add-on whatever includeUncontrolled says.
+  // Chrome's worker controls the add-on's pages, so `controller` is the worker
+  // and code posts to it there. A worker that handles `fetch` serves its pages'
+  // requests, which the event page can't, so its pages get no controller
+  // (CONFIG.serviceWorkerController is off) and code that reads `controller` as
+  // "my requests went through the worker" asks the worker instead; `ready`
+  // still gives it. clients.matchAll() lists every page of the add-on whatever
+  // includeUncontrolled says.
   var SW_ENVELOPE = "__lavaductServiceWorkerMessage";
 
   function swScriptUrl() {
@@ -1254,7 +1255,7 @@
       return url === undefined || String(url).indexOf(ORIGIN + "/") === 0 || !/^[a-z][a-z0-9+.-]*:/i.test(String(url));
     }
     Object.defineProperties(container, {
-      controller: { value: null, enumerable: true },
+      controller: { value: CONFIG.serviceWorkerController ? worker : null, enumerable: true },
       ready: { value: Promise.resolve(registration), enumerable: true },
       getRegistration: { value: function (url) { return Promise.resolve(inScope(url) ? registration : undefined); }, writable: true, configurable: true },
       getRegistrations: { value: function () { return Promise.resolve([registration]); }, writable: true, configurable: true },

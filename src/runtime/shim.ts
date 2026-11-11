@@ -149,9 +149,10 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
     serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
+    serviceWorkerController: config.serviceWorker === true && usage.serviceWorkerClients && !workerHandlesFetch(dir, config.serviceWorkerScript ?? ""),
     serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
-    serviceWorkerLocks: config.serviceWorker === true && usage.locks,
     serviceWorkerLifecycle: config.serviceWorker === true && usage.serviceWorkerLifecycle,
+    serviceWorkerLocks: config.serviceWorker === true && usage.locks,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
@@ -732,6 +733,48 @@ function insideStage(dir: string, rootRel: string): boolean {
   const root = resolve(dir);
   const rel = relative(root, resolve(root, rootRel.replace(/^\/+/, "")));
   return rel !== "" && rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel);
+}
+
+const FETCH_HANDLER_RE = /\bonfetch\s*=(?!=)|\baddEventListener\s*\(\s*["'`]fetch["'`]/;
+const IMPORT_SCRIPTS_CALL_RE = /\bimportScripts\s*\(([^)]*)\)/g;
+const STATIC_IMPORT_RE = /(?:^|[;\s}])(?:import|export)\s*(?:[\w$*{},\s]+?\s*from\s*)?["']([^"']+)["']/g;
+
+/**
+ * Whether the Chrome background worker handles `fetch`: its script or one it
+ * pulls in with importScripts() or a static import sets onfetch or listens for
+ * "fetch". Such a worker serves requests its pages make, which the event page
+ * can't, so its pages mustn't be told they are controlled. Ported from
+ * aqueduct's backgroundHandlesFetch. Paths come from the untrusted bundle, so
+ * nothing outside the staged add-on is read.
+ */
+export function workerHandlesFetch(dir: string, worker: string): boolean {
+  const entry = worker.replace(/^(?:\.?\/)+/, "");
+  if (!entry) return false;
+  const seen = new Set<string>();
+  const queue = [entry];
+  while (queue.length > 0 && seen.size < 200) {
+    const rel = queue.shift() as string;
+    if (seen.has(rel) || !insideStage(dir, rel)) continue;
+    seen.add(rel);
+    let src: string;
+    try {
+      src = readFileSync(join(dir, rel), "utf-8");
+    } catch {
+      continue;
+    }
+    if (FETCH_HANDLER_RE.test(src)) return true;
+    const refs: string[] = [];
+    for (const m of src.matchAll(IMPORT_SCRIPTS_CALL_RE)) {
+      for (const lit of rootLiteralsFromGetURL(m[1]).matchAll(/["'`]([^"'`]+)["'`]/g)) refs.push(lit[1]);
+    }
+    for (const m of src.matchAll(STATIC_IMPORT_RE)) refs.push(m[1]);
+    for (const ref of refs) {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(ref)) continue;
+      const next = ref.startsWith("/") ? ref.slice(1) : join(dirname(rel), ref).split(sep).join("/");
+      if (!seen.has(next)) queue.push(next);
+    }
+  }
+  return false;
 }
 
 function isFile(path: string): boolean {
