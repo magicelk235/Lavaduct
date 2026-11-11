@@ -71,6 +71,42 @@ const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
+// A listener added with a last argument that can be false: a falsy literal,
+// which is what a Chrome build compiles `isFirefox && { … }` to, or an `&&`
+// expression that isn't a conditional.
+const ADD_LISTENER_RE = /\.\s*addListener\s*\(/g;
+const FALSY_LITERAL_RE = /^(?:!\s*1|false|0|""|''|null|void\s+0)$/;
+
+// Whether a call in `src` passes addListener a last argument that may be false.
+function hasFalsyListenerArg(src: string): boolean {
+  if (!src.includes("addListener")) return false;
+  ADD_LISTENER_RE.lastIndex = 0;
+  for (let m = ADD_LISTENER_RE.exec(src); m; m = ADD_LISTENER_RE.exec(src)) {
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    let lastComma = -1;
+    let and = false;
+    let conditional = false;
+    const close = walkCode(src, open, (c, i) => {
+      if (c === "(" || c === "[" || c === "{") depth++;
+      else if (c === ")" || c === "]" || c === "}") {
+        depth--;
+        if (depth === 0) return true;
+      } else if (depth === 1) {
+        if (c === ",") {
+          lastComma = i;
+          and = conditional = false;
+        } else if (c === "&" && src[i + 1] === "&") and = true;
+        else if (c === "?" && src[i + 1] !== "?" && src[i + 1] !== "." && src[i - 1] !== "?") conditional = true;
+      }
+      return false;
+    });
+    if (close < 0) continue;
+    if (lastComma < 0) continue;
+    if (FALSY_LITERAL_RE.test(src.slice(lastComma + 1, close).trim()) || (and && !conditional)) return true;
+  }
+  return false;
+}
 
 interface Usage {
   favicon: boolean;
@@ -84,13 +120,14 @@ interface Usage {
   permissions: boolean;
   extraHeaders: boolean;
   messaging: boolean;
+  falsyListenerArg: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false, permissions: false,
-    extraHeaders: false, messaging: false,
+    extraHeaders: false, messaging: false, falsyListenerArg: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -112,6 +149,7 @@ function scanUsage(dir: string): Usage {
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
+      if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
     }
   }
   return found;
@@ -153,6 +191,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
     extraHeaders: usage.extraHeaders,
     messageJson: usage.messaging,
+    falsyListenerArgs: usage.falsyListenerArg,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
