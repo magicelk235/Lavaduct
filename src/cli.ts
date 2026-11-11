@@ -608,19 +608,21 @@ async function main(): Promise<void> {
   setVerbose(values.verbose);
   setQuiet(values.quiet && !values.verbose);
 
+  // Meta flags read no config: a broken config file mustn't hide the version or the help.
+  if (values.version) {
+    console.log(pkgVersion());
+    return;
+  }
+  if (values.help) {
+    console.log(HELP);
+    return;
+  }
+
   // Overlay the config before validating, so config values are checked like flags.
   const config = applyConfig(values as Record<string, unknown>, values.config, process.argv.slice(2));
   if (config.path) info(`Using config ${config.path}`);
   const flagCredentials = { key: values["amo-key"], secret: values["amo-secret"] };
 
-  if (values.version) {
-    console.log(pkgVersion());
-    process.exit(0);
-  }
-  if (values.help) {
-    console.log(HELP);
-    process.exit(0);
-  }
   try {
     if (values.doctor) {
       process.exitCode = await doctor({ flag: flagCredentials, config: config.credentials }, config.path, values.firefox);
