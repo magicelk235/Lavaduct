@@ -139,5 +139,54 @@
       });
     });
   });
+
+  // In Chrome a web page's message never reaches runtime.onConnect, so the
+  // extension's onConnect listeners may take every port for one of their own:
+  // keep one per tab, or disconnect a name they don't know, which would cost
+  // the page its answer. The relay's ports are kept from them; everything else
+  // reaches them as before, and removeListener and hasListener take the
+  // functions the extension added.
+  function hideRelayPorts(ns) {
+    var rt = ns.runtime;
+    var ev = rt && rt.onConnect;
+    if (!ev || typeof ev.addListener !== "function") return;
+    var nativeAdd = ev.addListener;
+    var nativeRemove = typeof ev.removeListener === "function" ? ev.removeListener : null;
+    var nativeHas = typeof ev.hasListener === "function" ? ev.hasListener : null;
+    var wrappers = new WeakMap();
+    var wrapperOf = function (fn) {
+      return typeof fn === "function" ? wrappers.get(fn) : undefined;
+    };
+    var add = function (fn) {
+      var args = Array.prototype.slice.call(arguments);
+      if (typeof fn === "function") {
+        var w = wrappers.get(fn);
+        if (!w) {
+          w = function (port) {
+            if (port && port.name === PORT_NAME) return undefined;
+            return fn.apply(this, arguments);
+          };
+          wrappers.set(fn, w);
+        }
+        args[0] = w;
+      }
+      return nativeAdd.apply(ev, args);
+    };
+    var remove = function (fn) {
+      return nativeRemove ? nativeRemove.call(ev, wrapperOf(fn) || fn) : undefined;
+    };
+    var has = function (fn) {
+      return nativeHas ? nativeHas.call(ev, wrapperOf(fn) || fn) : false;
+    };
+    if (setMethod(ev, "addListener", add)) {
+      setMethod(ev, "removeListener", remove);
+      setMethod(ev, "hasListener", has);
+      return;
+    }
+    // The event object's methods can't be replaced; put a forwarding event in
+    // its place instead.
+    setMethod(rt, "onConnect", { addListener: add, removeListener: remove, hasListener: has });
+  }
+  namespaces.forEach(hideRelayPorts);
   // __FRAME_GRANTS__
 })();
