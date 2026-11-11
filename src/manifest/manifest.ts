@@ -246,6 +246,21 @@ function invalidResourceMatches(m: Manifest): string[] {
   return out;
 }
 
+// Firefox's ExtensionID (toolkit/components/extensions/schemas/manifest.json): a GUID
+// in braces or name@domain. web_accessible_resources extension_ids also takes "*".
+const FIREFOX_EXTENSION_ID_RE = /^(?:\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}|[a-z0-9-._]*@[a-z0-9-._]+)$/i;
+const resourceExtensionIdOk = (id: unknown): id is string => typeof id === "string" && (id === "*" || FIREFOX_EXTENSION_ID_RE.test(id));
+
+// web_accessible_resources extension_ids Firefox refuses: Chrome's 32-letter IDs.
+function invalidResourceExtensionIds(m: Manifest): string[] {
+  const out: string[] = [];
+  for (const entry of Array.isArray(m.web_accessible_resources) ? m.web_accessible_resources : []) {
+    if (typeof entry !== "object" || entry === null || !("extension_ids" in entry)) continue;
+    for (const id of strings(entry.extension_ids)) if (!resourceExtensionIdOk(id)) out.push(id);
+  }
+  return out;
+}
+
 // A search engine icon given as a web address, which Firefox's Manifest V3 refuses
 // (favicon_url is a strictRelativeUrl there).
 function remoteSearchFavicon(m: Manifest): string | null {
@@ -666,6 +681,18 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     });
   }
 
+  const badIds = [...new Set(invalidResourceExtensionIds(m))];
+  if (badIds.length) {
+    issues.push({
+      severity: "info",
+      category: "resources",
+      message: `web_accessible_resources extension_ids lists ${badIds.join(", ")}, which Firefox refuses along with the whole manifest (it only takes add-on IDs and "*"); the IDs are removed, and an entry left matching nothing goes with it.`,
+      file: "manifest.json",
+      fix: "Those extensions have other IDs in Firefox; list their Firefox add-on IDs to share the files with them.",
+      autoFixed: true,
+    });
+  }
+
   const favicon = remoteSearchFavicon(m);
   if (favicon !== null) {
     issues.push({
@@ -959,6 +986,11 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     out.web_accessible_resources = out.web_accessible_resources.filter((entry: unknown) => {
       if (typeof entry !== "object" || entry === null) return true;
       Reflect.deleteProperty(entry, "use_dynamic_url");
+      if ("extension_ids" in entry && Array.isArray(entry.extension_ids)) {
+        const ids = entry.extension_ids.filter(resourceExtensionIdOk);
+        if (ids.length) entry.extension_ids = ids;
+        else Reflect.deleteProperty(entry, "extension_ids");
+      }
       // Chrome takes use_dynamic_url as an entry's only key besides resources, and
       // such an entry opens its files to no web page. Firefox refuses the whole
       // manifest over an entry with neither matches nor extension_ids.
@@ -971,7 +1003,7 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
         return true;
       }
       Reflect.deleteProperty(entry, "matches");
-      return "extension_ids" in entry && strings(entry.extension_ids).length > 0;
+      return "extension_ids" in entry;
     });
   }
 
