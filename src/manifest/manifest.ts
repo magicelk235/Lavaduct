@@ -485,11 +485,13 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   }
 
   for (const perm of optional) {
-    if (INSTALL_TIME_PERMISSIONS[perm] !== true || required.includes(perm)) continue;
+    if (!Object.hasOwn(INSTALL_TIME_PERMISSIONS, perm) || required.includes(perm)) continue;
     issues.push({
       severity: "warning",
       category: "permission",
-      message: `Optional permission "${perm}" moves to permissions: Firefox grants it at install without a prompt and ignores it in optional_permissions.`,
+      message: INSTALL_TIME_PERMISSIONS[perm]
+        ? `Optional permission "${perm}" moves to permissions: Firefox ignores it in optional_permissions, so it asks for it at install instead.`
+        : `Optional permission "${perm}" moves to permissions: Firefox grants it at install without a prompt and ignores it in optional_permissions.`,
       file: "manifest.json",
       fix: `permissions.request() for "${perm}" throws in Firefox; it is already granted, so check it with permissions.contains() first.`,
       autoFixed: true,
@@ -922,10 +924,10 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   const optional = Array.isArray(out.optional_permissions) ? out.optional_permissions.map(withoutPortWildcard).filter(keep) : [];
   const permissions = [
     ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] !== true),
-    ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] === true && !required.includes(p)),
+    ...optional.filter((p) => Object.hasOwn(INSTALL_TIME_PERMISSIONS, p) && !required.includes(p)),
   ];
   const optionalPermissions = [
-    ...optional.filter((p) => INSTALL_TIME_PERMISSIONS[p] !== true),
+    ...optional.filter((p) => !Object.hasOwn(INSTALL_TIME_PERMISSIONS, p)),
     ...required.filter((p) => OPTIONAL_ONLY_PERMISSIONS[p] === true && !optional.includes(p)),
   ];
   // Chrome leaves blocking webRequest to policy-installed MV3 extensions, so store

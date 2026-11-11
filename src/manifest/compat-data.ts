@@ -19,19 +19,21 @@ export function compareFirefoxVersions(a: string, b: string): number {
 }
 
 /**
- * Permissions Firefox grants at install without a prompt and ignores in
- * optional_permissions (PermissionNoPrompt in Firefox's manifest schema). The transform
- * moves them from optional_permissions to permissions; there is no prompt either way.
+ * Permissions Firefox only grants at install and ignores in optional_permissions
+ * (PermissionNoPrompt, and declarativeNetRequest, which is a plain Permission, in
+ * Firefox's manifest schemas). The transform moves them from optional_permissions to
+ * permissions. Value: whether Firefox asks for the permission at install.
  * browser-compat-data still lists contextMenus as optional, which current Firefox drops.
  */
-export const INSTALL_TIME_PERMISSIONS: Record<string, true> = {
-  alarms: true,
-  contextMenus: true,
-  declarativeNetRequestWithHostAccess: true,
-  dns: true,
-  identity: true,
-  storage: true,
-  unlimitedStorage: true,
+export const INSTALL_TIME_PERMISSIONS: Record<string, boolean> = {
+  alarms: false,
+  contextMenus: false,
+  declarativeNetRequest: true,
+  declarativeNetRequestWithHostAccess: false,
+  dns: false,
+  identity: false,
+  storage: false,
+  unlimitedStorage: false,
 };
 
 /**

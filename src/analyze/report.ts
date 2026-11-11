@@ -31,7 +31,7 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   const toRequired = optional.filter((p) => !required.includes(p) && requiredAfter.includes(p));
   const toOptional = required.filter((p) => !optional.includes(p) && optionalAfter.includes(p));
   const quoted = (list: string[]) => list.map((p) => `\`${p}\``).join(", ");
-  if (toRequired.length) out.push(`Moved ${quoted(toRequired)} from \`optional_permissions\` to \`permissions\` (Firefox grants ${toRequired.length > 1 ? "them" : "it"} at install, without a prompt).`);
+  if (toRequired.length) out.push(`Moved ${quoted(toRequired)} from \`optional_permissions\` to \`permissions\` (Firefox only grants ${toRequired.length > 1 ? "them" : "it"} at install).`);
   if (toOptional.length) out.push(`Moved ${quoted(toOptional)} from \`permissions\` to \`optional_permissions\` (Firefox only grants ${toOptional.length > 1 ? "them" : "it"} at runtime).`);
 
   // A pattern that only lost its port wildcard is kept, not removed.
