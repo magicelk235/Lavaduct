@@ -170,8 +170,17 @@ function httpGet(
     deadline = setTimeout(() => {
       req.destroy(new Error(`Timed out after ${TOTAL_TIMEOUT_MS}ms fetching ${url}`));
     }, Math.max(0, deadlineAt - Date.now()));
-    req.on("error", (e) => done(() => reject(e)));
+    req.on("error", (e) => done(() => reject(connectError(e, url))));
   });
+}
+
+/** Node tries every address a host resolves to and, when all of them fail,
+ * rejects with an AggregateError whose own message is empty. Name the URL and
+ * each address's reason instead, so the CLI never prints a bare "✗". */
+function connectError(e: Error, url: string): Error {
+  if (!(e instanceof AggregateError) || e.message) return e;
+  const reasons = e.errors.map((x) => (x as Error)?.message).filter(Boolean);
+  return new Error(`${reasons.join("; ") || (e as NodeJS.ErrnoException).code || "Connection failed"} fetching ${url}`, { cause: e });
 }
 
 /** Sniff CRX/ZIP magic; fall back to the URL's extension. `url` may be "" (store
