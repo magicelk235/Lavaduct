@@ -1549,10 +1549,22 @@
   var DNR_DOMAIN_CONDITIONS = ["requestDomains", "excludedRequestDomains", "initiatorDomains", "excludedInitiatorDomains"];
   var DNR_MISSING_TYPES = { webbundle: true, webtransport: true };
 
+  // Chrome's extension ID is the host of its own origin, so code names it in a
+  // rule's domains to mean its own requests: initiatorDomains: [chrome.runtime.id].
+  // Firefox's add-on ID isn't a domain, and its pages' host is a per-install
+  // UUID, so the add-on's ID, and its Chrome ID written into the code, become
+  // that host.
+  var OWN_HOST = "";
+  try { OWN_HOST = new URL(ORIGIN + "/").host; } catch (e) {}
+  var ownIds = {};
+  try { ownIds[String(api.runtime.id).toLowerCase()] = true; } catch (e) {}
+  if (CONFIG.extensionId) ownIds[String(CONFIG.extensionId).toLowerCase()] = true;
+
   // Chrome lower-cases a rule's domains, and Firefox refuses an upper-case one.
   function firefoxDomain(d) {
     if (typeof d !== "string") return d;
     var lower = d.toLowerCase();
+    if (OWN_HOST && ownIds[lower] === true) return OWN_HOST;
     if (lower.indexOf(":") < 0 || lower.charAt(0) === "[") return lower;
     try { return new URL("http://[" + lower + "]/").hostname; } catch (e) { return d; }
   }
