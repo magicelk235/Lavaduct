@@ -151,28 +151,44 @@ export function procLocksHolder(procLocks: string, inode: bigint): { pid: number
   return undefined;
 }
 
+function readProcLocks(): string | undefined {
+  try {
+    return readFileSync("/proc/locks", "utf-8");
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Firefox holds an fcntl lock on `.parentlock` and also writes a `lock`
- * symlink. /proc/locks shows the fcntl lock with a PID from this process's
- * namespace, which also covers the Flatpak's sandboxed Firefox. The symlink is
- * the fallback where /proc/locks isn't available.
+ * symlink to `<ip>:+<pid>`. /proc/locks shows the fcntl lock with a PID from
+ * this process's namespace, which also covers the Flatpak's sandboxed Firefox.
+ * Where fcntl locks fail (NFS without a lock daemon), Firefox locks with the
+ * symlink alone, written without the `+`. The symlink is also the fallback
+ * where /proc/locks isn't available.
  */
-function lockState(profilePath: string): { locked: boolean; pid?: number } {
+export function lockState(
+  profilePath: string,
+  readLocks: () => string | undefined = readProcLocks,
+): { locked: boolean; pid?: number } {
+  const symlink = join(profilePath, "lock");
   const stat = statSync(join(profilePath, ".parentlock"), { bigint: true, throwIfNoEntry: false });
   if (stat) {
-    let procLocks: string | undefined;
-    try {
-      procLocks = readFileSync("/proc/locks", "utf-8");
-    } catch {
-      procLocks = undefined;
-    }
+    const procLocks = readLocks();
     if (procLocks !== undefined) {
       const holder = procLocksHolder(procLocks, stat.ino);
-      if (!holder) return { locked: false };
-      return { locked: true, pid: holder.pid > 0 ? holder.pid : undefined };
+      if (holder) return { locked: true, pid: holder.pid > 0 ? holder.pid : undefined };
+      let target: string | undefined;
+      try {
+        target = readlinkSync(symlink);
+      } catch {
+        target = undefined;
+      }
+      // A `+` symlink without its fcntl lock is what a Firefox that died left.
+      if (target === undefined || target.includes(":+")) return { locked: false };
     }
   }
-  const pid = symlinkLockHolder(join(profilePath, "lock"));
+  const pid = symlinkLockHolder(symlink);
   return { locked: pid !== undefined, pid };
 }
 
