@@ -750,14 +750,20 @@ async function main(): Promise<void> {
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
 
+  // An input that can't be read fails only itself. --analyze --json answers in
+  // JSON, as analyzeOnly does, and stdout is left to drain rather than cut off by exit().
+  const inputFailed = (msg: string) => {
+    if (values.analyze && values.json) console.log(JSON.stringify({ error: msg, convertible: false }, null, 2));
+    else fail(msg);
+    anyFailed = true;
+  };
+
   for (const input of inputs) {
     if (batch) console.error(`\n${color("bold", `── ${basename(input)} ──`)}`);
 
     // Checked per input, so one bad path doesn't stop the rest of a batch.
     if (!isUrl(input) && !existsSync(input)) {
-      fail(`Input not found: ${input}`);
-      if (!batch) process.exit(1);
-      anyFailed = true;
+      inputFailed(`Input not found: ${input}`);
       continue;
     }
 
@@ -771,9 +777,7 @@ async function main(): Promise<void> {
         try {
           localInput = await downloadExtension(input, dlScratch);
         } catch (e) {
-          fail((e as Error).message);
-          if (!batch) process.exit(1);
-          anyFailed = true;
+          inputFailed((e as Error).message);
           continue;
         }
         ok(`Downloaded → ${basename(localInput)}`);
