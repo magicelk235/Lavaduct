@@ -1424,9 +1424,11 @@
   // Chrome worker restarted after its install is in. No update ever arrives, so
   // the registration's events never fire. Its postMessage reaches the worker
   // itself, with the worker as the source, as in Chrome. Only emitted for a
-  // bundle that reads them.
+  // bundle that reads them. A bundle with web push code gets the worker without
+  // the registration (see PUSH_MANAGER_REF_RE in shim.ts): MetaMask boots on
+  // `"activated" === self.serviceWorker.state` and carries Firebase's push code.
   function installServiceWorkerRegistration() {
-    if (!CONFIG.serviceWorkerRegistration || !isBackground || typeof EventTarget !== "function") return;
+    if (!CONFIG.serviceWorkerSelf || !isBackground || typeof EventTarget !== "function") return;
     var worker = makeServiceWorker(function postMessage(message, transfer) {
       var list = transferList(transfer);
       var copy = structuredClone({ m: message, t: list }, { transfer: list });
@@ -1441,7 +1443,7 @@
       }, 0);
     });
     defineMissing(G, "serviceWorker", worker);
-    defineMissing(G, "registration", makeRegistration(worker));
+    if (CONFIG.serviceWorkerRegistration) defineMissing(G, "registration", makeRegistration(worker));
   }
 
   // ── The worker's location in Web Lock names ────────────────────────────────

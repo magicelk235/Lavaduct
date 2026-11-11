@@ -65,6 +65,10 @@ const SW_CLIENTS_REF_RE = /\b(?:self|globalThis)\s*\.\s*clients\b|\bclients\s*\.
 // Firefox gives add-ons no Push API, so it must keep finding none.
 const SW_REGISTRATION_REF_RE = /\b(?:self|globalThis)\s*\.\s*registration\s*(?:\?\.|\.)\s*(?:active|installing|waiting|scope|addEventListener|update|unregister)\b/;
 const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
+// The worker's own state (`self.serviceWorker.state`), read through any alias
+// of self, which minifiers introduce: `"activated" === a.serviceWorker.state`.
+// A ServiceWorker object has no pushManager, so web push doesn't rule it out.
+const SW_STATE_REF_RE = /\.\s*serviceWorker\s*(?:\?\.|\.)\s*state\b/;
 const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
@@ -79,6 +83,7 @@ interface Usage {
   serviceWorkerScope: boolean;
   serviceWorkerClients: boolean;
   serviceWorkerRegistration: boolean;
+  serviceWorkerState: boolean;
   pushManager: boolean;
   locks: boolean;
   permissions: boolean;
@@ -89,7 +94,7 @@ interface Usage {
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
-    serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, locks: false, permissions: false,
+    serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, locks: false, permissions: false,
     extraHeaders: false, messaging: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -107,6 +112,7 @@ function scanUsage(dir: string): Usage {
       if (!found.serviceWorkerScope) found.serviceWorkerScope = SW_SCOPE_REF_RE.test(src);
       if (!found.serviceWorkerClients) found.serviceWorkerClients = SW_CLIENTS_REF_RE.test(src);
       if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
+      if (!found.serviceWorkerState) found.serviceWorkerState = SW_STATE_REF_RE.test(src);
       if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
@@ -146,6 +152,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
     serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
+    serviceWorkerSelf: config.serviceWorker === true && (usage.serviceWorkerState || (usage.serviceWorkerRegistration && !usage.pushManager)),
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
     userScriptEvents: config.userScripts === true,
