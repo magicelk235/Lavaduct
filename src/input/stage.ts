@@ -1,5 +1,5 @@
 import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, statSync, realpathSync, copyFileSync } from "node:fs";
-import { join, dirname, resolve, relative, sep } from "node:path";
+import { join, dirname, resolve, relative, sep, posix } from "node:path";
 import type { Manifest } from "../types.js";
 
 /** Names/globs excluded from the clean staged extension. */
@@ -107,21 +107,130 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
     // got staged means an ancestor directory was a symlink (dropped by the filter),
     // so fall through and dereference it via realpathSync below.
     if (!lst.isSymbolicLink() && existsSync(join(stageDir, rel))) continue;
-    let target;
-    try {
-      target = realpathSync(srcLink);
-      // Only follow links whose target stays inside the source tree (compare against
-      // the realpath'd root so a symlinked ancestor like /tmp→/private/tmp doesn't
-      // make an in-tree target look external).
-      if (target !== realRoot && !target.startsWith(realRoot + sep)) { dropped.push(rel); continue; }
-      if (!statSync(target).isFile()) { dropped.push(rel); continue; }
-    } catch { dropped.push(rel); continue; }
-    const dest = join(stageDir, rel);
-    try { mkdirSync(dirname(dest), { recursive: true }); copyFileSync(target, dest); }
-    catch { dropped.push(rel); }
+    if (!copyInTreeFile(root, realRoot, rel, stageDir)) dropped.push(rel);
   }
 
+  stageLoadedAssets(root, realRoot, stageDir);
   return dropped;
+}
+
+/**
+ * Copy root/rel to stageDir/rel, dereferencing a symlink only when its target is a
+ * regular file inside the source tree (compared against the realpath'd root so a
+ * symlinked ancestor like /tmp→/private/tmp doesn't make an in-tree target look
+ * external). False when nothing was copied.
+ */
+function copyInTreeFile(root: string, realRoot: string, rel: string, stageDir: string): boolean {
+  let target;
+  try {
+    target = realpathSync(join(root, rel));
+    if (target !== realRoot && !target.startsWith(realRoot + sep)) return false;
+    if (!statSync(target).isFile()) return false;
+  } catch { return false; }
+  const dest = join(stageDir, rel);
+  try { mkdirSync(dirname(dest), { recursive: true }); copyFileSync(target, dest); }
+  catch { return false; }
+  return true;
+}
+
+// The exclusion rules judge files by name, and the manifest only names its entry
+// points, so a file an extension page or script loads by path can be dropped as
+// cruft: `<script src="node_modules/jquery/dist/jquery.min.js">` in a popup,
+// `importScripts("node_modules/…")` in a worker, a stylesheet's `url()` into an
+// excluded folder, an about page linking LICENSE.txt. Chrome serves every file in
+// the package, so each of these 404s only after conversion. Follow the references
+// the staged pages, stylesheets and scripts make and bring back any file they name
+// that staging left out. Only actual loads are followed (attribute values, url()
+// and @import, importScripts, relative import specifiers, getURL and Worker
+// arguments), so a word like "LICENSE" in a comment rescues nothing, and a
+// sourceMappingURL comment is not a load: dropped .map files stay dropped.
+const PAGE_EXTS = [".html", ".htm", ".xhtml"];
+const STYLE_EXTS = [".css"];
+const SCRIPT_EXTS = [".js", ".mjs"];
+const HTML_REF_RE = /\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+))/gi;
+const CSS_REF_RE = /\burl\(\s*(?:"([^"]*)"|'([^']*)'|([^\s"')]+))\s*\)|@import\s+(?:"([^"]*)"|'([^']*)')/gi;
+const SCRIPT_CALL_RE = /\b(?:importScripts|getURL|Worker)\s*\(([^)]*)\)/g;
+const SCRIPT_IMPORT_RE = /(?:\bimport\s*\(?|\bfrom)\s*(?:"(\.{0,2}\/[^"\n]*)"|'(\.{0,2}\/[^'\n]*)')/g;
+const STRING_LITERAL_RE = /"([^"\n]*)"|'([^'\n]*)'|`([^`$\n]*)`/g;
+
+function referencesIn(rel: string, text: string): string[] {
+  const lower = rel.toLowerCase();
+  const refs: string[] = [];
+  const collect = (re: RegExp) => {
+    for (const m of text.matchAll(re)) {
+      const v = m.slice(1).find((g) => g !== undefined);
+      if (v) refs.push(v);
+    }
+  };
+  if (PAGE_EXTS.some((e) => lower.endsWith(e))) {
+    collect(HTML_REF_RE);
+    collect(CSS_REF_RE); // inline <style> and style="" attributes
+  } else if (STYLE_EXTS.some((e) => lower.endsWith(e))) {
+    collect(CSS_REF_RE);
+  } else {
+    for (const m of text.matchAll(SCRIPT_CALL_RE)) {
+      for (const s of m[1].matchAll(STRING_LITERAL_RE)) {
+        const v = s.slice(1).find((g) => g !== undefined);
+        if (v) refs.push(v);
+      }
+    }
+    collect(SCRIPT_IMPORT_RE);
+  }
+  return refs;
+}
+
+/**
+ * Package-relative paths a reference from `fromRel` may point at. Root-absolute
+ * references resolve against the package root. A relative one resolves against
+ * the referencing file, and also against the root, because a script's relative
+ * fetches and getURL calls resolve against its page or the package root, not the
+ * script. Out-of-package and remote references give nothing.
+ */
+function candidatePaths(fromRel: string, ref: string): string[] {
+  let path = ref.trim().split(/[?#]/)[0];
+  if (!path || path.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(path)) return [];
+  try { path = decodeURIComponent(path); } catch { /* keep it as written */ }
+  const out = new Set<string>();
+  const add = (p: string) => {
+    const n = posix.normalize(p);
+    if (n && n !== "." && n !== ".." && !n.startsWith("../") && !posix.isAbsolute(n)) out.add(n);
+  };
+  if (path.startsWith("/")) add(path.slice(1));
+  else {
+    add(posix.join(posix.dirname(fromRel), path));
+    add(path);
+  }
+  return [...out];
+}
+
+function stageLoadedAssets(root: string, realRoot: string, stageDir: string): void {
+  const isText = (rel: string) => {
+    const lower = rel.toLowerCase();
+    return [...PAGE_EXTS, ...STYLE_EXTS, ...SCRIPT_EXTS].some((e) => lower.endsWith(e));
+  };
+  const queue: string[] = [];
+  const walk = (dir: string, rel: string): void => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(join(dir, e.name), r);
+      else if (e.isFile() && isText(r)) queue.push(r);
+    }
+  };
+  walk(stageDir, "");
+  while (queue.length > 0) {
+    const rel = queue.pop() as string;
+    let text: string;
+    try { text = readFileSync(join(stageDir, rel), "utf-8"); } catch { continue; }
+    for (const ref of referencesIn(rel, text)) {
+      for (const cand of candidatePaths(rel, ref)) {
+        if (existsSync(join(stageDir, cand))) continue;
+        // A rescued page or script can load further files itself.
+        if (copyInTreeFile(root, realRoot, cand, stageDir) && isText(cand)) queue.push(cand);
+      }
+    }
+  }
 }
 
 const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
