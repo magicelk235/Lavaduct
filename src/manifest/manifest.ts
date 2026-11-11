@@ -982,6 +982,12 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   // normal and private windows.
   if (out.incognito === "split") delete out.incognito;
 
+  // An extension that only adds rules at runtime may declare rule_resources: [],
+  // which Chrome accepts. Firefox wants at least one ruleset there and refuses the
+  // whole manifest otherwise; the permission alone gives the API.
+  const rules = out.declarative_net_request?.rule_resources;
+  if (Array.isArray(rules) && rules.length === 0) delete out.declarative_net_request;
+
   if (Array.isArray(out.web_accessible_resources)) {
     out.web_accessible_resources = out.web_accessible_resources.filter((entry: unknown) => {
       if (typeof entry !== "object" || entry === null) return true;
