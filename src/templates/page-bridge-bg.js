@@ -125,7 +125,17 @@
       if (!m || m.__pageBridgeRequest !== true) return;
       DBG("[page-bridge] page message from", sender.origin, "listeners:", listeners.length);
       dispatch(m.payload, sender).then(function (response) {
-        try { port.postMessage({ __pageBridgeReply: true, response: response }); } catch (e) {}
+        // Chrome sends the answer to a web page as JSON: functions and undefined
+        // members drop out and toJSON applies. Firefox's structured clone throws
+        // on a function instead, and the page would wait out its timeout.
+        var reply;
+        try {
+          var json = JSON.stringify(response);
+          reply = { __pageBridgeReply: true, response: json === undefined ? undefined : JSON.parse(json) };
+        } catch (e) {
+          reply = { __pageBridgeReply: true, error: "The extension's response could not be serialized." };
+        }
+        try { port.postMessage(reply); } catch (e) {}
       });
     });
   });
