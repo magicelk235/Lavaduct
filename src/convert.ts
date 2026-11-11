@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -554,6 +554,23 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
       fail(`Output directory (${outputDir}) is inside the input extension; staging cannot copy a directory into itself. Pass -o <dir> outside the input.`);
       return result;
     }
+    // An archive input is extracted to scratch, so the checks above can't see it;
+    // the output files and --clean can still destroy the archive itself.
+    const stageDir = join(outputDir, STAGE_DIR);
+    const xpiPath = join(outputDir, `${appName}.xpi`);
+    const zipPath = opts.zip ? join(outputDir, `${appName}.zip`) : undefined;
+    if (statSync(opts.input).isFile()) {
+      const realInput = realOrSelf(opts.input);
+      const target = [xpiPath, zipPath].find((p) => p !== undefined && realOrSelf(p) === realInput);
+      if (target || isInside(realInput, realOrSelf(stageDir))) {
+        fail(`The output would overwrite the input ${opts.input}${target ? ` with ${basename(target)}` : ""}. Pass -o <dir> elsewhere.`);
+        return result;
+      }
+      if (opts.clean && isInside(realInput, realOut)) {
+        fail(`The input ${opts.input} lives in the output directory (${outputDir}), which --clean deletes. Pass -o <dir> elsewhere, or drop --clean.`);
+        return result;
+      }
+    }
     if (opts.clean && existsSync(outputDir)) {
       rmSync(outputDir, { recursive: true, force: true });
       ok(`Cleaned output dir → ${outputDir}`);
@@ -561,7 +578,6 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     mkdirSync(outputDir, { recursive: true });
 
     // Kept in the output directory: a temporary install loads it in place.
-    const stageDir = join(outputDir, STAGE_DIR);
     info("Staging clean extension assets …");
     const { manifest: built, staticRules } = buildAddon({ ...src, permissionsToRemove, addonId }, stageDir, opts, { ok, warn });
     const version = built.version ?? "";
@@ -582,8 +598,6 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     ok(`Report → ${reportPath}`);
 
     info("Packing .xpi");
-    const xpiPath = join(outputDir, `${appName}.xpi`);
-    const zipPath = opts.zip ? join(outputDir, `${appName}.zip`) : undefined;
     let packed: { version: string; xpiPath: string; sha256: string } | undefined;
     // AMO may need the add-on packed again under a higher version.
     const pack = (v: string) => {
