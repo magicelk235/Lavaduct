@@ -1524,39 +1524,74 @@
     });
   }
 
-  // ── chrome://newtab ─────────────────────────────────────────────────────────
+  // ── chrome://newtab and chrome://extensions/shortcuts ──────────────────────
   // tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox
-  // ("Illegal URL"). A bundle that opens Chrome's new tab page gets Firefox's,
-  // which those calls open when given no url. Only emitted for a bundle that
-  // names chrome://newtab.
+  // ("Illegal URL"), and about:newtab and about:home as well. A bundle that
+  // opens Chrome's new tab page gets Firefox's, which tabs.create and
+  // windows.create open when given no url. tabs.update can't navigate a tab to
+  // it, except where the add-on overrides the new tab page itself: chrome://newtab
+  // then shows the add-on's page, as it does in Chrome, in place and in
+  // windows.create lists alike. Chrome's shortcuts page is Firefox's
+  // commands.openShortcutSettings(), which opens about:addons there; the call
+  // answers with the tab that ends up active. Only emitted for a bundle that
+  // names these URLs.
   var NEW_TAB_RE = /^chrome:\/\/new-?tab(?:-page)?\/?$/i;
+  var SHORTCUTS_RE = /^chrome:\/\/extensions\/(?:shortcuts|configureCommands)\/?$/i;
 
-  function installNewTabUrls() {
-    if (!CONFIG.newTab) return;
-    var isNewTab = function (u) { return typeof u === "string" && NEW_TAB_RE.test(u); };
-    function fixed(props) {
+  function installChromeUrls() {
+    if (!CONFIG.newTab && !CONFIG.shortcutsPage) return;
+    var ownNewTab = CONFIG.newTabPage ? extensionUrl(CONFIG.newTabPage) : "";
+    var isNewTab = function (u) { return !!CONFIG.newTab && typeof u === "string" && NEW_TAB_RE.test(u); };
+    var isShortcuts = function (u) { return !!CONFIG.shortcutsPage && typeof u === "string" && SHORTCUTS_RE.test(u); };
+    function fixed(props, inPlace) {
       var url = props.url;
       if (!isNewTab(url) && !(Array.isArray(url) && url.some(isNewTab))) return props;
       var copy = Object.assign({}, props);
-      var rest = Array.isArray(url) ? url.filter(function (u) { return !isNewTab(u); }) : [];
-      if (rest.length) copy.url = rest;
+      var rest = Array.isArray(url)
+        ? (ownNewTab ? url.map(function (u) { return isNewTab(u) ? ownNewTab : u; }) : url.filter(function (u) { return !isNewTab(u); }))
+        : (inPlace && ownNewTab ? ownNewTab : null);
+      if (rest && (!Array.isArray(rest) || rest.length)) copy.url = rest;
       else delete copy.url;
       return copy;
     }
-    function wrap(obj, name) {
+    // Called before anything is awaited, so a user action that opened the call
+    // still counts. Answers with the about:addons tab Firefox opened, or the
+    // active tab of the last focused window when the add-on can't see URLs.
+    function openShortcuts(ns, cb) {
+      var p;
+      try { p = Promise.resolve(ns.commands.openShortcutSettings()); } catch (e) { p = Promise.reject(e); }
+      p = p.then(function () {
+        return api.tabs.query({});
+      }).then(function (tabs) {
+        var list = Array.isArray(tabs) ? tabs : [];
+        var addons = list.filter(function (t) { return t && /^about:addons/.test(String(t.url || "")); });
+        if (addons.length) return addons.filter(function (t) { return t.active; })[0] || addons[0];
+        return Promise.resolve(api.tabs.query({ active: true, lastFocusedWindow: true })).then(function (t) { return t && t[0]; });
+      });
+      return respond(ns, p, cb);
+    }
+    function wrap(ns, obj, name, inPlace, shortcuts) {
       if (!obj || typeof obj[name] !== "function") return;
       var original = obj[name];
       var wrapped = function () {
         var args = Array.prototype.slice.call(arguments);
-        for (var i = 0; i < args.length; i++) if (args[i] && typeof args[i] === "object") args[i] = fixed(args[i]);
+        for (var i = 0; i < args.length; i++) {
+          if (!args[i] || typeof args[i] !== "object") continue;
+          var commands = null;
+          try { commands = ns.commands; } catch (e) {}
+          if (shortcuts && isShortcuts(args[i].url) && commands && typeof commands.openShortcutSettings === "function") {
+            return openShortcuts(ns, typeof args[args.length - 1] === "function" ? args[args.length - 1] : null);
+          }
+          args[i] = fixed(args[i], inPlace);
+        }
         return original.apply(obj, args);
       };
       try { Object.defineProperty(obj, name, { value: wrapped, writable: true, configurable: true, enumerable: true }); } catch (e) {}
     }
     namespaces.forEach(function (ns) {
-      wrap(ns.tabs, "create");
-      wrap(ns.tabs, "update");
-      wrap(ns.windows, "create");
+      wrap(ns, ns.tabs, "create", false, true);
+      wrap(ns, ns.tabs, "update", true, true);
+      wrap(ns, ns.windows, "create", false, false);
     });
   }
 
@@ -2354,7 +2389,7 @@
   try { installServiceWorkerContainer(); } catch (e) { dbg("navigator.serviceWorker shim failed:", errorMessage(e)); }
   try { installServiceWorkerLifecycle(); } catch (e) { dbg("worker lifecycle shim failed:", errorMessage(e)); }
   try { installServiceWorkerLocks(); } catch (e) { dbg("Web Locks shim failed:", errorMessage(e)); }
-  try { installNewTabUrls(); } catch (e) { dbg("new tab URL shim failed:", errorMessage(e)); }
+  try { installChromeUrls(); } catch (e) { dbg("chrome:// URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
   try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
   try { installRuleFilter(); } catch (e) { dbg("declarativeNetRequest rule filter failed:", errorMessage(e)); }

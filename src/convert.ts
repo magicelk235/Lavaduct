@@ -226,6 +226,7 @@ function buildAddon(
       userScripts: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].includes("userScripts"),
       webpackChunkGlobal: workerChunkGlobal(stageDir, manifest),
       declaredPermissions: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].filter((p): p is string => typeof p === "string"),
+      newTabPage: typeof manifest.chrome_url_overrides?.newtab === "string" ? manifest.chrome_url_overrides.newtab : "",
     });
     if (settings.debug) {
       log.ok(`Debug build: shim tracing on, kept in storage.local under ${DEBUG_LOG_KEY} (read it with ${NAME} --logs). Don't ship this build.`);

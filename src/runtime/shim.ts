@@ -44,6 +44,8 @@ export interface ShimConfig {
   userScripts?: boolean;
   /** The Chrome manifest's permissions and optional_permissions, before the transform removes any. */
   declaredPermissions?: string[];
+  /** The Chrome manifest's chrome_url_overrides.newtab: the add-on's own new tab page. */
+  newTabPage?: string;
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
@@ -56,6 +58,7 @@ export interface ShimConfig {
 const FAVICON_REF_RE = /chrome:\/\/favicon|(?:^|[^\w$])_favicon\//m;
 const OFFSCREEN_REF_RE = /\.\s*offscreen\b|\[\s*["']offscreen["']\s*\]/;
 const NEW_TAB_REF_RE = /["'`]chrome:\/\/new-?tab(?:-page)?\/?["'`]/i;
+const SHORTCUTS_REF_RE = /["'`]chrome:\/\/extensions\/(?:shortcuts|configureCommands)\/?["'`]/i;
 const SW_SCOPE_REF_RE = /\bServiceWorkerGlobalScope\b/;
 // The worker's clients (`self.clients`, `clients.matchAll(`, `const { clients } = self`),
 // and its pages' navigator.serviceWorker: the two ends of one channel.
@@ -78,6 +81,7 @@ interface Usage {
   favicon: boolean;
   offscreen: boolean;
   newTab: boolean;
+  shortcutsPage: boolean;
   serviceWorkerScope: boolean;
   serviceWorkerClients: boolean;
   serviceWorkerRegistration: boolean;
@@ -91,7 +95,7 @@ interface Usage {
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
-    favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
+    favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, messaging: false,
   };
@@ -107,6 +111,7 @@ function scanUsage(dir: string): Usage {
     if (/\.m?js$/i.test(file)) {
       if (!found.offscreen) found.offscreen = OFFSCREEN_REF_RE.test(src);
       if (!found.newTab) found.newTab = NEW_TAB_REF_RE.test(src);
+      if (!found.shortcutsPage) found.shortcutsPage = SHORTCUTS_REF_RE.test(src);
       if (!found.serviceWorkerScope) found.serviceWorkerScope = SW_SCOPE_REF_RE.test(src);
       if (!found.serviceWorkerClients) found.serviceWorkerClients = SW_CLIENTS_REF_RE.test(src);
       if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
@@ -146,6 +151,9 @@ function shimSource(dir: string, config: ShimConfig): string {
     favicon: usage.favicon,
     offscreen: usage.offscreen,
     newTab: usage.newTab,
+    // The add-on's own new tab page, which chrome://newtab shows in Chrome.
+    newTabPage: usage.newTab ? (config.newTabPage ?? "").split(/[?#]/)[0].replace(/^\/+/, "") : "",
+    shortcutsPage: usage.shortcutsPage,
     serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
     serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
