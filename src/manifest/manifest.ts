@@ -956,6 +956,21 @@ function withQuery(path: string, query: string | undefined): string {
 }
 
 /**
+ * Give each of `actions` (a page action, a sidebar) the add-on's icons when it
+ * declares none. Chrome shows the extension's icons on an action without
+ * default_icon; Firefox's page action and sidebar show a generic puzzle piece
+ * instead (its browser_action and action fall back to the icons on their own).
+ */
+export function wireActionIcons(actions: Array<Record<string, unknown> | undefined>, icons: Record<string, string>): void {
+  for (const a of actions) {
+    if (!a || typeof a !== "object") continue;
+    const own = a.default_icon;
+    if (typeof own === "string" ? own !== "" : own && typeof own === "object" && Object.keys(own).length > 0) continue;
+    a.default_icon = { ...icons };
+  }
+}
+
+/**
  * Produce the Firefox manifest. Pure: deep-clones its input and writes nothing.
  * `background` is left as it is; wireBackground rewrites it.
  */
@@ -1049,17 +1064,18 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   // never does.
   const sidePanelPath = typeof out.side_panel?.default_path === "string" ? out.side_panel.default_path : "";
   const panel = out.side_panel !== undefined ? sidePanelPath : (opts.sidebarPanel ?? "");
+  const icons = out.icons && typeof out.icons === "object" && Object.keys(out.icons).length ? out.icons : undefined;
   if (!out.sidebar_action && panel) {
     const actionTitle = (out.action ?? out.browser_action ?? out.page_action)?.default_title;
     const title = typeof actionTitle === "string" && actionTitle ? actionTitle : out.name;
     const sidebar: NonNullable<Manifest["sidebar_action"]> = { default_panel: withQuery(panel, opts.sidebarPanelQuery) };
     if (title) sidebar.default_title = title;
-    const icons = out.icons;
-    if (icons && typeof icons === "object" && Object.keys(icons).length) sidebar.default_icon = { ...icons };
+    if (icons) sidebar.default_icon = { ...icons };
     sidebar.open_at_install = false;
     out.sidebar_action = sidebar;
   }
   delete out.side_panel;
+  if (icons) wireActionIcons([out.page_action], icons);
 
   // Firefox would treat "split" as "not_allowed"; without the key the add-on spans
   // normal and private windows.
