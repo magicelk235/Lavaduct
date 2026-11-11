@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, relative, isAbsolute, sep, join } from "node:path";
-import type { Manifest } from "../types.js";
+import type { Issue, Manifest } from "../types.js";
 import { NAME } from "../name.js";
 import { parseJsonc } from "./manifest.js";
 
@@ -18,8 +18,11 @@ export const STATIC_RULES_PREF = "extensions.dnr.guaranteed_minimum_static_rules
 export const CHROME_STATIC_RULE_LIMIT = 330000;
 
 export interface DnrResult {
-  /** What changed in the rulesets, and what Firefox's limits keep from loading. */
-  notes: string[];
+  /**
+   * What changed in the rulesets (info, auto-fixed) and what Firefox won't load or
+   * evaluate (warning), as issues of category "dnr" for the analysis and the report.
+   */
+  notes: Issue[];
   /** Rules across all the add-on's rulesets, enabled or not, after the rewrite. */
   staticRules: number;
 }
@@ -200,7 +203,10 @@ function adaptRule(rule: unknown): RuleOutcome {
  * limits on enabled rulesets, static rules and regex rules would make it ignore.
  */
 export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
-  const notes: string[] = [];
+  const notes: Issue[] = [];
+  const lost = (message: string, file?: string) => notes.push({ severity: "warning", category: "dnr", message, ...(file ? { file } : {}) });
+  const fixed = (message: string, file?: string) =>
+    notes.push({ severity: "info", category: "dnr", message, ...(file ? { file } : {}), autoFixed: true });
   const loaded: Array<{ id: string; enabled: boolean; rules: unknown[] | null }> = [];
   const resources = manifest.declarative_net_request?.rule_resources;
   const redirectFiles = new Map<string, string>();
@@ -209,7 +215,7 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
 
   for (const res of Array.isArray(resources) ? resources : []) {
     if (!res || typeof res.path !== "string") {
-      notes.push("A DNR rule_resources entry has no valid 'path'; Firefox can't load it.");
+      lost("A DNR rule_resources entry has no valid 'path'; Firefox can't load it.", "manifest.json");
       continue;
     }
     const id = typeof res.id === "string" ? res.id : res.path;
@@ -218,11 +224,11 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
 
     const file = resolveInside(stageDir, res.path);
     if (file === null) {
-      notes.push(`DNR ruleset "${id}" path ${res.path} points outside the extension; left untouched.`);
+      lost(`DNR ruleset "${id}" path ${res.path} points outside the extension; left untouched.`, "manifest.json");
       continue;
     }
     if (!existsSync(file)) {
-      notes.push(`DNR ruleset "${id}" points to missing file ${res.path}; Firefox can't load it.`);
+      lost(`DNR ruleset "${id}" points to missing file ${res.path}; Firefox can't load it.`, "manifest.json");
       continue;
     }
     // Firefox reads rule files with a strict JSON parser; Chrome tolerates comments and
@@ -237,12 +243,12 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
       try {
         rules = parseJsonc(text);
       } catch {
-        notes.push(`DNR ruleset "${id}" (${res.path}) is not valid JSON; Firefox can't load it.`);
+        lost(`DNR ruleset "${id}" (${res.path}) is not valid JSON; Firefox can't load it.`, res.path);
         continue;
       }
     }
     if (!Array.isArray(rules)) {
-      notes.push(`DNR ruleset "${id}" (${res.path}) is not a JSON array of rules; Firefox can't load it.`);
+      lost(`DNR ruleset "${id}" (${res.path}) is not a JSON array of rules; Firefox can't load it.`, res.path);
       continue;
     }
 
@@ -273,13 +279,19 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
     }
     if (removed.length) {
       const shown = removed.slice(0, 10).join(", ") + (removed.length > 10 ? `, and ${removed.length - 10} more` : "");
-      notes.push(`DNR ruleset "${id}" (${res.path}): removed ${removed.length} rule(s) Firefox can't evaluate the way Chrome does: ${shown}.`);
+      notes.push({
+        severity: "warning",
+        category: "dnr",
+        message: `DNR ruleset "${id}" (${res.path}): removed ${removed.length} rule(s) Firefox can't evaluate the way Chrome does: ${shown}.`,
+        file: res.path,
+        autoFixed: true,
+      });
     }
     if (renamed) {
-      notes.push(`DNR ruleset "${id}": renamed domains/excludedDomains to initiatorDomains/excludedInitiatorDomains in ${renamed} rule(s); Firefox only knows the new names.`);
+      fixed(`DNR ruleset "${id}": renamed domains/excludedDomains to initiatorDomains/excludedInitiatorDomains in ${renamed} rule(s); Firefox only knows the new names.`, res.path);
     }
     if (narrowed) {
-      notes.push(`DNR ruleset "${id}": removed the webbundle/webtransport resource types from ${narrowed} rule(s); Firefox never makes those requests.`);
+      fixed(`DNR ruleset "${id}": removed the webbundle/webtransport resource types from ${narrowed} rule(s); Firefox never makes those requests.`, res.path);
     }
     if (redirected) {
       redirectedRules += redirected;
@@ -288,7 +300,7 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
   }
   if (redirectFiles.size) {
     exposeRedirectFiles(manifest);
-    notes.push(`${redirectedRules} DNR rule(s) in ${redirectedSets} ruleset(s) redirect to data: URLs, which Firefox refuses; they redirect to the same content in ${REDIRECT_DIR}/ instead.`);
+    fixed(`${redirectedRules} DNR rule(s) in ${redirectedSets} ruleset(s) redirect to data: URLs, which Firefox refuses; they redirect to the same content in ${REDIRECT_DIR}/ instead.`);
   }
 
   // Replay Firefox's start-up: enabled rulesets load in manifest order, the cap on
@@ -314,11 +326,11 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
         "regexFilter" in r.condition && !!r.condition.regexFilter,
     ).length;
     if (rules.length > rulesLeft) {
-      notes.push(`DNR ruleset "${id}" would take the enabled static rules past Firefox's default limit of ${GUARANTEED_MINIMUM_STATIC_RULES} (it has ${rules.length} rules and ${rulesLeft} are left), so Firefox ignores the whole ruleset unless the profile raises ${STATIC_RULES_PREF}, which --install does.`);
+      lost(`DNR ruleset "${id}" would take the enabled static rules past Firefox's default limit of ${GUARANTEED_MINIMUM_STATIC_RULES} (it has ${rules.length} rules and ${rulesLeft} are left), so Firefox ignores the whole ruleset unless the profile raises ${STATIC_RULES_PREF}, which --install does.`, "manifest.json");
       continue;
     }
     if (regexRules > regexLeft) {
-      notes.push(`DNR ruleset "${id}" has ${regexRules} regexFilter rules, past Firefox's limit of ${MAX_REGEX_RULES} (${regexLeft} are left), so Firefox ignores the whole ruleset.`);
+      lost(`DNR ruleset "${id}" has ${regexRules} regexFilter rules, past Firefox's limit of ${MAX_REGEX_RULES} (${regexLeft} are left), so Firefox ignores the whole ruleset.`, "manifest.json");
       continue;
     }
     rulesLeft -= rules.length;
@@ -326,7 +338,7 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
     enabled++;
   }
   if (overflow.length) {
-    notes.push(`Firefox enables at most ${MAX_ENABLED_STATIC_RULESETS} static DNR rulesets and ignores the rest: ${overflow.join(", ")}.`);
+    lost(`Firefox enables at most ${MAX_ENABLED_STATIC_RULESETS} static DNR rulesets and ignores the rest: ${overflow.join(", ")}.`, "manifest.json");
   }
   return { notes, staticRules };
 }

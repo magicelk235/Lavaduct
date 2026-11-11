@@ -3,7 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
-import { applyDnr } from "../dist/manifest/dnr.js";
+import { applyDnr as applyDnrIssues } from "../dist/manifest/dnr.js";
+
+// The notes are issues for the report; these tests read their messages.
+function applyDnr(dir, manifest) {
+  const result = applyDnrIssues(dir, manifest);
+  for (const note of result.notes) assert.equal(note.category, "dnr");
+  return { ...result, notes: result.notes.map((n) => n.message) };
+}
 
 function stage(files) {
   const dir = mkdtempSync(join(tmpdir(), "lavaduct-dnr-"));

@@ -52,7 +52,8 @@ export interface ShimConfig {
 // to be a service worker changes what code testing for one does, and so do the
 // service worker's `clients` and `registration` in the background and
 // navigator.serviceWorker in the extension's pages; the background's Web Lock
-// names are translated only for code that takes locks.
+// names are translated only for code that takes locks, and getManifest() gains
+// the worker's script only for code that reads service_worker.
 const FAVICON_REF_RE = /chrome:\/\/favicon|(?:^|[^\w$])_favicon\//m;
 const OFFSCREEN_REF_RE = /\.\s*offscreen\b|\[\s*["']offscreen["']\s*\]/;
 const NEW_TAB_REF_RE = /["'`]chrome:\/\/new-?tab(?:-page)?\/?["'`]/i;
@@ -70,6 +71,9 @@ const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
 // A ServiceWorker object has no pushManager, so web push doesn't rule it out.
 const SW_STATE_REF_RE = /\.\s*serviceWorker\s*(?:\?\.|\.)\s*state\b/;
 const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
+// The manifest's worker script read at runtime: bundles resolve it against their
+// own location to decide whether they run in the background.
+const SW_MANIFEST_REF_RE = /\bservice_worker\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
 // The storage areas whose set the clone fallback wraps.
@@ -77,6 +81,9 @@ const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
+// A worker's own localStorage or sessionStorage, which it doesn't have:
+// `self.localStorage = polyfill`. The event page's are getter-only.
+const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
 
 interface Usage {
   favicon: boolean;
@@ -87,18 +94,20 @@ interface Usage {
   serviceWorkerRegistration: boolean;
   serviceWorkerState: boolean;
   pushManager: boolean;
+  serviceWorkerManifest: boolean;
   locks: boolean;
   permissions: boolean;
   extraHeaders: boolean;
   storage: boolean;
   messaging: boolean;
+  storageGlobalsAssigned: string[];
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
-    serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false,
+    serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
+    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [],
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -117,11 +126,15 @@ function scanUsage(dir: string): Usage {
       if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
       if (!found.serviceWorkerState) found.serviceWorkerState = SW_STATE_REF_RE.test(src);
       if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
+      if (!found.serviceWorkerManifest) found.serviceWorkerManifest = SW_MANIFEST_REF_RE.test(src);
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
+      for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
+        if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
+      }
     }
   }
   return found;
@@ -158,6 +171,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
     serviceWorkerSelf: config.serviceWorker === true && (usage.serviceWorkerState || (usage.serviceWorkerRegistration && !usage.pushManager)),
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
+    serviceWorkerManifest: config.serviceWorker === true && usage.serviceWorkerManifest,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
@@ -165,6 +179,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     extraHeaders: usage.extraHeaders,
     storageClone: usage.storage,
     messageJson: usage.messaging,
+    storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
