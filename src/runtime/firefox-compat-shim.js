@@ -1680,15 +1680,28 @@
     return out;
   }
 
+  // The session rules lavaduct adds for itself: the backend Origin rule, and
+  // the frame grants' rules just above it (frame-grants-bg.js). An add-on that
+  // clears every session rule at startup (getSessionRules, then removeRuleIds
+  // of all of them, as Requestly does) or numbers its rules after the highest
+  // one it sees would take them out or collide with them, so with
+  // CONFIG.reservedSessionRules the add-on's getSessionRules leaves them out
+  // and its removeRuleIds can't name them. The frame grants reach Firefox's
+  // own methods through __lavaductNative on the wrappers.
+  function isShimRule(id) {
+    return id === BACKEND_ORIGIN_RULE_ID || (id >= 2147480100 && id < 2147480200);
+  }
+
   function installRuleFilter() {
     namespaces.forEach(function (ns) {
       var dnr = null;
       try { dnr = ns.declarativeNetRequest; } catch (e) {}
       if (!dnr || typeof dnr !== "object") return;
+      var hide = CONFIG.reservedSessionRules === true;
       ["updateDynamicRules", "updateSessionRules"].forEach(function (name) {
         var native = dnr[name];
         if (typeof native !== "function") return;
-        replaceMember(dnr, name, function (options) {
+        var wrapper = function (options) {
           var args = Array.prototype.slice.call(arguments);
           if (options && typeof options === "object" && Array.isArray(options.addRules)) {
             var rules = [];
@@ -1699,9 +1712,28 @@
             });
             args[0] = Object.assign({}, options, { addRules: rules });
           }
+          if (hide && name === "updateSessionRules" && args[0] && typeof args[0] === "object" && Array.isArray(args[0].removeRuleIds)) {
+            args[0] = Object.assign({}, args[0], { removeRuleIds: args[0].removeRuleIds.filter(function (id) { return !isShimRule(id); }) });
+          }
           return native.apply(dnr, args);
-        });
+        };
+        if (hide && name === "updateSessionRules") {
+          try { Object.defineProperty(wrapper, "__lavaductNative", { value: native }); } catch (e) {}
+        }
+        replaceMember(dnr, name, wrapper);
       });
+      var getSession = dnr.getSessionRules;
+      if (!hide || typeof getSession !== "function") return;
+      var getWrapper = function () {
+        var args = Array.prototype.slice.call(arguments);
+        var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+        var p = Promise.resolve(getSession.apply(dnr, args)).then(function (rules) {
+          return Array.isArray(rules) ? rules.filter(function (r) { return !r || !isShimRule(r.id); }) : rules;
+        });
+        return respond(ns, p, cb);
+      };
+      try { Object.defineProperty(getWrapper, "__lavaductNative", { value: getSession }); } catch (e) {}
+      replaceMember(dnr, "getSessionRules", getWrapper);
     });
   }
 

@@ -52,6 +52,8 @@ export interface ShimConfig {
    * Chrome lets every extension in.
    */
   externalIds?: string[];
+  /** The page bridge lets the add-on's pages frame sites (framedSites), with session rules of its own. */
+  frameGrants?: boolean;
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
@@ -179,6 +181,9 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerLifecycle: config.serviceWorker === true && usage.serviceWorkerLifecycle,
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
+    // lavaduct adds session rules of its own: the backend Origin rule, and the
+    // frame grants' rules.
+    reservedSessionRules: (!!config.extensionId && (config.backendHosts ?? []).length > 0) || config.frameGrants === true,
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
