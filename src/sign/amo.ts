@@ -1,7 +1,7 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { cacheDir, readState, writeState } from "../state.js";
+import { cacheDir, readState, stateDir, writeState } from "../state.js";
 import type { AmoCredentials, Issue } from "../types.js";
 import { info, ok, warn } from "../util.js";
 import { isAmoAddonId } from "./addon-id.js";
@@ -25,6 +25,11 @@ const DEFAULT_RETRY_AFTER_SECONDS = 60;
 const VERSIONS_FILE = "amo-versions.json";
 const PENDING_FILE = "amo-pending.json";
 const NOTICE_FILE = "amo-notice-shown.json";
+// Held while one of the files above is rewritten.
+const STATE_LOCK = "amo-state.lock";
+const LOCK_POLL_MS = 10;
+const LOCK_STALE_MS = 10_000;
+const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 
 const POLICY_NOTICE =
   "AMO signs unlisted add-ons automatically, but they still fall under Mozilla's add-on policies: " +
@@ -100,8 +105,26 @@ function errorDetail(status: number, body: unknown): string {
   return messagesOf(body).join(" ") || `HTTP ${status}`;
 }
 
+// A failed request, or a connection dropped mid-response (undici's bare "terminated"),
+// named after the reason undici keeps on the error's cause.
+function unreachable(url: string, err: unknown): Error {
+  const cause = err instanceof Error ? err.cause : undefined;
+  const reason =
+    (cause instanceof Error && (cause.message || (cause as NodeJS.ErrnoException).code)) ||
+    (err instanceof Error ? err.message : String(err));
+  return new Error(`Couldn't reach AMO at ${new URL(url).origin}: ${reason}`);
+}
+
+async function readBytes(res: Response): Promise<Buffer> {
+  try {
+    return Buffer.from(await res.arrayBuffer());
+  } catch (err) {
+    throw unreachable(res.url, err);
+  }
+}
+
 async function readBody(res: Response): Promise<unknown> {
-  const text = await res.text();
+  const text = (await readBytes(res)).toString("utf-8");
   try {
     return JSON.parse(text);
   } catch {
@@ -140,15 +163,11 @@ async function amoFetch(
         },
       });
     } catch (err) {
-      const cause = err instanceof Error ? err.cause : undefined;
-      const reason =
-        (cause instanceof Error && (cause.message || (cause as NodeJS.ErrnoException).code)) ||
-        (err instanceof Error ? err.message : String(err));
-      throw new Error(`Couldn't reach AMO at ${new URL(url).origin}: ${reason}`);
+      throw unreachable(url, err);
     }
     if (res.status !== 429) return res;
 
-    await res.arrayBuffer();
+    await readBytes(res);
     const header = res.headers.get("retry-after")?.trim() ?? "";
     const seconds = /^\d+$/.test(header) ? Number(header) : Math.ceil((Date.parse(header) - Date.now()) / 1000);
     const wait = Number.isFinite(seconds) ? Math.max(1, seconds) : DEFAULT_RETRY_AFTER_SECONDS;
@@ -249,6 +268,12 @@ async function submitVersion(amo: Amo, addonId: string, uuid: string): Promise<S
   if (res.status === 409 && messages.some((m) => /already exists|uploaded before/i.test(m))) {
     return { kind: "version-used" };
   }
+  // A 403 for an add-on Mozilla disabled says so in is_disabled_by_mozilla; the
+  // permission message itself is the same as for someone else's ID.
+  if (res.status === 403 && field(body, "is_disabled_by_mozilla") === true) {
+    const message = `Mozilla disabled the add-on ${addonId} on AMO, so it takes no new versions.`;
+    return { kind: "refused", issues: [amoIssue(message, "Pass --addon-id with a new ID to sign it as a separate add-on.")] };
+  }
   if (res.status === 403) {
     const message = `The add-on ID ${addonId} belongs to another AMO account, so these credentials can't submit versions of it.`;
     const fix = "Use the credentials of the account that owns it, or pass --addon-id with a different ID.";
@@ -300,13 +325,48 @@ export function removeSignedCache(addonId: string): void {
   rmSync(signedCacheDir(addonId), { recursive: true, force: true });
 }
 
+/**
+ * Run a read-modify-write of the AMO state files under a lock directory, so runs
+ * signing at the same time don't overwrite each other's records: a lost pending
+ * record makes the next run upload again, a lost version a 409 round trip. The
+ * section takes milliseconds; a lock older than LOCK_STALE_MS was left by a run that
+ * died holding it.
+ */
+function withStateLock<T>(update: () => T): T {
+  mkdirSync(stateDir(), { recursive: true });
+  const lock = join(stateDir(), STATE_LOCK);
+  for (;;) {
+    try {
+      mkdirSync(lock);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+    let age = 0;
+    try {
+      age = Date.now() - statSync(lock).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (age > LOCK_STALE_MS) rmSync(lock, { recursive: true, force: true });
+    else Atomics.wait(LOCK_WAIT, 0, 0, LOCK_POLL_MS);
+  }
+  try {
+    return update();
+  } finally {
+    rmSync(lock, { recursive: true, force: true });
+  }
+}
+
 /** Record that AMO has seen `version` of the add-on; returns every version recorded for it. */
 function recordVersion(addonId: string, version: string): string[] {
-  const all = readState<Record<string, string[]>>(VERSIONS_FILE, {});
-  const versions = all[addonId] ?? [];
-  if (!versions.includes(version)) all[addonId] = [...versions, version];
-  writeState(VERSIONS_FILE, all);
-  return all[addonId];
+  return withStateLock(() => {
+    const all = readState<Record<string, string[]>>(VERSIONS_FILE, {});
+    const versions = all[addonId] ?? [];
+    if (!versions.includes(version)) all[addonId] = [...versions, version];
+    writeState(VERSIONS_FILE, all);
+    return all[addonId];
+  });
 }
 
 function readPending(): PendingSubmission[] {
@@ -316,8 +376,10 @@ function readPending(): PendingSubmission[] {
 
 /** Replace the pending record for this add-on and input with `record`, or drop it. */
 function setPending(addonId: string, contentHash: string, record?: PendingSubmission): void {
-  const others = readPending().filter((p) => p.addonId !== addonId || p.contentHash !== contentHash);
-  writeState(PENDING_FILE, record ? [...others, record] : others);
+  withStateLock(() => {
+    const others = readPending().filter((p) => p.addonId !== addonId || p.contentHash !== contentHash);
+    writeState(PENDING_FILE, record ? [...others, record] : others);
+  });
 }
 
 /**
@@ -354,7 +416,7 @@ async function awaitSignature(
       if (!download.ok) {
         throw new Error(`Couldn't download the signed version ${version} from AMO (HTTP ${download.status}).`);
       }
-      const data = Buffer.from(await download.arrayBuffer());
+      const data = await readBytes(download);
       writeSignedCache(addonId, contentHash, version, data);
       mkdirSync(dirname(signedXpiPath), { recursive: true });
       writeFileSync(signedXpiPath, data);
