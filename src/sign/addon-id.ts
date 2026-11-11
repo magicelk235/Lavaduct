@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ADDON_ID_SUFFIX } from "../name.js";
 import { readState, stateDir } from "../state.js";
@@ -17,17 +17,31 @@ export function isAmoAddonId(id: string): boolean {
 }
 
 // Every ID derived on this machine embeds the salt, so once written it must never
-// change. The exclusive create keeps a concurrent first run from replacing a salt
-// another run already handed out, and a damaged file is an error rather than a
-// silent new salt.
+// change. The salt is written to a temp file and published with link(), which fails
+// when the file already exists: a concurrent first run never replaces a salt another
+// run already handed out, and never reads the file half-written, as it could after
+// an exclusive create. A damaged file is an error rather than a silent new salt.
 function addonIdSalt(): string {
   const path = join(stateDir(), SALT_FILE);
   if (!existsSync(path)) {
     mkdirSync(stateDir(), { recursive: true });
+    const content = JSON.stringify({ salt: randomBytes(4).toString("hex") }, null, 2) + "\n";
+    const tmp = `${path}.${randomBytes(6).toString("hex")}.tmp`;
+    writeFileSync(tmp, content);
     try {
-      writeFileSync(path, JSON.stringify({ salt: randomBytes(4).toString("hex") }, null, 2) + "\n", { flag: "wx" });
+      linkSync(tmp, path);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        // A file system without hard links: fall back to the exclusive create.
+        try {
+          writeFileSync(path, content, { flag: "wx" });
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        }
+      }
+    } finally {
+      rmSync(tmp, { force: true });
     }
   }
   const salt = readState<{ salt?: unknown } | null>(SALT_FILE, null)?.salt;
