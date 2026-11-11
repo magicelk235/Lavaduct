@@ -270,9 +270,13 @@ export function stripDanglingSourcemaps(stageDir: string): number {
     }
     let changed = false;
     const next = content.replace(SOURCEMAP_RE, (whole, url: string) => {
-      if (url.startsWith("data:")) return whole; // inline map, self-contained
-      // Resolve relative to the script; keep the ref if the map actually shipped.
-      const mapPath = resolve(dirname(file), url);
+      // data: (inline) and remote maps don't live in the package; only a local path can dangle.
+      if (url.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(url)) return whole;
+      // Resolve as the browser does: a leading "/" is the package root, anything
+      // else is relative to the script, and a query or fragment isn't part of the file.
+      let path = url.split(/[?#]/)[0];
+      try { path = decodeURIComponent(path); } catch { /* keep it as written */ }
+      const mapPath = path.startsWith("/") ? join(stageDir, path) : resolve(dirname(file), path);
       if (existsSync(mapPath)) return whole;
       changed = true;
       return "";
