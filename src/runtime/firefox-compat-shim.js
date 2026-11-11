@@ -1640,6 +1640,12 @@
       var rt = null;
       try { rt = ns.runtime; } catch (e) {}
       if (!rt || typeof rt.getContexts !== "function") return;
+      // Firefox's ContextType object has no OFFSCREEN_DOCUMENT, so a filter built
+      // from Chrome's enum would hand Firefox [undefined].
+      var contextType = null;
+      try { contextType = rt.ContextType; } catch (e) {}
+      if (contextType && typeof contextType === "object") defineMissing(contextType, "OFFSCREEN_DOCUMENT", "OFFSCREEN_DOCUMENT");
+      else defineMissing(rt, "ContextType", { BACKGROUND: "BACKGROUND", POPUP: "POPUP", SIDE_PANEL: "SIDE_PANEL", TAB: "TAB", OFFSCREEN_DOCUMENT: "OFFSCREEN_DOCUMENT" });
       replaceMember(rt, "getContexts", function (filter, cb) {
         var types = filter && Array.isArray(filter.contextTypes) ? filter.contextTypes : null;
         var wantsOffscreen = !types || types.indexOf("OFFSCREEN_DOCUMENT") >= 0;
