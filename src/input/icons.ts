@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import type { Manifest } from "../types.js";
@@ -107,7 +107,10 @@ export function synthesizePlaceholderIcons(stageDir: string, manifest: Manifest,
   const [r, g, b] = colorFor(appName);
   const icons: Record<string, string> = {};
   for (const size of SIZES) {
-    const name = `icon-${size}.png`;
+    // The extension's own pages may use a file of this name (an <img> in the popup)
+    // without declaring it as an icon; never write over it.
+    let name = `icon-${size}.png`;
+    for (let n = 1; existsSync(join(stageDir, name)); n++) name = `icon-${size}-${n}.png`;
     writeFileSync(join(stageDir, name), solidPng(size, r, g, b));
     icons[String(size)] = name;
   }
