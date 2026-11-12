@@ -38,18 +38,24 @@
 
     function ownRule(id) { return id >= FIRST_RULE && id < FIRST_RULE + RULE_COUNT; }
 
+    // The shim keeps these rules out of the add-on's own session-rule calls;
+    // Firefox's methods sit under __lavaductNative on its wrappers.
+    function nativeDnr(name) { var f = dnr[name]; return (f && f.__lavaductNative) || f; }
+    function getRules() { return nativeDnr("getSessionRules").call(dnr); }
+    function updateRules(options) { return nativeDnr("updateSessionRules").call(dnr, options); }
+
     // A background that restarts loses track of its rules; clear them first.
     var ready = Promise.resolve()
-      .then(function () { return dnr.getSessionRules(); })
+      .then(function () { return getRules(); })
       .then(function (rules) {
         var stale = (rules || []).map(function (r) { return r.id; }).filter(ownRule);
-        if (stale.length) return dnr.updateSessionRules({ removeRuleIds: stale });
+        if (stale.length) return updateRules({ removeRuleIds: stale });
       })
       .catch(function (e) { DBG("[frame-grants] clearing old rules failed:", e); });
 
     function dropRule(id) {
       Promise.resolve()
-        .then(function () { return dnr.updateSessionRules({ removeRuleIds: [id] }); })
+        .then(function () { return updateRules({ removeRuleIds: [id] }); })
         .catch(function (e) { DBG("[frame-grants] removing rule", id, "failed:", e); });
     }
 
@@ -57,13 +63,13 @@
     // background uses to clean up after a frame it let in before.
     function dropRulesFor(url) {
       Promise.resolve()
-        .then(function () { return dnr.getSessionRules(); })
+        .then(function () { return getRules(); })
         .then(function (rules) {
           var ids = (rules || []).filter(function (r) {
             if (!ownRule(r.id) || !r.condition || typeof r.condition.regexFilter !== "string") return false;
             try { return new RegExp(r.condition.regexFilter).test(url); } catch (e) { return false; }
           }).map(function (r) { return r.id; });
-          if (ids.length) return dnr.updateSessionRules({ removeRuleIds: ids });
+          if (ids.length) return updateRules({ removeRuleIds: ids });
         })
         .catch(function () {});
     }
@@ -157,7 +163,7 @@
       var url = d.url.split("#")[0];
       return ready
         .then(function () {
-          return dnr.updateSessionRules({
+          return updateRules({
             removeRuleIds: [rule],
             addRules: [{
               id: rule,

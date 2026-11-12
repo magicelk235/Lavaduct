@@ -1,11 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { warn } from "../util.js";
 import type { FirefoxInstall } from "./locate.js";
 import { platform, type LockHolder, type ProfileLookup } from "./platform/index.js";
-import { pathKey, processAgeMs, processAlive } from "./platform/shared.js";
+import { pathKey, processAlive } from "./platform/shared.js";
 import { defaultProfileFor, profileInUse, profilesFor, type FirefoxProfile } from "./profiles.js";
 
 const QUIT_TIMEOUT_MS = 30_000;
@@ -54,10 +54,26 @@ function holderOf(install: FirefoxInstall, profilePath: string): LockHolder | un
 export async function waitForSettledFirefox(install: FirefoxInstall, profilePath: string): Promise<LockHolder | undefined> {
   const holder = holderOf(install, profilePath);
   if (holder && platform.quitMinAgeMs > 0) {
-    const age = processAgeMs(holder.pid);
+    const age = platform.processAgeMs(holder.pid);
     if (age !== undefined && age < platform.quitMinAgeMs) await sleep(platform.quitMinAgeMs - age);
   }
   return holder;
+}
+
+/**
+ * Whether the Firefox that has the profile open started before the profile's
+ * user.js was last written. Firefox reads user.js only when it starts, so that
+ * Firefox hasn't seen what the file says now. False when no Firefox has the
+ * profile open, there is no user.js, or the process's start can't be told.
+ */
+export function startedBeforeUserJs(install: FirefoxInstall, profilePath: string): boolean {
+  const written = statSync(join(profilePath, "user.js"), { throwIfNoEntry: false })?.mtimeMs;
+  if (written === undefined || !profileInUse(profilePath)) return false;
+  const holder = holderOf(install, profilePath);
+  const age = holder && platform.processAgeMs(holder.pid);
+  // ps rounds the age down to whole seconds, which puts the start late: a
+  // user.js written in the second Firefox started counts as read.
+  return age !== undefined && written > Date.now() - age;
 }
 
 /**
@@ -83,6 +99,18 @@ export async function quitFirefoxForProfile(install: FirefoxInstall, profilePath
 }
 
 /**
+ * The executable of the Firefox that has the profile open, when it comes from
+ * another install than `install`. Undefined when no Firefox has the profile
+ * open, it is this install's, or the holder can't be told.
+ */
+export function otherInstallHolding(install: FirefoxInstall, profilePath: string): string | undefined {
+  if (!profileInUse(profilePath)) return undefined;
+  const exe = holderOf(install, profilePath)?.exe;
+  const dirs = [install.installDir, platform.profileSetup(install).hashDir].map(pathKey);
+  return exe && !dirs.includes(pathKey(dirname(exe))) ? exe : undefined;
+}
+
+/**
  * Hand an .xpi to Firefox, which shows its install prompt. If Firefox already
  * has the profile open, the new process forwards the request to it and
  * exits. Forwarding matches on the profile path as the running Firefox
@@ -94,14 +122,9 @@ export async function quitFirefoxForProfile(install: FirefoxInstall, profilePath
  * running" dialog.
  */
 export function openXpiInFirefox(install: FirefoxInstall, profile: FirefoxProfile, xpiPath: string): void {
-  if (profileInUse(profile.path)) {
-    const exe = holderOf(install, profile.path)?.exe;
-    const dirs = [install.installDir, platform.profileSetup(install).hashDir].map(pathKey);
-    if (exe && !dirs.includes(pathKey(dirname(exe)))) {
-      throw new Error(
-        `${profile.path} is open in the Firefox at ${exe}. Quit that Firefox first, or pass --firefox "${exe}".`,
-      );
-    }
+  const exe = otherInstallHolding(install, profile.path);
+  if (exe) {
+    throw new Error(`${profile.path} is open in the Firefox at ${exe}. Quit that Firefox first, or pass --firefox "${exe}".`);
   }
   openProfileInFirefox(install, profile, [resolve(xpiPath)]);
 }

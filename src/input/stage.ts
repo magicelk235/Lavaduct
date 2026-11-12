@@ -1,6 +1,7 @@
 import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, writeFileSync, lstatSync, statSync, realpathSync, copyFileSync } from "node:fs";
 import { join, dirname, resolve, relative, sep, posix } from "node:path";
 import type { Manifest } from "../types.js";
+import { mapManifestPaths, parseJsonc } from "../manifest/manifest.js";
 
 /** Names/globs excluded from the clean staged extension. */
 const EXCLUDE_EXACT = new Set([
@@ -17,9 +18,18 @@ const EXCLUDE_EXACT = new Set([
   "yarn.lock",
   "pnpm-lock.yaml",
   "tsconfig.json",
+  // Credentials and editor settings a source folder holds; never runtime files.
+  ".npmrc",
+  ".vscode",
+  ".idea",
+  // A Recommended add-on's AMO badge; addons-linter refuses the name anywhere.
+  "mozilla-recommendation.json",
 ]);
+// Excluded at the package root only: a signed .xpi's signature, which covers the
+// files and add-on ID the conversion changes.
+const SIGNATURE_DIR = "META-INF";
 
-const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log"];
+const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log", ".pem"];
 // Doc/config files: bare name or name + extension only (e.g. "LICENSE",
 // "LICENSE.txt"), never a prefix match — that would drop legit runtime files
 // like "LICENSE_KEY.js" or "READMExporter.js".
@@ -27,13 +37,16 @@ const EXCLUDE_SUFFIX = [".map", ".ts", ".tsx", ".md", ".log"];
 // the name — changelog.html, license.js, Changelog.json — must ship, or it 404s
 // at runtime (only manifest-referenced paths are otherwise protected).
 const EXCLUDE_DOC_RE = /^(README|CHANGELOG|LICENSE)(\.(txt|md|markdown|rst|adoc))?$/i;
+// Tool dotfiles, and .env files with their secrets (.env, .env.local, …).
 const EXCLUDE_DOTFILE = [".eslint", ".prettier"];
+const ENV_FILE_RE = /^\.env(\..+)?$/;
 
 function shouldExclude(name: string): boolean {
   if (EXCLUDE_EXACT.has(name)) return true;
   if (EXCLUDE_SUFFIX.some((s) => name.endsWith(s))) return true;
   if (EXCLUDE_DOC_RE.test(name)) return true;
   if (EXCLUDE_DOTFILE.some((p) => name.startsWith(p))) return true;
+  if (ENV_FILE_RE.test(name)) return true;
   return false;
 }
 
@@ -84,7 +97,7 @@ export function stageExtension(sourceDir: string, stageDir: string, keep: Set<st
       // file like _metadata/junk.js (parent excluded) from riding in just because
       // its own basename is clean.
       const segments = rel.split("/");
-      if (segments.some(shouldExclude)) {
+      if (segments.some(shouldExclude) || segments[0] === SIGNATURE_DIR) {
         // Still allow an excluded directory to be entered when a kept path lives
         // inside it; cpSync won't recurse otherwise and the kept child is lost.
         const asDir = rel + "/";
@@ -234,6 +247,156 @@ function stageLoadedAssets(root: string, realRoot: string, stageDir: string): vo
       }
     }
   }
+}
+
+/**
+ * Whether Firefox's JSON reader (Extension.sys.mjs readJSON) takes `text`: it cuts
+ * `//` comments outside strings, throws on any other `/`, then calls JSON.parse.
+ */
+function firefoxReadsJson(text: string): boolean {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let end = i;
+      do {
+        end = text.indexOf('"', end + 1);
+        if (end === -1) return false;
+        let backslashes = 0;
+        for (let k = end - 1; text[k] === "\\"; k--) backslashes++;
+        if (backslashes % 2 === 0) break;
+      } while (true);
+      out += text.slice(i, end + 1);
+      i = end;
+    } else if (c === "/") {
+      if (text[i + 1] !== "/") return false;
+      const nl = text.indexOf("\n", i + 2);
+      i = (nl === -1 ? text.length : nl) - 1;
+    } else out += c;
+  }
+  try {
+    JSON.parse(out);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spell each path the manifest names the way the file is named on disk. Chrome on
+ * macOS and Windows reads an unpacked or installed extension from a case-insensitive
+ * disk, so "icons/a.png" finds Icons/A.png; Firefox reads a packed .xpi by exact
+ * name, and the icon, script or page is missing (the temporary route loads the folder
+ * and hides this on macOS and Windows). A path with no file, or more than one file
+ * differing only in case, is left as it is. Returns "old → new" for each change.
+ */
+export function matchManifestPathCase(stageDir: string, manifest: Manifest): string[] {
+  const listings = new Map<string, string[] | null>();
+  const namesIn = (dir: string) => {
+    if (!listings.has(dir)) {
+      try {
+        listings.set(dir, readdirSync(dir));
+      } catch {
+        listings.set(dir, null);
+      }
+    }
+    return listings.get(dir) ?? null;
+  };
+  const changed: string[] = [];
+  mapManifestPaths(manifest, (path) => {
+    if (path.includes("*")) return path;
+    const cut = path.search(/[#?]/);
+    const filePart = cut === -1 ? path : path.slice(0, cut);
+    const lead = /^\.?\//.exec(filePart)?.[0] ?? "";
+    const actual: string[] = [];
+    let dir = stageDir;
+    for (const segment of filePart.slice(lead.length).split("/")) {
+      const names = namesIn(dir);
+      if (!names) return path;
+      let name = segment;
+      if (!names.includes(segment)) {
+        const matches = names.filter((n) => n.toLowerCase() === segment.toLowerCase());
+        if (matches.length !== 1) return path;
+        name = matches[0];
+      }
+      actual.push(name);
+      dir = join(dir, name);
+    }
+    const fixed = lead + actual.join("/") + (cut === -1 ? "" : path.slice(cut));
+    if (fixed !== path) changed.push(`${path} → ${fixed}`);
+    return fixed;
+  });
+  return changed;
+}
+
+/**
+ * Remove each _locales subfolder without a messages.json Chrome can read, except
+ * the default locale's (the analyzer reports that one). Chrome ignores a folder
+ * whose name isn't one of its locales and refuses an extension whose locale
+ * folder lacks a readable catalog, so a working Chrome extension can only carry
+ * such a folder as junk Chrome skips (`_locales/xx/`, an empty folder). Firefox
+ * reads every subfolder and refuses the whole add-on over one it can't load.
+ * Returns the removed folders.
+ */
+export function removeUnreadableLocales(stageDir: string, defaultLocale: string | undefined): string[] {
+  const localesDir = join(stageDir, "_locales");
+  let locales;
+  try {
+    locales = readdirSync(localesDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const locale of locales) {
+    if (!locale.isDirectory() || locale.name === defaultLocale) continue;
+    try {
+      parseJsonc(readFileSync(join(localesDir, locale.name, "messages.json"), "utf-8"));
+    } catch {
+      rmSync(join(localesDir, locale.name), { recursive: true, force: true });
+      removed.push(`_locales/${locale.name}`);
+    }
+  }
+  return removed;
+}
+
+/**
+ * Rewrite as plain JSON each _locales/<locale>/messages.json that Chrome reads and
+ * Firefox doesn't. Chrome's reader also takes block comments, line breaks inside
+ * strings and \x escapes; Firefox's only cuts // comments, and it refuses the whole
+ * add-on when any locale's catalog fails to parse. A catalog Firefox reads is left
+ * byte for byte, and one Chrome can't read either is left for the analyzer to
+ * report. Returns the rewritten paths.
+ */
+export function normalizeLocaleCatalogs(stageDir: string): string[] {
+  const localesDir = join(stageDir, "_locales");
+  let locales;
+  try {
+    locales = readdirSync(localesDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const rewritten: string[] = [];
+  for (const locale of locales) {
+    if (!locale.isDirectory()) continue;
+    const file = join(localesDir, locale.name, "messages.json");
+    let text: string;
+    try {
+      text = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (firefoxReadsJson(text)) continue;
+    let messages: unknown;
+    try {
+      messages = parseJsonc(text);
+    } catch {
+      continue;
+    }
+    writeFileSync(file, JSON.stringify(messages, null, 2) + "\n", "utf-8");
+    rewritten.push(`_locales/${locale.name}/messages.json`);
+  }
+  return rewritten;
 }
 
 const SOURCEMAP_RE = /^[ \t]*\/\/[#@] sourceMappingURL=(\S+)[ \t]*\r?$/gm;
@@ -536,7 +699,25 @@ const EXT_ORIGIN_CONCAT_RE = new RegExp(
   "g",
 );
 
-function rewriteExtensionOriginFromRuntimeId(stageDir: string): number {
+// The same origin sent to a server as a referer header names the extension to its
+// backend, which knows it by its Chrome origin. Google Dictionary sends
+//   fetch(url, { headers: { "x-referer": "chrome-extension://" + chrome.runtime.id } })
+// to an API whose key only accepts chrome-extension://<its Chrome ID>: the add-on's
+// moz-extension origin is refused with 403, and so is no referer at all, which is what
+// Firefox sends from an extension page. Where the origin is a quoted referer header's
+// value (a headers object key, or headers.set/append and setRequestHeader) and the
+// Chrome ID is known, it becomes that Chrome origin, exactly what Chrome sends. A fetch
+// init's `referrer:` must be the page's own URL, so a bare key is left to the rewrite above.
+const REFERER_HEADER = "([\"'])(?:x-)?referr?er\\";
+const EXT_ORIGIN_EXPR =
+  "(?:`chrome-extension://\\$\\{\\s*" + NS_CHAIN + "\\s*\\.\\s*runtime\\s*\\.\\s*id\\s*\\}`" +
+  "|([\"'])chrome-extension://\\4\\s*\\+\\s*" + NS_CHAIN + "\\s*\\.\\s*runtime\\s*\\.\\s*id\\b)";
+const EXT_ORIGIN_HEADER_RE = new RegExp(
+  "(" + REFERER_HEADER + "2\\s*:\\s*|\\.\\s*(?:set|append|setRequestHeader)\\s*\\(\\s*" + REFERER_HEADER + "3\\s*,\\s*)" + EXT_ORIGIN_EXPR,
+  "gi",
+);
+
+function rewriteExtensionOriginFromRuntimeId(stageDir: string, chromeId?: string): number {
   let modified = 0;
   for (const file of walkScripts(stageDir)) {
     let content: string;
@@ -551,7 +732,14 @@ function rewriteExtensionOriginFromRuntimeId(stageDir: string): number {
       changed = true;
       return 'new URL(' + ns + '.runtime.getURL("/")).origin';
     };
-    const next = content
+    let next = content;
+    if (chromeId) {
+      next = next.replace(EXT_ORIGIN_HEADER_RE, (_whole, head: string) => {
+        changed = true;
+        return head + JSON.stringify(`chrome-extension://${chromeId}`);
+      });
+    }
+    next = next
       .replace(EXT_ORIGIN_TEMPLATE_RE, (_whole, ns: string) => origin(ns))
       .replace(EXT_ORIGIN_CONCAT_RE, (_whole, _q: string, ns: string) => origin(ns));
     if (changed) {
@@ -676,15 +864,107 @@ function rewriteBackgroundContextChecks(stageDir: string, manifest: Manifest): n
   return modified;
 }
 
+// What the background's shim sets on its global, and nothing else does: lets a
+// check in a file that pages load too say yes in the background only.
+export const BACKGROUND_FLAG = "globalThis.__lavaductBackground===true";
+
+const regexEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** `typeof document === "undefined"` and its spellings, as WINDOW_IS_UNDEFINED has them for window. */
+const DOCUMENT_IS_UNDEFINED = WINDOW_IS_UNDEFINED.split("window").join("document");
+
+// A function named for the question, whose body has no nested braces:
+// `static isBackground() { return … "undefined" == typeof document }`,
+// `isServiceWorker: () => typeof window === "undefined"`.
+const BG_PREDICATE_RE =
+  /(\bis_?(?:bg|background\w*|service_?worker\w*|sw)\s*(?:\(\s*\)\s*\{|[:=]\s*(?:function\s*)?\(\s*\)\s*(?:=>\s*)?\{))([^{}]*)\}|(\bis_?(?:bg|background\w*|service_?worker\w*|sw)\s*[:=]\s*\(\s*\)\s*=>)([^{};,]*)/gi;
+const UNDEFINED_GLOBAL_RE = new RegExp(`${WINDOW_IS_UNDEFINED}|${DOCUMENT_IS_UNDEFINED}`, "g");
+
+/**
+ * The worker's "am I the worker?" checks in every script the background loads,
+ * once the worker's importScripts targets and chunks are known (wireBackground):
+ *   - the background-literal checks rewriteBackgroundContextChecks fixes in the
+ *     manifest's scripts, now in the hoisted files too;
+ *   - `location.pathname == "/<worker script>"` (Hola's is_bg);
+ *   - a worker test inside an is…Background()/isServiceWorker() body (Total
+ *     Adblock's `"undefined" == typeof document`).
+ * The worker's own script only runs as the background, so its checks become
+ * true. The other files are chunks the add-on's pages may load too, so there
+ * the check gains `|| BACKGROUND_FLAG` and keeps its answer in the pages.
+ */
+export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: string, loaded: string[]): number {
+  const worker = workerScript.replace(/^\.?\//, "");
+  if (!worker) return 0;
+  const pathCheck = String.raw`(?:(?:self|globalThis|window)\.)?location\.pathname\s*===?\s*(["'])\/?${regexEscape(worker)}\1`;
+  const pathRe = new RegExp(`${pathCheck}|(["'])\\/?${regexEscape(worker)}\\2\\s*===?\\s*(?:(?:self|globalThis|window)\\.)?location\\.pathname`, "g");
+  let modified = 0;
+  for (const rel of loaded) {
+    const name = rel.replace(/^\.?\//, "");
+    const file = join(stageDir, name);
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    const isWorker = name === worker;
+    const yes = (check: string) => (isWorker ? "true" : `(${check}||${BACKGROUND_FLAG})`);
+    let next = content.replace(pathRe, (check) => yes(check));
+    next = next.replace(BG_PREDICATE_RE, (whole, head?: string, body?: string, arrowHead?: string, arrowBody?: string) =>
+      head !== undefined
+        ? `${head}${(body ?? "").replace(UNDEFINED_GLOBAL_RE, yes)}}`
+        : `${arrowHead}${(arrowBody ?? "").replace(UNDEFINED_GLOBAL_RE, yes)}`);
+    if (!isWorker) {
+      next = next
+        .replace(BG_CHECK_RETURN_RE, (whole, pre: string, post: string) => pre + yes(whole.slice(pre.length, whole.length - post.length)) + post)
+        .replace(BG_CHECK_TERNARY_RE, (whole, post: string) => yes(whole.slice(0, whole.length - post.length)) + post);
+    }
+    if (next !== content) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
 // A worker gives itself a window with `self.window = self`. In the event page that
 // replaces it, window is a getter-only accessor, and the assignment throws in
 // strict code, ending the script there. window already is the global in a page.
 const WINDOW_SELF_ALIAS_RE = /(^|[^.\w$])(?:self|globalThis)\s*\.\s*window\s*=\s*(self|globalThis)\b(?!\s*[.[(=])/g;
 
+// `import "./x.js"`, `import { a } from "../y.js"`, `export * from "./z.mjs"`:
+// relative static imports, the only ones resolvable without running the code.
+const STATIC_IMPORT_RE = /(?:^|[;\s}])(?:import|export)\s*(?:[\w$*{}\s,]+?\s*from\s*)?(["'])(\.{1,2}\/[^"'\n]+)\1/g;
+
+/** The background's scripts plus, for a module worker, every module they import statically. */
+function backgroundModuleClosure(stageDir: string, manifest: Manifest): string[] {
+  const files = backgroundScriptPaths(stageDir, manifest);
+  if (manifest.background?.type !== "module") return files;
+  const root = resolve(stageDir);
+  const seen = new Set(files);
+  for (let i = 0; i < files.length; i++) {
+    let content: string;
+    try {
+      content = readFileSync(files[i], "utf-8");
+    } catch {
+      continue;
+    }
+    for (const m of content.matchAll(STATIC_IMPORT_RE)) {
+      const target = resolve(dirname(files[i]), m[2].split(/[?#]/)[0]);
+      if (!target.startsWith(root + sep) || seen.has(target) || !existsSync(target)) continue;
+      seen.add(target);
+      files.push(target);
+    }
+  }
+  return files;
+}
+
 function rewriteWorkerWindowAlias(stageDir: string, manifest: Manifest): number {
   if (typeof manifest.background?.service_worker !== "string") return 0;
   let modified = 0;
-  for (const file of backgroundScriptPaths(stageDir, manifest)) {
+  // An imported module may be the pages' too; in a page window already is the
+  // global, so dropping the alias changes nothing there.
+  for (const file of backgroundModuleClosure(stageDir, manifest)) {
     let content: string;
     try {
       content = readFileSync(file, "utf-8");
@@ -895,12 +1175,12 @@ function renameNonJsScripts(stageDir: string, manifest: Manifest): number {
  * per rewrite, phrased to read as "<name> in <count> file(s)"; entries with a
  * zero count did nothing.
  */
-export function applySourceRewrites(stageDir: string, manifest: Manifest): Array<{ name: string; count: number }> {
+export function applySourceRewrites(stageDir: string, manifest: Manifest, chromeId?: string): Array<{ name: string; count: number }> {
   return [
     // First, so every later pass (and the background lookups) sees the new names.
     { name: "Gave scripts without a .js extension a name Firefox loads", count: renameNonJsScripts(stageDir, manifest) },
     { name: "Rewrote runtime.id-based port matchers", count: rewriteRuntimeIdUrlMatchers(stageDir) },
-    { name: "Rewrote runtime.id-based extension-origin checks", count: rewriteExtensionOriginFromRuntimeId(stageDir) },
+    { name: "Rewrote runtime.id-based extension-origin checks", count: rewriteExtensionOriginFromRuntimeId(stageDir, chromeId) },
     { name: "Rewrote chrome-extension: scheme literals", count: rewriteChromeSchemeLiterals(stageDir) },
     { name: "Rewrote self-page chrome-extension: URLs to runtime.getURL", count: rewriteSelfPageExtensionUrls(stageDir) },
     { name: "Rewrote @@extension_id placeholder URLs", count: rewriteExtensionIdPlaceholderUrls(stageDir) },

@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import type { Issue, Manifest } from "../types.js";
 import { parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
 import { UNSUPPORTED_APIS, compareFirefoxVersions } from "../manifest/compat-data.js";
@@ -8,9 +8,11 @@ import { matchBalancedParen, rootLiteralsFromGetURL, importScriptsTargets } from
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
  * symlinks are stat'ed to resolve their target kind); `seen` holds realpaths of
- * visited directories to break symlink cycles.
+ * visited directories to break symlink cycles. A symlink whose target lies
+ * outside `root` (the input's realpath) is skipped: staging never ships one, and
+ * a `link -> /` would otherwise walk the whole disk.
  */
-function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new Set<string>()): string[] {
+function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new Set<string>(), root?: string): string[] {
   let real: string;
   try {
     real = realpathSync(dir);
@@ -19,6 +21,7 @@ function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new S
   }
   if (seen.has(real)) return acc;
   seen.add(real);
+  root ??= real;
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
@@ -34,6 +37,8 @@ function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new S
     let isFile = entry.isFile();
     if (entry.isSymbolicLink()) {
       try {
+        const target = relative(root, realpathSync(full));
+        if (target.split(sep)[0] === ".." || isAbsolute(target)) continue;
         const st = statSync(full);
         isDir = st.isDirectory();
         isFile = st.isFile();
@@ -41,7 +46,7 @@ function walkFiles(dir: string, exts: string[], acc: string[] = [], seen = new S
         continue;
       }
     }
-    if (isDir) walkFiles(full, exts, acc, seen);
+    if (isDir) walkFiles(full, exts, acc, seen, root);
     else if (isFile && exts.some((e) => name.endsWith(e))) acc.push(full);
   }
   return acc;
@@ -128,7 +133,14 @@ function majorVersion(v: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function scanJsContent(content: string, rel: string, issues: Issue[], isClassicServiceWorker: boolean, minFirefox: string): void {
+function scanJsContent(
+  content: string,
+  rel: string,
+  issues: Issue[],
+  isClassicServiceWorker: boolean,
+  opts: { minFirefox: string; shim: boolean; unloadingBackground: boolean },
+): void {
+  const { minFirefox, unloadingBackground } = opts;
   const lineAt = makeLineResolver(content);
 
   const hits: Array<{ name: string; at: number; info: (typeof API_PATTERNS)[number]["info"] }> = [];
@@ -142,14 +154,16 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isClassicS
     // A more specific match (chrome.identity.launchWebAuthFlow) subsumes the
     // generic namespace one (chrome.identity) — skip the duplicate.
     if (hits.some((o) => o !== h && o.name.startsWith(h.name + "."))) continue;
+    // Without the shim (--no-shim) nothing emulates the API.
+    const lacking = h.info.shimmed === true && !opts.shim;
     issues.push({
-      severity: h.info.severity,
+      severity: lacking ? "warning" : h.info.severity,
       category: "api",
-      message: h.info.message,
+      message: lacking ? (h.info.unshimmed ?? h.info.message) : h.info.message,
       file: rel,
       line: lineAt(h.at),
-      fix: h.info.fix,
-      shimmed: h.info.shimmed,
+      fix: lacking ? "--no-shim leaves out the emulation: convert without it, or feature-detect the API." : h.info.fix,
+      shimmed: lacking ? undefined : h.info.shimmed,
     });
   }
 
@@ -168,7 +182,7 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isClassicS
     });
   }
 
-  if (BACKGROUND_FILE_RE.test(rel)) {
+  if (unloadingBackground && BACKGROUND_FILE_RE.test(rel)) {
     const m = TIMER_RE.exec(content);
     if (m) {
       issues.push({
@@ -240,6 +254,23 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isClassicS
       line: lineAt(isFirstAt),
     });
   }
+  // importScripts reached as a value instead of called by name: Closure's safe
+  // importScripts (`a.importScripts.apply(a, urls)`, Google Dictionary), a bound or
+  // aliased copy, or a bracketed lookup. The converter only finds `importScripts(` calls,
+  // so these targets are never hoisted, and the event page has no importScripts to
+  // call: the code they load (Google Dictionary's mustache.js) never runs.
+  const IS_INDIRECT_RE = /\bimportScripts\s*\.\s*(?:apply|call|bind)\s*\(|\[\s*["'`]importScripts["'`]\s*\]|=\s*(?:self|globalThis)\s*\.\s*importScripts\b(?!\s*\()/;
+  const indirect = isClassicServiceWorker ? IS_INDIRECT_RE.exec(content) : null;
+  if (indirect) {
+    issues.push({
+      severity: "warning",
+      category: "background",
+      message: "importScripts is called indirectly (through apply, call, bind, an alias or a bracketed name), so its targets can't be found or hoisted; the scripts it loads won't run in Firefox's background scripts.",
+      file: rel,
+      line: lineAt(indirect.index),
+      fix: "List the imported scripts in background.scripts ahead of the worker, or load them with a literal importScripts(\"a.js\").",
+    });
+  }
 }
 
 /**
@@ -247,8 +278,10 @@ function scanJsContent(content: string, rel: string, issues: Issue[], isClassicS
  * runs every disk-backed check (missing manifest files, _locales consistency,
  * chrome.* APIs Firefox lacks, background timers and importScripts, favicon
  * access, hardcoded extension and chrome:// URLs, main-world scripting).
+ * `shim: false` (--no-shim) reports what the shim would emulate as missing.
  */
-export function scanExtension(extPath: string, manifest: Manifest, opts: { minFirefox: string }): Issue[] {
+export function scanExtension(extPath: string, manifest: Manifest, opts: { minFirefox: string; shim?: boolean }): Issue[] {
+  const shim = opts.shim !== false;
   const issues: Issue[] = [];
 
   // Declared icon paths that don't exist on disk → Firefox shows a blank icon and
@@ -390,6 +423,9 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
     ? manifest.background.service_worker.replace(/^\.?\//, "")
     : undefined;
   const checkMainWorld = majorVersion(opts.minFirefox) < MAIN_WORLD_MIN_FIREFOX;
+  // An MV2 background is persistent unless it says otherwise, and Firefox keeps it
+  // loaded; only an event page or a converted service worker drops its timers.
+  const unloadingBackground = (manifest.manifest_version ?? 2) >= 3 || manifest.background?.persistent === false;
 
   let faviconNoted = false;
   let extUrlNoted = false;
@@ -419,15 +455,26 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
       const m = FAVICON_RE.exec(content);
       if (m) {
         faviconNoted = true;
-        issues.push({
-          severity: "info",
-          category: "api",
-          message: "Favicon access via chrome://favicon / _favicon; the shim serves these URLs for <img> and fetch.",
-          file: rel,
-          line: lineAt(m.index),
-          fix: "No action needed for images and fetch; a favicon URL used from CSS isn't covered.",
-          shimmed: true,
-        });
+        issues.push(
+          shim
+            ? {
+                severity: "info",
+                category: "api",
+                message: "Favicon access via chrome://favicon / _favicon; the shim serves these URLs for <img> and fetch.",
+                file: rel,
+                line: lineAt(m.index),
+                fix: "No action needed for images and fetch; a favicon URL used from CSS isn't covered.",
+                shimmed: true,
+              }
+            : {
+                severity: "warning",
+                category: "api",
+                message: "Favicon access via chrome://favicon / _favicon; Firefox has no favicon service for add-ons, so these URLs don't load.",
+                file: rel,
+                line: lineAt(m.index),
+                fix: "--no-shim leaves out the shim that serves them; convert without it.",
+              },
+        );
       }
     }
 
@@ -469,14 +516,25 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
       const m = NEW_TAB_URL_RE.exec(content);
       if (m) {
         newTabNoted = true;
-        issues.push({
-          severity: "info",
-          category: "api",
-          message: "chrome://newtab is opened as Firefox's new tab page: the shim drops the URL from tabs.create, tabs.update and windows.create, which refuse chrome:// URLs.",
-          file: rel,
-          line: lineAt(m.index),
-          shimmed: true,
-        });
+        issues.push(
+          shim
+            ? {
+                severity: "info",
+                category: "api",
+                message: "chrome://newtab is opened as Firefox's new tab page: the shim drops the URL from tabs.create, tabs.update and windows.create, which refuse chrome:// URLs.",
+                file: rel,
+                line: lineAt(m.index),
+                shimmed: true,
+              }
+            : {
+                severity: "warning",
+                category: "api",
+                message: "chrome://newtab can't be opened: tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox.",
+                file: rel,
+                line: lineAt(m.index),
+                fix: "--no-shim leaves out the shim that opens Firefox's new tab page instead; convert without it.",
+              },
+        );
       }
     }
 
@@ -495,7 +553,7 @@ export function scanExtension(extPath: string, manifest: Manifest, opts: { minFi
       }
     }
 
-    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel, opts.minFirefox);
+    if (isJs) scanJsContent(content, rel, issues, rel.split("\\").join("/") === swRel, { minFirefox: opts.minFirefox, shim, unloadingBackground });
   }
 
   return issues;

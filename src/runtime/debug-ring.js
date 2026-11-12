@@ -130,17 +130,21 @@ var __SHIM_DEBUG_WRITE__ = (function () {
     } catch (e) {}
     // The extension's own caught failures usually end in console.error/warn; tee
     // those too. The shim's own traces go to console.log, which stays untouched.
+    // The console object is held here, not looked up per call: LavaMoat's
+    // scuttling (MetaMask) turns globalThis.console into a throwing getter after
+    // startup while the bundle keeps logging through its own reference.
     try {
       if (typeof console !== "undefined") {
+        var con = console;
         ["error", "warn"].forEach(function (level) {
-          var orig = console[level];
+          var orig = con[level];
           if (typeof orig !== "function" || orig.__debugRingTee) return;
           var teed = function () {
             try { write(["[console." + level + "]"].concat(Array.prototype.slice.call(arguments))); } catch (e) {}
-            return orig.apply(console, arguments);
+            return orig.apply(con, arguments);
           };
           teed.__debugRingTee = true;
-          console[level] = teed;
+          con[level] = teed;
         });
       }
     } catch (e) {}

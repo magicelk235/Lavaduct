@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { run } from "../../util.js";
 import type { InstallCandidate, Platform } from "./index.js";
-import { symlinkLockHolder } from "./shared.js";
+import { processAgeMs, symlinkLockHolder } from "./shared.js";
 
 // Names the Mozilla disk images use, plus the older unbranded Nightly name.
 const APP_NAMES = [
@@ -106,6 +106,8 @@ export const darwin: Platform = {
   // the first second after taking the profile lock never quit, however often
   // the request is repeated. Asked five seconds in, every one did.
   quitMinAgeMs: 5_000,
+
+  processAgeMs,
 
   visibleLaunchArgs() {
     // Started from a terminal, Firefox would otherwise open behind it.

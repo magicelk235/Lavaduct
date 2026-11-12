@@ -89,6 +89,12 @@
   var isTopFrame = true;
   try { isTopFrame = typeof window === "undefined" || window.top === window; } catch (e) { isTopFrame = false; }
   var isBackground = isExtensionPage && isTopFrame && detectBackground();
+  // A converted worker's chunks are loaded by its pages too, so their "am I the
+  // worker?" checks were rewritten to `check || globalThis.__lavaductBackground
+  // === true` (src/input/stage.ts rewriteHoistedBackgroundChecks): true here only.
+  if (isBackground) {
+    try { Object.defineProperty(G, "__lavaductBackground", { value: true, configurable: true }); } catch (e) {}
+  }
 
   var ORIGIN = "";
   try { ORIGIN = String(api.runtime.getURL("/")).replace(/\/+$/, ""); } catch (e) {}
@@ -325,7 +331,9 @@
   var PANEL_MSG_KEY = "__sidePanelShim:message";
 
   function installSidePanel() {
-    if (!isExtensionPage) return;
+    // Chrome defines chrome.sidePanel only with the sidePanel permission, and
+    // code tests for it: `if (chrome.sidePanel) open() else openWindow()`.
+    if (!isExtensionPage || !CONFIG.sidePanel) return;
     var sidebar = api.sidebarAction || null;
     if (!sidebar && !api.windows) return;
 
@@ -1105,6 +1113,28 @@
     defineMissing(G, "skipWaiting", function () { return Promise.resolve(); });
   }
 
+  // ── A worker's own localStorage ─────────────────────────────────────────────
+  // A service worker has no localStorage or sessionStorage, so a bundle may
+  // give itself one: `self.localStorage = polyfill`. In the event page both are
+  // getter-only accessors, and the assignment throws in strict and module code,
+  // ending the background there. The names the bundle assigns become plain
+  // writable properties holding Firefox's storage, so reads still reach it
+  // until the bundle replaces it. Only in the background of a converted worker.
+  function installAssignableStorageGlobals() {
+    var names = CONFIG.storageGlobalsAssigned;
+    if (!isBackground || !Array.isArray(names)) return;
+    names.forEach(function (name) {
+      var desc = null;
+      for (var o = G; o && !desc; o = Object.getPrototypeOf(o)) desc = Object.getOwnPropertyDescriptor(o, name) || null;
+      if (!desc || typeof desc.get !== "function" || desc.set) return;
+      var value;
+      try { value = G[name]; } catch (e) {}
+      try {
+        Object.defineProperty(G, name, { value: value, writable: true, configurable: true, enumerable: desc.enumerable === true });
+      } catch (e) { dbg("can't make " + name + " assignable:", errorMessage(e)); }
+    });
+  }
+
   // ── Service worker messaging ────────────────────────────────────────────────
   // A Chrome extension's pages reach its service worker through
   // navigator.serviceWorker (ready, controller, getRegistration), and the worker
@@ -1118,12 +1148,13 @@
   //     for the page as the source;
   //   - Client.postMessage fires `message` on the page's navigator.serviceWorker,
   //     queued until the page starts its messages, as in Chrome.
-  // The event page can't answer the pages' requests the way a worker's fetch
-  // handler does, so no page is controlled: `controller` is null and `ready`
-  // gives the worker, as for a page Chrome loaded without its worker. Code that
-  // reads `controller` as "my requests went through the worker" then asks the
-  // worker instead. For the same reason clients.matchAll() lists every page of
-  // the add-on whatever includeUncontrolled says.
+  // Chrome's worker controls the add-on's pages, so `controller` is the worker
+  // and code posts to it there. A worker that handles `fetch` serves its pages'
+  // requests, which the event page can't, so its pages get no controller
+  // (CONFIG.serviceWorkerController is off) and code that reads `controller` as
+  // "my requests went through the worker" asks the worker instead; `ready`
+  // still gives it. clients.matchAll() lists every page of the add-on whatever
+  // includeUncontrolled says.
   var SW_ENVELOPE = "__lavaductServiceWorkerMessage";
 
   function swScriptUrl() {
@@ -1255,7 +1286,7 @@
       return url === undefined || String(url).indexOf(ORIGIN + "/") === 0 || !/^[a-z][a-z0-9+.-]*:/i.test(String(url));
     }
     Object.defineProperties(container, {
-      controller: { value: null, enumerable: true },
+      controller: { value: CONFIG.serviceWorkerController ? worker : null, enumerable: true },
       ready: { value: Promise.resolve(registration), enumerable: true },
       getRegistration: { value: function (url) { return Promise.resolve(inScope(url) ? registration : undefined); }, writable: true, configurable: true },
       getRegistrations: { value: function () { return Promise.resolve([registration]); }, writable: true, configurable: true },
@@ -1425,9 +1456,11 @@
   // Chrome worker restarted after its install is in. No update ever arrives, so
   // the registration's events never fire. Its postMessage reaches the worker
   // itself, with the worker as the source, as in Chrome. Only emitted for a
-  // bundle that reads them.
+  // bundle that reads them. A bundle with web push code gets the worker without
+  // the registration (see PUSH_MANAGER_REF_RE in shim.ts): MetaMask boots on
+  // `"activated" === self.serviceWorker.state` and carries Firebase's push code.
   function installServiceWorkerRegistration() {
-    if (!CONFIG.serviceWorkerRegistration || !isBackground || typeof EventTarget !== "function") return;
+    if (!CONFIG.serviceWorkerSelf || !isBackground || typeof EventTarget !== "function") return;
     var worker = makeServiceWorker(function postMessage(message, transfer) {
       var list = transferList(transfer);
       var copy = structuredClone({ m: message, t: list }, { transfer: list });
@@ -1442,7 +1475,59 @@
       }, 0);
     });
     defineMissing(G, "serviceWorker", worker);
-    defineMissing(G, "registration", makeRegistration(worker));
+    if (CONFIG.serviceWorkerRegistration) defineMissing(G, "registration", makeRegistration(worker));
+  }
+
+  // ── The worker's install and activate events ───────────────────────────────
+  // Chrome installs an extension's service worker when the extension is
+  // installed or updated: the worker's script runs, `install` fires, then
+  // `activate`, each waiting on the promises its handlers pass to waitUntil.
+  // Workers boot from those events (MetaMask starts its app from `install`)
+  // and call skipWaiting() in them. The event page gets no such events, and a
+  // page has no skipWaiting, so both are given here: once per add-on version,
+  // after the background's scripts have run, `install` and then `activate`
+  // are dispatched on the global, oninstall and onactivate included. Without
+  // localStorage nothing is dispatched, since the version can't be told apart
+  // and an event page restarts every time it wakes. Only emitted for a bundle
+  // that listens for them or calls skipWaiting().
+  var SW_VERSION_KEY = "__lavaductServiceWorkerVersion";
+
+  function installServiceWorkerLifecycle() {
+    if (!CONFIG.serviceWorkerLifecycle || !isBackground) return;
+    defineMissing(G, "skipWaiting", function skipWaiting() { return Promise.resolve(); });
+    if (typeof G.addEventListener !== "function" || typeof G.dispatchEvent !== "function" || typeof Event !== "function") return;
+    ["install", "activate"].forEach(function (type) {
+      if (!("on" + type in G)) handlerProps(G, [type]);
+    });
+    if (!localStore) return;
+    var version = "";
+    try { version = String(api.runtime.getManifest().version || ""); } catch (e) {}
+    var last = null;
+    try { last = localStore.getItem(SW_VERSION_KEY); } catch (e) {}
+    if (last === version) return;
+
+    // An ExtendableEvent: resolves once every promise passed to waitUntil has
+    // settled, and keeps the event page awake until then.
+    function fire(type) {
+      var pending = [];
+      var evt = new Event(type);
+      try {
+        Object.defineProperty(evt, "waitUntil", {
+          configurable: true, writable: true,
+          value: function waitUntil(p) { pending.push(Promise.resolve(p).catch(noop)); },
+        });
+      } catch (e) {}
+      try { G.dispatchEvent(evt); } catch (e) { dbg("worker " + type + " event failed:", errorMessage(e)); }
+      var all = Promise.all(pending);
+      if (pending.length) keepAliveUntil(all);
+      return all;
+    }
+    function run() {
+      try { localStore.setItem(SW_VERSION_KEY, version); } catch (e) {}
+      fire("install").then(function () { return fire("activate"); });
+    }
+    if (hasDocument && document.readyState === "loading") document.addEventListener("DOMContentLoaded", run, { once: true });
+    else setTimeout(run, 0);
   }
 
   // ── The worker's location in Web Lock names ────────────────────────────────
@@ -1472,39 +1557,102 @@
     });
   }
 
-  // ── chrome://newtab ─────────────────────────────────────────────────────────
-  // tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox
-  // ("Illegal URL"). A bundle that opens Chrome's new tab page gets Firefox's,
-  // which those calls open when given no url. Only emitted for a bundle that
-  // names chrome://newtab.
-  var NEW_TAB_RE = /^chrome:\/\/new-?tab(?:-page)?\/?$/i;
+  // ── The worker's script in getManifest() ────────────────────────────────────
+  // Firefox returns the converted manifest, whose background has scripts and no
+  // service_worker. Bundles tell the worker from their pages by resolving that
+  // script against their own location (Loom):
+  //   new URL(getManifest().background.service_worker, location.origin).pathname === location.pathname
+  // Without the key the background answers no and sends what it would handle
+  // itself to itself with runtime.sendMessage, where nothing receives it. The
+  // background is told its own page is the worker's script, so the check says
+  // yes there; everywhere else the key is Chrome's, the worker's real script,
+  // which navigator.serviceWorker.register() in the pages matches.
+  function installServiceWorkerManifest() {
+    if (!CONFIG.serviceWorkerManifest || !CONFIG.serviceWorkerScript) return;
+    var script = isBackground ? stripSlashes(loc.pathname) : stripSlashes(CONFIG.serviceWorkerScript);
+    namespaces.forEach(function (ns) {
+      var rt = ns && ns.runtime;
+      var native = rt && rt.getManifest;
+      if (typeof native !== "function") return;
+      replaceMember(rt, "getManifest", function () {
+        var manifest = native.apply(rt, arguments);
+        var bg = manifest && manifest.background;
+        if (!bg || typeof bg !== "object" || typeof bg.service_worker === "string") return manifest;
+        var copy = Object.assign({}, manifest);
+        copy.background = Object.assign({}, bg, { service_worker: script });
+        return copy;
+      });
+    });
+  }
 
-  function installNewTabUrls() {
-    if (!CONFIG.newTab) return;
-    var isNewTab = function (u) { return typeof u === "string" && NEW_TAB_RE.test(u); };
-    function fixed(props) {
+  // ── chrome://newtab and chrome://extensions/shortcuts ──────────────────────
+  // tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox
+  // ("Illegal URL"), and about:newtab and about:home as well. A bundle that
+  // opens Chrome's new tab page gets Firefox's, which tabs.create and
+  // windows.create open when given no url. tabs.update can't navigate a tab to
+  // it, except where the add-on overrides the new tab page itself: chrome://newtab
+  // then shows the add-on's page, as it does in Chrome, in place and in
+  // windows.create lists alike. Chrome's shortcuts page is Firefox's
+  // commands.openShortcutSettings(), which opens about:addons there; the call
+  // answers with the tab that ends up active. Only emitted for a bundle that
+  // names these URLs.
+  var NEW_TAB_RE = /^chrome:\/\/new-?tab(?:-page)?\/?$/i;
+  var SHORTCUTS_RE = /^chrome:\/\/extensions\/(?:shortcuts|configureCommands)\/?$/i;
+
+  function installChromeUrls() {
+    if (!CONFIG.newTab && !CONFIG.shortcutsPage) return;
+    var ownNewTab = CONFIG.newTabPage ? extensionUrl(CONFIG.newTabPage) : "";
+    var isNewTab = function (u) { return !!CONFIG.newTab && typeof u === "string" && NEW_TAB_RE.test(u); };
+    var isShortcuts = function (u) { return !!CONFIG.shortcutsPage && typeof u === "string" && SHORTCUTS_RE.test(u); };
+    function fixed(props, inPlace) {
       var url = props.url;
       if (!isNewTab(url) && !(Array.isArray(url) && url.some(isNewTab))) return props;
       var copy = Object.assign({}, props);
-      var rest = Array.isArray(url) ? url.filter(function (u) { return !isNewTab(u); }) : [];
-      if (rest.length) copy.url = rest;
+      var rest = Array.isArray(url)
+        ? (ownNewTab ? url.map(function (u) { return isNewTab(u) ? ownNewTab : u; }) : url.filter(function (u) { return !isNewTab(u); }))
+        : (inPlace && ownNewTab ? ownNewTab : null);
+      if (rest && (!Array.isArray(rest) || rest.length)) copy.url = rest;
       else delete copy.url;
       return copy;
     }
-    function wrap(obj, name) {
+    // Called before anything is awaited, so a user action that opened the call
+    // still counts. Answers with the about:addons tab Firefox opened, or the
+    // active tab of the last focused window when the add-on can't see URLs.
+    function openShortcuts(ns, cb) {
+      var p;
+      try { p = Promise.resolve(ns.commands.openShortcutSettings()); } catch (e) { p = Promise.reject(e); }
+      p = p.then(function () {
+        return api.tabs.query({});
+      }).then(function (tabs) {
+        var list = Array.isArray(tabs) ? tabs : [];
+        var addons = list.filter(function (t) { return t && /^about:addons/.test(String(t.url || "")); });
+        if (addons.length) return addons.filter(function (t) { return t.active; })[0] || addons[0];
+        return Promise.resolve(api.tabs.query({ active: true, lastFocusedWindow: true })).then(function (t) { return t && t[0]; });
+      });
+      return respond(ns, p, cb);
+    }
+    function wrap(ns, obj, name, inPlace, shortcuts) {
       if (!obj || typeof obj[name] !== "function") return;
       var original = obj[name];
       var wrapped = function () {
         var args = Array.prototype.slice.call(arguments);
-        for (var i = 0; i < args.length; i++) if (args[i] && typeof args[i] === "object") args[i] = fixed(args[i]);
+        for (var i = 0; i < args.length; i++) {
+          if (!args[i] || typeof args[i] !== "object") continue;
+          var commands = null;
+          try { commands = ns.commands; } catch (e) {}
+          if (shortcuts && isShortcuts(args[i].url) && commands && typeof commands.openShortcutSettings === "function") {
+            return openShortcuts(ns, typeof args[args.length - 1] === "function" ? args[args.length - 1] : null);
+          }
+          args[i] = fixed(args[i], inPlace);
+        }
         return original.apply(obj, args);
       };
       try { Object.defineProperty(obj, name, { value: wrapped, writable: true, configurable: true, enumerable: true }); } catch (e) {}
     }
     namespaces.forEach(function (ns) {
-      wrap(ns.tabs, "create");
-      wrap(ns.tabs, "update");
-      wrap(ns.windows, "create");
+      wrap(ns, ns.tabs, "create", false, true);
+      wrap(ns, ns.tabs, "update", true, true);
+      wrap(ns, ns.windows, "create", false, false);
     });
   }
 
@@ -1553,10 +1701,22 @@
   var DNR_DOMAIN_CONDITIONS = ["requestDomains", "excludedRequestDomains", "initiatorDomains", "excludedInitiatorDomains"];
   var DNR_MISSING_TYPES = { webbundle: true, webtransport: true };
 
+  // Chrome's extension ID is the host of its own origin, so code names it in a
+  // rule's domains to mean its own requests: initiatorDomains: [chrome.runtime.id].
+  // Firefox's add-on ID isn't a domain, and its pages' host is a per-install
+  // UUID, so the add-on's ID, and its Chrome ID written into the code, become
+  // that host.
+  var OWN_HOST = "";
+  try { OWN_HOST = new URL(ORIGIN + "/").host; } catch (e) {}
+  var ownIds = {};
+  try { ownIds[String(api.runtime.id).toLowerCase()] = true; } catch (e) {}
+  if (CONFIG.extensionId) ownIds[String(CONFIG.extensionId).toLowerCase()] = true;
+
   // Chrome lower-cases a rule's domains, and Firefox refuses an upper-case one.
   function firefoxDomain(d) {
     if (typeof d !== "string") return d;
     var lower = d.toLowerCase();
+    if (OWN_HOST && ownIds[lower] === true) return OWN_HOST;
     if (lower.indexOf(":") < 0 || lower.charAt(0) === "[") return lower;
     try { return new URL("http://[" + lower + "]/").hostname; } catch (e) { return d; }
   }
@@ -1594,15 +1754,28 @@
     return out;
   }
 
+  // The session rules lavaduct adds for itself: the backend Origin rule, and
+  // the frame grants' rules just above it (frame-grants-bg.js). An add-on that
+  // clears every session rule at startup (getSessionRules, then removeRuleIds
+  // of all of them, as Requestly does) or numbers its rules after the highest
+  // one it sees would take them out or collide with them, so with
+  // CONFIG.reservedSessionRules the add-on's getSessionRules leaves them out
+  // and its removeRuleIds can't name them. The frame grants reach Firefox's
+  // own methods through __lavaductNative on the wrappers.
+  function isShimRule(id) {
+    return id === BACKEND_ORIGIN_RULE_ID || (id >= 2147480100 && id < 2147480200);
+  }
+
   function installRuleFilter() {
     namespaces.forEach(function (ns) {
       var dnr = null;
       try { dnr = ns.declarativeNetRequest; } catch (e) {}
       if (!dnr || typeof dnr !== "object") return;
+      var hide = CONFIG.reservedSessionRules === true;
       ["updateDynamicRules", "updateSessionRules"].forEach(function (name) {
         var native = dnr[name];
         if (typeof native !== "function") return;
-        replaceMember(dnr, name, function (options) {
+        var wrapper = function (options) {
           var args = Array.prototype.slice.call(arguments);
           if (options && typeof options === "object" && Array.isArray(options.addRules)) {
             var rules = [];
@@ -1613,9 +1786,28 @@
             });
             args[0] = Object.assign({}, options, { addRules: rules });
           }
+          if (hide && name === "updateSessionRules" && args[0] && typeof args[0] === "object" && Array.isArray(args[0].removeRuleIds)) {
+            args[0] = Object.assign({}, args[0], { removeRuleIds: args[0].removeRuleIds.filter(function (id) { return !isShimRule(id); }) });
+          }
           return native.apply(dnr, args);
-        });
+        };
+        if (hide && name === "updateSessionRules") {
+          try { Object.defineProperty(wrapper, "__lavaductNative", { value: native }); } catch (e) {}
+        }
+        replaceMember(dnr, name, wrapper);
       });
+      var getSession = dnr.getSessionRules;
+      if (!hide || typeof getSession !== "function") return;
+      var getWrapper = function () {
+        var args = Array.prototype.slice.call(arguments);
+        var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+        var p = Promise.resolve(getSession.apply(dnr, args)).then(function (rules) {
+          return Array.isArray(rules) ? rules.filter(function (r) { return !r || !isShimRule(r.id); }) : rules;
+        });
+        return respond(ns, p, cb);
+      };
+      try { Object.defineProperty(getWrapper, "__lavaductNative", { value: getSession }); } catch (e) {}
+      replaceMember(dnr, "getSessionRules", getWrapper);
     });
   }
 
@@ -1714,6 +1906,12 @@
     },
     identity: {
       AccountStatus: ["SYNC", "ANY"],
+    },
+    // Firefox's has INSTALL, UPDATE and BROWSER_UPDATE. Chrome code compares a
+    // repeat with OnInstalledReason.CHROME_UPDATE, the reason the onInstalled
+    // wrapper gives a temporary add-on loaded again.
+    runtime: {
+      OnInstalledReason: ["install", "update", "chrome_update", "shared_module_update"],
     },
     storage: {
       AccessLevel: ["TRUSTED_AND_UNTRUSTED_CONTEXTS", "TRUSTED_CONTEXTS"],
@@ -2160,6 +2358,248 @@
     });
   }
 
+  // ── Content scripts injected at runtime ────────────────────────────────────
+  // The conversion puts the shim first in every manifest content script, but
+  // files injected later with scripting.executeScript, registered with
+  // registerContentScripts or updateContentScripts, or run with
+  // tabs.executeScript (MV2) ran without it in a tab no manifest script
+  // matched: no window.chrome, no JSON fallback for messages, no favicon URLs.
+  // The shim goes first in each such file list of the isolated world (the
+  // page's own world has no extension API); where it already ran in that
+  // frame, it returns at once. Injections of a function are left alone, and
+  // getRegisteredContentScripts leaves the shim out. Only emitted for a
+  // bundle that injects files.
+  function withShimFirst(files) {
+    var shim = CONFIG.injectShim;
+    if (!Array.isArray(files) || !files.length) return files;
+    var first = String(files[0]).replace(/^\/+/, "");
+    return first === shim ? files : [shim].concat(files);
+  }
+
+  function withoutShim(files) {
+    if (!Array.isArray(files) || !files.length || String(files[0]).replace(/^\/+/, "") !== CONFIG.injectShim) return files;
+    return files.slice(1);
+  }
+
+  function installInjectedScriptShim() {
+    if (typeof CONFIG.injectShim !== "string" || !CONFIG.injectShim || !isExtensionPage) return;
+    function copyWith(obj, key, value) {
+      var c = {};
+      for (var k in obj) c[k] = obj[k];
+      c[key] = value;
+      return c;
+    }
+    function isolated(o) { return o && typeof o === "object" && o.world !== "MAIN"; }
+    namespaces.forEach(function (ns) {
+      var scripting = null, tabs = null;
+      try { scripting = ns.scripting; } catch (e) {}
+      try { tabs = ns.tabs; } catch (e) {}
+      if (scripting && typeof scripting.executeScript === "function") {
+        var exec = scripting.executeScript;
+        replaceMember(scripting, "executeScript", function (details) {
+          var args = Array.prototype.slice.call(arguments);
+          if (isolated(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", withShimFirst(details.files));
+          return exec.apply(scripting, args);
+        });
+      }
+      ["registerContentScripts", "updateContentScripts"].forEach(function (name) {
+        if (!scripting || typeof scripting[name] !== "function") return;
+        var native = scripting[name];
+        replaceMember(scripting, name, function (scripts) {
+          var args = Array.prototype.slice.call(arguments);
+          if (Array.isArray(scripts)) {
+            args[0] = scripts.map(function (s) { return isolated(s) && Array.isArray(s.js) ? copyWith(s, "js", withShimFirst(s.js)) : s; });
+          }
+          return native.apply(scripting, args);
+        });
+      });
+      if (scripting && typeof scripting.getRegisteredContentScripts === "function") {
+        var getRegistered = scripting.getRegisteredContentScripts;
+        replaceMember(scripting, "getRegisteredContentScripts", function () {
+          var args = Array.prototype.slice.call(arguments);
+          var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+          var p = Promise.resolve(getRegistered.apply(scripting, args.length ? args : [])).then(function (list) {
+            return Array.isArray(list) ? list.map(function (s) { return s && Array.isArray(s.js) ? copyWith(s, "js", withoutShim(s.js)) : s; }) : list;
+          });
+          return respond(ns, p, cb);
+        });
+      }
+      // MV2: one file per call, so the shim goes in a call of its own first.
+      if (tabs && typeof tabs.executeScript === "function") {
+        var tabsExec = tabs.executeScript;
+        replaceMember(tabs, "executeScript", function () {
+          var args = Array.prototype.slice.call(arguments);
+          var at = typeof args[0] === "object" && args[0] !== null ? 0 : 1;
+          var details = args[at];
+          if (!details || typeof details.file !== "string" || String(details.file).replace(/^\/+/, "") === CONFIG.injectShim) return tabsExec.apply(tabs, args);
+          var shimDetails = { file: "/" + CONFIG.injectShim };
+          ["allFrames", "frameId", "matchAboutBlank", "runAt"].forEach(function (k) { if (details[k] !== undefined) shimDetails[k] = details[k]; });
+          var shimArgs = at === 1 ? [args[0], shimDetails] : [shimDetails];
+          var first;
+          try { first = Promise.resolve(api.tabs.executeScript.apply(api.tabs, shimArgs)); } catch (e) { first = Promise.reject(e); }
+          var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+          var p = first.catch(function (e) { dbg("shim injection failed:", errorMessage(e)); }).then(function () {
+            return tabsExec.apply(tabs, args);
+          });
+          return respond(ns, p, cb);
+        });
+      }
+    });
+  }
+
+  // ── externally_connectable ids ─────────────────────────────────────────────
+  // In Chrome a manifest with externally_connectable lets in only the
+  // extensions its `ids` lists: none when the list is missing, every one for
+  // "*". Firefox has no such key and delivers every other add-on's messages
+  // and ports to runtime.onMessageExternal and onConnectExternal. The add-on's
+  // listeners now hear only the senders Chrome would let through. The list
+  // holds Chrome IDs, so a sender converted by lavaduct matches by the Chrome
+  // ID its add-on ID starts with. Only emitted for a manifest that declares
+  // externally_connectable; the page bridge feeds web pages' messages to the
+  // listeners directly, past this filter.
+  function allowedSender(sender) {
+    var ids = CONFIG.externalIds;
+    if (ids.indexOf("*") >= 0) return true;
+    var id = "";
+    try { id = String((sender && sender.id) || ""); } catch (e) {}
+    if (!id) return false;
+    for (var i = 0; i < ids.length; i++) {
+      var allowed = String(ids[i]);
+      if (id === allowed) return true;
+      if (id.indexOf(allowed.toLowerCase() + ".") === 0 && /@lavaduct$/.test(id)) return true;
+    }
+    return false;
+  }
+
+  function installExternalSenders() {
+    if (!Array.isArray(CONFIG.externalIds) || typeof WeakMap !== "function") return;
+    namespaces.forEach(function (ns) {
+      var rt = null;
+      try { rt = ns.runtime; } catch (e) {}
+      if (!rt) return;
+      [["onMessageExternal", 1], ["onConnectExternal", 0]].forEach(function (pair) {
+        var ev = null;
+        try { ev = rt[pair[0]]; } catch (e) {}
+        if (!ev || typeof ev.addListener !== "function") return;
+        var senderOf = pair[1] === 1 ? function (args) { return args[1]; } : function (args) { return args[0] && args[0].sender; };
+        var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+        var wrappers = new WeakMap();
+        function wrapperOf(fn) {
+          if (typeof fn !== "function") return fn;
+          var w = wrappers.get(fn);
+          if (!w) {
+            w = function () {
+              if (!allowedSender(senderOf(arguments))) {
+                dbg(pair[0] + ": dropped a sender externally_connectable doesn't list:", senderOf(arguments) && senderOf(arguments).id);
+                if (pair[1] === 0 && arguments[0] && typeof arguments[0].disconnect === "function") {
+                  try { arguments[0].disconnect(); } catch (e) {}
+                }
+                return undefined;
+              }
+              return fn.apply(this, arguments);
+            };
+            wrappers.set(fn, w);
+          }
+          return w;
+        }
+        replaceMember(ev, "addListener", function (fn) {
+          var args = Array.prototype.slice.call(arguments);
+          args[0] = wrapperOf(fn);
+          return add.apply(ev, args);
+        });
+        if (typeof remove === "function") replaceMember(ev, "removeListener", function (fn) { return remove.call(ev, wrappers.get(fn) || fn); });
+        if (typeof has === "function") replaceMember(ev, "hasListener", function (fn) { return has.call(ev, wrappers.get(fn) || fn); });
+      });
+    });
+  }
+
+  // ── Values Chrome's storage keeps and Firefox can't clone ───────────────────
+  // Chrome's storage.set serializes values: a function, or an object without
+  // own data such as a URL, is stored as {}. Firefox structured-clones them and
+  // refuses the whole call (in Firefox 160 for local, sync and session alike):
+  // the promise rejects with "DataCloneError: Function object could not be
+  // cloned.", the callback sees it as lastError, and nothing is stored. Rabby
+  // keeps rules with a getValue function in storage.local. A call Firefox
+  // takes stays Firefox's; one it refuses for a clone error is sent again with
+  // what it couldn't clone replaced the way Chrome stores it. Only emitted for
+  // a bundle that uses storage.
+  function chromeStorable(value, ancestors) {
+    if (typeof value === "function") return {};
+    if (typeof value === "symbol") return undefined;
+    if (value === null || typeof value !== "object") return value;
+    if (ancestors.indexOf(value) >= 0) return undefined;
+    var proto = Object.getPrototypeOf(value);
+    var plain = Array.isArray(value) || proto === Object.prototype || proto === null;
+    if (!plain && typeof structuredClone === "function") {
+      try {
+        structuredClone(value);
+        return value;
+      } catch (e) {
+        if (!isCloneError(e)) return value;
+      }
+    }
+    ancestors.push(value);
+    var out;
+    if (Array.isArray(value)) {
+      out = [];
+      for (var i = 0; i < value.length; i++) {
+        var item = chromeStorable(value[i], ancestors);
+        out.push(item === undefined ? null : item);
+      }
+    } else {
+      out = {};
+      Object.keys(value).forEach(function (k) {
+        var v = chromeStorable(value[k], ancestors);
+        if (v !== undefined) out[k] = v;
+      });
+    }
+    ancestors.pop();
+    return out;
+  }
+
+  function installStorageCloneFallback() {
+    if (!CONFIG.storageClone) return;
+    namespaces.forEach(function (ns) {
+      var storage = null;
+      try { storage = ns.storage; } catch (e) {}
+      if (!storage) return;
+      ["local", "sync", "session"].forEach(function (name) {
+        var area = null;
+        try { area = storage[name]; } catch (e) {}
+        var set = area && area.set;
+        if (typeof set !== "function") return;
+        replaceMember(area, "set", function (items) {
+          var args = Array.prototype.slice.call(arguments);
+          var storable = function () { return chromeStorable(items, []); };
+          var last = args.length - 1;
+          if (last >= 1 && typeof args[last] === "function") {
+            var cb = args[last];
+            args[last] = function () {
+              var err = null;
+              try { err = ns.runtime.lastError; } catch (e) {}
+              if (err && isCloneError(err)) {
+                var copy = null;
+                try { copy = storable(); } catch (e) {}
+                if (copy) return set.call(area, copy, cb);
+              }
+              return cb.apply(this, arguments);
+            };
+            return set.apply(area, args);
+          }
+          var retry = function (e) {
+            if (!isCloneError(e)) throw e;
+            var copy;
+            try { copy = storable(); } catch (x) { throw e; }
+            return set.call(area, copy);
+          };
+          var result;
+          try { result = set.apply(area, args); } catch (e) { return retry(e); }
+          return result && typeof result.then === "function" ? result.then(null, retry) : result;
+        });
+      });
+    });
+  }
+
   // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
   // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
   // such as Cookie or Referer; Firefox shows every header without it, has no
@@ -2193,6 +2633,48 @@
         });
       });
     });
+  }
+
+  // ── A listener's filter passed as false ────────────────────────────────────
+  // Code built for both browsers passes an event's filter as
+  // `isFirefox && { … }`, which a Chrome build compiles to
+  // addListener(fn, false). Firefox's schemas refuse false, 0 or "" where a
+  // filter object or nothing goes ("Incorrect argument types for
+  // tabs.onUpdated"), and the throw ends the script that registered it. A
+  // trailing argument that is falsy (false, 0, "", null, undefined) is left
+  // out instead: that's what the add-on means by it. The function is passed on
+  // as it is, so removeListener and hasListener still find it. Every event
+  // object the namespaces hold is wrapped once (chrome and browser share them);
+  // a namespace a later permission grant adds isn't. Only emitted for a bundle
+  // that passes addListener a last argument that may be false.
+  function installFalsyListenerArgs() {
+    if (!CONFIG.falsyListenerArgs) return;
+    var wrapped = [];
+    function wrapEvent(ev) {
+      if (wrapped.indexOf(ev) >= 0) return;
+      wrapped.push(ev);
+      var add = ev.addListener;
+      replaceMember(ev, "addListener", function () {
+        var args = Array.prototype.slice.call(arguments);
+        while (args.length > 1 && !args[args.length - 1]) args.length--;
+        return add.apply(ev, args);
+      });
+    }
+    function walk(obj, depth) {
+      var keys;
+      try { keys = Object.keys(obj); } catch (e) { return; }
+      keys.forEach(function (key) {
+        var v = null;
+        try { v = obj[key]; } catch (e) {}
+        if (!v || typeof v !== "object") return;
+        if (/^on[A-Z]/.test(key)) {
+          if (typeof v.addListener === "function") wrapEvent(v);
+        } else if (depth > 0) {
+          walk(v, depth - 1);
+        }
+      });
+    }
+    namespaces.forEach(function (ns) { walk(ns, 2); });
   }
 
   // ── permissions Firefox doesn't know ───────────────────────────────────────
@@ -2362,11 +2844,14 @@
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
   try { installFavicon(); } catch (e) { dbg("favicon shim failed:", errorMessage(e)); }
   try { installServiceWorkerScope(); } catch (e) { dbg("ServiceWorkerGlobalScope shim failed:", errorMessage(e)); }
+  try { installAssignableStorageGlobals(); } catch (e) { dbg("assignable storage globals failed:", errorMessage(e)); }
   try { installServiceWorkerRegistration(); } catch (e) { dbg("registration shim failed:", errorMessage(e)); }
   try { installServiceWorkerClients(); } catch (e) { dbg("clients shim failed:", errorMessage(e)); }
   try { installServiceWorkerContainer(); } catch (e) { dbg("navigator.serviceWorker shim failed:", errorMessage(e)); }
+  try { installServiceWorkerLifecycle(); } catch (e) { dbg("worker lifecycle shim failed:", errorMessage(e)); }
   try { installServiceWorkerLocks(); } catch (e) { dbg("Web Locks shim failed:", errorMessage(e)); }
-  try { installNewTabUrls(); } catch (e) { dbg("new tab URL shim failed:", errorMessage(e)); }
+  try { installServiceWorkerManifest(); } catch (e) { dbg("getManifest service_worker shim failed:", errorMessage(e)); }
+  try { installChromeUrls(); } catch (e) { dbg("chrome:// URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
   try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
   try { installRuleFilter(); } catch (e) { dbg("declarativeNetRequest rule filter failed:", errorMessage(e)); }
@@ -2381,6 +2866,10 @@
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
   try { installMenuActionContext(); } catch (e) { dbg("menu action context shim failed:", errorMessage(e)); }
+  try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
+  try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
+  try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
+  try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();

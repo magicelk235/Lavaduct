@@ -31,7 +31,7 @@ function bridge(t) {
   const clearT = (h) => { timers.delete(h); clearTimeout(h); };
   t.after(() => { for (const h of timers) clearTimeout(h); });
   const world = (file, globals) => {
-    const sandbox = { console, setTimeout: setT, clearTimeout: clearT, Promise, JSON, URL, CustomEvent, ...globals };
+    const sandbox = { console, setTimeout: setT, clearTimeout: clearT, setInterval, clearInterval, Promise, JSON, URL, CustomEvent, ...globals };
     sandbox.self = sandbox;
     sandbox.globalThis = sandbox;
     vm.createContext(sandbox);

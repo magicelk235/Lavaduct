@@ -16,7 +16,9 @@ import { FIREFOX_PERMISSION_SUPPORT } from "./compat-generated.js";
  * illegal in strict JSON but common in hand-edited Chrome manifests (Chrome's own
  * loader tolerates comments). A single character-state scan skips comment runs and
  * trailing commas WITHOUT touching their look-alikes inside string literals (e.g.
- * the "//" in an "https://…" URL), then hands clean JSON to JSON.parse.
+ * the "//" in an "https://…" URL), then hands clean JSON to JSON.parse. Inside
+ * strings it also takes the rest of what Chrome's reader allows
+ * (JSON_PARSE_CHROMIUM_EXTENSIONS): raw line breaks and \xNN escapes.
  */
 export function parseJsonc<T = unknown>(text: string): T {
   // Strip a leading UTF-8 BOM (U+FEFF). Node's readFileSync('utf-8') leaves it in
@@ -31,10 +33,16 @@ export function parseJsonc<T = unknown>(text: string): T {
     const c = text[i];
     const next = text[i + 1];
     if (inString) {
-      out += c;
-      if (escaped) escaped = false;
-      else if (c === "\\") escaped = true;
-      else if (c === '"') inString = false;
+      if (escaped) {
+        escaped = false;
+        out += c === "x" ? "u00" : c;
+      } else if (c === "\n") out += "\\n";
+      else if (c === "\r") out += "\\r";
+      else {
+        out += c;
+        if (c === "\\") escaped = true;
+        else if (c === '"') inString = false;
+      }
       continue;
     }
     if (c === '"') {
@@ -293,6 +301,19 @@ function insecureSearchUrls(m: Manifest): Array<[string, string]> {
   return out;
 }
 
+// Firefox's omnibox keyword (omnibox.json) has no whitespace or colon and doesn't
+// start with "?", and any other keyword refuses the whole manifest. Chrome takes
+// any non-empty one. A __MSG_ value is checked after Firefox localizes it, which
+// needs the locale files, so it is left alone. Returns the keyword Firefox takes
+// ("" when nothing is left), or null when the manifest's is fine.
+const FIREFOX_OMNIBOX_KEYWORD_RE = /^[^?\s:][^\s:]*$/;
+function firefoxOmniboxKeyword(m: Manifest): { from: string; to: string } | null {
+  const omnibox = m.omnibox;
+  const keyword: unknown = typeof omnibox === "object" && omnibox !== null ? Reflect.get(omnibox, "keyword") : undefined;
+  if (typeof keyword !== "string" || keyword === "" || keyword.includes("__MSG_") || FIREFOX_OMNIBOX_KEYWORD_RE.test(keyword)) return null;
+  return { from: keyword, to: keyword.replace(/[\s:]+/g, "").replace(/^\?+/, "") };
+}
+
 // Firefox accepts a port in a pattern but compares it as part of the host name, so a
 // pattern with a port never matches anything.
 function portIssue(pattern: string, where: string, category: string): Issue | null {
@@ -370,6 +391,22 @@ function analyzeCommands(commands: Record<string, unknown>): Issue[] {
   return issues;
 }
 
+// Chrome reserves command names starting with "_": it binds each action command
+// only when the manifest has its action key, and ignores every other reserved name
+// (CommandsHandler::Parse). Firefox binds _execute_action in MV3 and
+// _execute_browser_action in MV2 and treats any other name as an ordinary command,
+// whose shortcut then fires commands.onCommand and can take the action's keys
+// (MetaMask binds Alt+Shift+M to both _execute_browser_action and _execute_action).
+// Firefox's own _execute_sidebar_action, which Chrome ignores, is kept: only an
+// extension written with Firefox in mind declares it.
+const ACTION_COMMAND_KEYS: Record<string, string> = { _execute_action: "action", _execute_browser_action: "browser_action", _execute_page_action: "page_action" };
+function commandsChromeIgnores(m: Manifest): string[] {
+  return Object.keys(m.commands && typeof m.commands === "object" ? m.commands : {}).filter((name) => {
+    if (!name.startsWith("_") || name === "_execute_sidebar_action") return false;
+    return !Object.hasOwn(ACTION_COMMAND_KEYS, name) || !(ACTION_COMMAND_KEYS[name] in m);
+  });
+}
+
 // Chrome's CSP for manifest sandbox pages when the manifest sets none. Firefox
 // applies script-src 'self' to them instead, so eval() and inline scripts fail.
 const CHROME_SANDBOX_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' 'unsafe-eval'; child-src 'self';";
@@ -385,6 +422,86 @@ function lacksSandboxCsp(m: Manifest): boolean {
   return typeof sandbox === "object" && sandbox !== null && typeof Reflect.get(sandbox, "content_security_policy") !== "string";
 }
 
+// Chrome's CSP for MV3 extension pages when the manifest sets none (Chromium's
+// kDefaultMV3CSP, with its enforced minimum's object-src 'self'). Firefox's own
+// default adds upgrade-insecure-requests, which sends every http:// request the
+// background and extension pages make to a host other than loopback as https://.
+const CHROME_EXTENSION_PAGES_CSP = "script-src 'self'; object-src 'self';";
+
+function lacksExtensionPagesCsp(m: Manifest): boolean {
+  if ((m.manifest_version ?? 2) < 3) return false;
+  const csp = m.content_security_policy;
+  return csp === undefined || (typeof csp === "object" && csp !== null && typeof csp.extension_pages !== "string");
+}
+/** Calls `fn` on every CSP string in the manifest and stores what it returns:
+ * each string member of an MV3 content_security_policy (`where` is its key),
+ * MV2's string policy ("content_security_policy") and MV2's sandbox policy
+ * ("sandbox.content_security_policy"). */
+function mapManifestCsps(m: Manifest, fn: (csp: string, where: string) => string): void {
+  const csp = m.content_security_policy;
+  if (typeof csp === "string") m.content_security_policy = fn(csp, "content_security_policy");
+  else if (typeof csp === "object" && csp !== null) {
+    for (const [key, value] of Object.entries(csp)) if (typeof value === "string") csp[key] = fn(value, key);
+  }
+  const sandbox: unknown = m.sandbox;
+  if (typeof sandbox === "object" && sandbox !== null) {
+    const policy: unknown = Reflect.get(sandbox, "content_security_policy");
+    if (typeof policy === "string") Reflect.set(sandbox, "content_security_policy", fn(policy, "sandbox.content_security_policy"));
+  }
+}
+
+// A CSP source can name every host with a bare "*" and still restrict the path
+// (http://*/api/test). Firefox's parser refuses a wildcard host followed by a
+// path ("Couldn't parse invalid host") and drops the source; it takes one
+// followed by a port. A source without a port means the scheme's default port,
+// so writing that port in keeps the source as Chrome reads it.
+const CSP_DEFAULT_PORTS: Record<string, string> = { http: "80", ws: "80", https: "443", wss: "443" };
+const CSP_WILDCARD_HOST_PATH = /(^|[\s;])((https?|wss?):\/\/\*)(\/[^\s;]*)/gi;
+
+/** The sources in `csp` that Firefox drops for a wildcard host followed by a path. */
+export function cspWildcardHostPaths(csp: string): string[] {
+  return [...csp.matchAll(CSP_WILDCARD_HOST_PATH)].map((match) => match[2] + match[4]);
+}
+
+/** `csp` with the default port written after each wildcard host a path follows. */
+export function withWildcardHostPorts(csp: string): string {
+  return csp.replace(CSP_WILDCARD_HOST_PATH, (_all, lead: string, origin: string, scheme: string, path: string) =>
+    `${lead}${origin}:${CSP_DEFAULT_PORTS[scheme.toLowerCase()]}${path}`);
+}
+
+// Chrome lets an MV3 extension_pages policy name a local dev server in script-src
+// (React DevTools' standalone http://localhost:8097), and a packed extension's
+// pages never load from it. Firefox checks script-src and worker-src and takes a
+// localhost source there only from a temporarily loaded add-on: a signed or
+// unsigned install drops the whole policy, 'wasm-unsafe-eval' with it.
+const LOCALHOST_CSP_SOURCE = /^https?:\/\/(?:localhost|127\.0\.0\.1)(?::(?:\d+|\*))?(?:\/\S*)?$/i;
+const LOCALHOST_CHECKED_DIRECTIVE = /^(?:script-src|worker-src)$/i;
+
+function splitLocalhostSources(csp: string): { policy: string; removed: string[] } {
+  const removed: string[] = [];
+  const policy = csp
+    .split(";")
+    .map((directive) => {
+      const tokens = directive.trim().split(/\s+/);
+      if (!LOCALHOST_CHECKED_DIRECTIVE.test(tokens[0])) return directive;
+      const kept = tokens.filter((t, i) => i === 0 || !LOCALHOST_CSP_SOURCE.test(t));
+      if (kept.length === tokens.length) return directive;
+      removed.push(...tokens.filter((t) => !kept.includes(t)));
+      return /^\s*/.exec(directive)?.[0] + kept.join(" ");
+    })
+    .join(";");
+  return { policy, removed };
+}
+
+/** The localhost sources Firefox refuses in an MV3 extension_pages policy. */
+export function cspLocalhostSources(csp: string): string[] {
+  return splitLocalhostSources(csp).removed;
+}
+
+function extensionPagesCsp(m: Manifest): string | undefined {
+  const csp = m.content_security_policy;
+  return (m.manifest_version ?? 2) >= 3 && typeof csp === "object" && csp !== null && typeof csp.extension_pages === "string" ? csp.extension_pages : undefined;
+}
 // Manifest keys Firefox added after its first Manifest V3 release, and what an older
 // Firefox does when it meets them.
 const KEY_GATES: Array<{ since: string; applies: (m: Manifest) => boolean; message: string; category: string }> = [
@@ -414,7 +531,11 @@ const KEY_GATES: Array<{ since: string; applies: (m: Manifest) => boolean; messa
   },
 ];
 
-export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): ManifestAnalysis {
+/**
+ * `shim: false` (--no-shim) and `oauthBridge: false` (--no-oauth-bridge) describe a
+ * build without that emulation, so nothing it would cover is reported as shimmed.
+ */
+export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: boolean; oauthBridge?: boolean }): ManifestAnalysis {
   const issues: Issue[] = [];
   const permissionsToRemove: string[] = [];
   const before = (version: string) => compareFirefoxVersions(opts.minFirefox, version) < 0;
@@ -492,7 +613,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     if (perm === "<all_urls>" || perm.includes("://") || !Object.hasOwn(FIREFOX_PERMISSION_SUPPORT, perm)) continue;
     const since = FIREFOX_PERMISSION_SUPPORT[perm];
     if (since === null) {
-      const shimmed = SHIMMED_PERMISSIONS.has(perm);
+      const shimmed = opts.shim !== false && SHIMMED_PERMISSIONS.has(perm);
       issues.push({
         severity: shimmed ? "info" : "warning",
         category: "permission",
@@ -500,7 +621,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
           ? `Permission "${perm}" is removed (Firefox doesn't know it), but the shim keeps the feature working.`
           : `Unsupported permission "${perm}" will be removed; Firefox doesn't have it.`,
         file: "manifest.json",
-        fix: UNSUPPORTED_PERMISSIONS[perm],
+        fix: shimmed || !SHIMMED_PERMISSIONS.has(perm) ? UNSUPPORTED_PERMISSIONS[perm] : `--no-shim leaves out the emulation, so the "${perm}" features don't work.`,
         autoFixed: true,
         ...(shimmed ? { shimmed: true } : {}),
       });
@@ -549,7 +670,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       if (perm !== "<all_urls>" && !perm.includes("://")) continue;
       const err = patternError(perm);
       if (err !== null) {
-        const favicon = perm.startsWith("chrome://favicon");
+        const favicon = opts.shim !== false && perm.startsWith("chrome://favicon");
         issues.push({
           severity: favicon ? "info" : "warning",
           category: "permission",
@@ -653,9 +774,12 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   // rules on purpose. A bare string is the MV2 form.
   const cspObj = m.content_security_policy;
   const csp = typeof cspObj === "string" ? cspObj : typeof cspObj?.extension_pages === "string" ? cspObj.extension_pages : "";
+  const pages = extensionPagesCsp(m);
+  const localhostSrc = new Set(pages === undefined ? [] : cspLocalhostSources(pages));
   const remoteSrc = new Set<string>();
   for (const dm of csp.matchAll(/(?:^|;)\s*script-src(?:-elem)?\s+([^;]+)/gi)) {
     for (const token of dm[1].trim().split(/\s+/)) {
+      if (localhostSrc.has(token)) continue;
       if (token === "*" || /^(https?:|\/\/|wss?:|\*:)/i.test(token) || /^(?:\*\.)?[a-z0-9.-]+\.[a-z]{2,}(?::\d+)?$/i.test(token)) {
         remoteSrc.add(token);
       }
@@ -670,12 +794,46 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       fix: "Bundle the script into the extension and load it locally.",
     });
   }
+  if (localhostSrc.size > 0) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `CSP extension_pages names a local development server (${[...localhostSrc].join(", ")}); Firefox takes that only from a temporarily loaded add-on and drops the whole policy on install, so the source is removed. A packed Chrome extension never loads from it either.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
+  if (lacksExtensionPagesCsp(m)) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "Without a content_security_policy.extension_pages, Firefox gives MV3 extension pages a CSP with upgrade-insecure-requests, so the background's and pages' http:// requests to other hosts than this machine go out as https://; Chrome's default, which upgrades nothing, is written into the manifest.",
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
 
   if (lacksSandboxCsp(m)) {
     issues.push({
       severity: "info",
       category: "manifest",
       message: "sandbox pages without a sandbox CSP get script-src 'self' in Firefox, which blocks eval() and inline scripts there; Chrome's default sandbox CSP, which allows both, is written into the manifest.",
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
+  const wildcardPaths = new Set<string>();
+  mapManifestCsps(JSON.parse(JSON.stringify(m)), (policy) => {
+    for (const source of cspWildcardHostPaths(policy)) wildcardPaths.add(source);
+    return policy;
+  });
+  if (wildcardPaths.size > 0) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: `CSP source(s) ${[...wildcardPaths].join(", ")} name every host and a path; Firefox can't parse a wildcard host followed by a path and drops the source, so the scheme's default port is written after the wildcard, which Firefox accepts and which matches the same URLs.`,
       file: "manifest.json",
       autoFixed: true,
     });
@@ -783,6 +941,19 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     });
   }
 
+  const omniboxKeyword = firefoxOmniboxKeyword(m);
+  if (omniboxKeyword) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: omniboxKeyword.to
+        ? `omnibox keyword "${omniboxKeyword.from}" has whitespace, a colon or a leading "?", which Firefox refuses along with the whole add-on; it becomes "${omniboxKeyword.to}".`
+        : `omnibox keyword "${omniboxKeyword.from}" has nothing Firefox takes as a keyword, and Firefox refuses the whole add-on over it; the omnibox key is removed, so chrome.omnibox gets no input.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
+
   if (typeof m.author === "object" && m.author !== null) {
     issues.push({
       severity: "info",
@@ -795,14 +966,24 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
 
   const ec = m.externally_connectable;
   if (strings(ec?.matches).length > 0) {
-    issues.push({
-      severity: "info",
-      category: "manifest",
-      message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage calls (a port from runtime.connect never connects).",
-      file: "manifest.json",
-      fix: "Re-test sign-in and site integrations; --no-oauth-bridge turns the bridge off.",
-      shimmed: true,
-    });
+    issues.push(
+      opts.oauthBridge === false
+        ? {
+            severity: "warning",
+            category: "manifest",
+            message: "Firefox doesn't support externally_connectable, and --no-oauth-bridge leaves out the page bridge, so the listed sites can't message the extension.",
+            file: "manifest.json",
+            fix: "Convert without --no-oauth-bridge to relay their runtime.sendMessage calls.",
+          }
+        : {
+            severity: "info",
+            category: "manifest",
+            message: "Firefox doesn't support externally_connectable, so the listed sites can't message the extension directly; the page bridge relays their runtime.sendMessage calls (a port from runtime.connect never connects).",
+            file: "manifest.json",
+            fix: "Re-test sign-in and site integrations; --no-oauth-bridge turns the bridge off.",
+            shimmed: true,
+          },
+    );
   }
   const ids = strings(ec?.ids).filter((id) => id !== "*");
   if (ids.length > 0) {
@@ -826,6 +1007,16 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   }
 
   if (m.commands && typeof m.commands === "object") issues.push(...analyzeCommands(m.commands));
+  const ignoredCommands = commandsChromeIgnores(m);
+  if (ignoredCommands.length) {
+    issues.push({
+      severity: "info",
+      category: "ui",
+      message: `commands ${ignoredCommands.join(", ")} use reserved names Chrome ignores here (an action command without its action key, or another name starting with "_"); Firefox would make them ordinary commands whose shortcuts fire commands.onCommand and can take the action's keys, so they are removed.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
 
   const overrides = m.chrome_url_overrides;
   if (overrides && typeof overrides === "object") {
@@ -842,8 +1033,7 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
     }
   }
 
-  const icons = m.icons;
-  if (!icons || typeof icons !== "object" || Object.keys(icons).length === 0) {
+  if (needsPlaceholderIcons(m)) {
     issues.push({
       severity: "info",
       category: "ui",
@@ -852,14 +1042,94 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
       fix: "Replace it with real icons for production.",
       autoFixed: true,
     });
+  } else if (!m.icons || typeof m.icons !== "object" || Object.keys(m.icons).length === 0) {
+    issues.push({
+      severity: "info",
+      category: "ui",
+      message: "Only the toolbar button declares icons (action.default_icon); Firefox's add-ons manager shows a generic icon for this add-on.",
+      file: "manifest.json",
+      fix: "Add an icons key to the manifest.",
+    });
   }
 
   return { issues, permissionsToRemove };
 }
 
 /**
- * Collect every concrete file path the manifest references as a runtime asset
- * (scripts, pages, css, icons, web_accessible_resources, DNR rulesets, …),
+ * Whether the conversion writes a placeholder icon set: the manifest declares no
+ * icons, and no action or browser_action icon either (MV3 allows icons declared
+ * only there). The analyzer and synthesizePlaceholderIcons share this test.
+ */
+export function needsPlaceholderIcons(m: Manifest): boolean {
+  if (m.icons && typeof m.icons === "object" && Object.keys(m.icons).length > 0) return false;
+  const actionIcon = (m.action ?? m.browser_action)?.default_icon;
+  return !(actionIcon && (typeof actionIcon === "string" || (typeof actionIcon === "object" && Object.keys(actionIcon).length > 0)));
+}
+
+/**
+ * Call `map` with each file path the manifest names as a runtime asset (scripts,
+ * pages, css, icons, web_accessible_resources, DNR rulesets, …) and store what it
+ * returns in its place. The one list of path-bearing keys, shared by staging and by
+ * the rewrites that edit those paths.
+ */
+export function mapManifestPaths(m: Manifest, map: (path: string) => string): void {
+  const slot = (holder: unknown, key: string | number) => {
+    if (typeof holder !== "object" || holder === null) return;
+    const record = holder as Record<string | number, unknown>;
+    const value = record[key];
+    if (typeof value !== "string" || !value) return;
+    const mapped = map(value);
+    if (mapped !== value) record[key] = mapped;
+  };
+  const each = (list: unknown) => {
+    if (Array.isArray(list)) for (let i = 0; i < list.length; i++) slot(list, i);
+  };
+  const values = (holder: unknown) => {
+    if (typeof holder === "object" && holder !== null && !Array.isArray(holder)) for (const key of Object.keys(holder)) slot(holder, key);
+  };
+
+  if (Array.isArray(m.content_scripts)) {
+    for (const cs of m.content_scripts) {
+      if (typeof cs !== "object" || cs === null) continue;
+      if ("js" in cs) each(cs.js);
+      if ("css" in cs) each(cs.css);
+    }
+  }
+  each(m.background?.scripts);
+  slot(m.background, "service_worker");
+  slot(m.background, "page");
+  for (const a of [m.action, m.browser_action, m.page_action]) {
+    slot(a, "default_popup");
+    if (typeof a?.default_icon === "string") slot(a, "default_icon");
+    else values(a?.default_icon);
+  }
+  values(m.icons);
+  slot(m, "options_page");
+  slot(m.options_ui, "page");
+  slot(m, "devtools_page");
+  values(m.chrome_url_overrides);
+  each(m.sandbox?.pages);
+  if (Array.isArray(m.declarative_net_request?.rule_resources)) for (const r of m.declarative_net_request.rule_resources) slot(r, "path");
+  // side_panel.default_path becomes the Firefox sidebar page, so a miss here leaves an
+  // empty sidebar.
+  slot(m.side_panel, "default_path");
+  slot(m.sidebar_action, "default_panel");
+  slot(m.storage, "managed_schema");
+
+  // web_accessible_resources: MV2 string[], MV3 [{resources: string[]}], or a bare
+  // string (invalid, but hand-edited manifests produce it).
+  slot(m, "web_accessible_resources");
+  if (Array.isArray(m.web_accessible_resources)) {
+    for (let i = 0; i < m.web_accessible_resources.length; i++) {
+      const entry: unknown = m.web_accessible_resources[i];
+      if (typeof entry === "string") slot(m.web_accessible_resources, i);
+      else if (typeof entry === "object" && entry !== null && "resources" in entry) each(entry.resources);
+    }
+  }
+}
+
+/**
+ * Collect every concrete file path the manifest references as a runtime asset,
  * normalized to forward-slash relative paths. Glob/wildcard resource entries
  * (containing '*') are skipped — only literal paths are returned. Used by the
  * stager so a declared resource is never dropped as "dev cruft" (e.g. a
@@ -868,53 +1138,15 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
  */
 export function collectReferencedPaths(m: Manifest): Set<string> {
   const paths = new Set<string>();
-  const add = (p: unknown) => {
-    if (typeof p === "string" && p && !p.includes("*")) {
+  mapManifestPaths(m, (p) => {
+    if (!p.includes("*")) {
       // Drop any #fragment/?query (e.g. "devpanel.html#popup") so the concrete
       // file on disk is preserved during staging, not a phantom "…#popup" name.
       const filePart = p.split(/[#?]/)[0];
       if (filePart) paths.add(filePart.replace(/^\.?\//, "").replace(/\\/g, "/"));
     }
-  };
-  const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
-
-  for (const cs of arr(m.content_scripts)) {
-    if (typeof cs !== "object" || cs === null) continue;
-    if ("js" in cs) for (const j of arr(cs.js)) add(j);
-    if ("css" in cs) for (const c of arr(cs.css)) add(c);
-  }
-  for (const b of arr(m.background?.scripts)) add(b);
-  add(m.background?.service_worker);
-  add(m.background?.page);
-  for (const a of [m.action, m.browser_action, m.page_action]) {
-    add(a?.default_popup);
-    const di = a?.default_icon;
-    if (typeof di === "string") add(di);
-    else if (di && typeof di === "object") for (const p of Object.values(di)) add(p);
-  }
-  for (const p of Object.values(m.icons ?? {})) add(p);
-  add(m.options_page);
-  add(m.options_ui?.page);
-  add(m.devtools_page);
-  for (const p of Object.values(m.chrome_url_overrides ?? {})) add(p);
-  for (const p of arr(m.sandbox?.pages)) add(p);
-  for (const r of arr(m.declarative_net_request?.rule_resources)) {
-    if (typeof r === "object" && r !== null && "path" in r) add(r.path);
-  }
-  // side_panel.default_path becomes the Firefox sidebar page, so a miss here leaves an
-  // empty sidebar.
-  add(m.side_panel?.default_path);
-  add(m.sidebar_action?.default_panel);
-  const storage = m.storage;
-  if (typeof storage === "object" && storage !== null && "managed_schema" in storage) add(storage.managed_schema);
-
-  // web_accessible_resources: MV2 string[], MV3 [{resources: string[]}], or a bare
-  // string (invalid, but hand-edited manifests produce it).
-  if (typeof m.web_accessible_resources === "string") add(m.web_accessible_resources);
-  for (const entry of arr(m.web_accessible_resources)) {
-    if (typeof entry === "string") add(entry);
-    else if (typeof entry === "object" && entry !== null && "resources" in entry) for (const r of arr(entry.resources)) add(r);
-  }
+    return p;
+  });
   return paths;
 }
 
@@ -941,8 +1173,12 @@ export interface TransformOptions {
   debuggerEmulation?: boolean;
 }
 
-/** What the chrome.debugger emulation drives tabs with. */
-export const DEBUGGER_EMULATION_PERMISSIONS = ["scripting", "tabs", "webNavigation", "webRequest"];
+/**
+ * What the chrome.debugger emulation drives tabs with. Blocking webRequest and a
+ * response filter (its own permission in Manifest V3) hold back each document an
+ * attached tab loads until the emulation's hooks are in it.
+ */
+export const DEBUGGER_EMULATION_PERMISSIONS = ["scripting", "tabs", "webNavigation", "webRequest", "webRequestBlocking", "webRequestFilterResponse"];
 
 // Add `query` to a page path ahead of its fragment, after any query it already has.
 function withQuery(path: string, query: string | undefined): string {
@@ -953,6 +1189,21 @@ function withQuery(path: string, query: string | undefined): string {
   const fragment = hash === -1 ? "" : path.slice(hash);
   const sep = !page.includes("?") ? "?" : /[?&]$/.test(page) ? "" : "&";
   return page + sep + q + fragment;
+}
+
+/**
+ * Give each of `actions` (a page action, a sidebar) the add-on's icons when it
+ * declares none. Chrome shows the extension's icons on an action without
+ * default_icon; Firefox's page action and sidebar show a generic puzzle piece
+ * instead (its browser_action and action fall back to the icons on their own).
+ */
+export function wireActionIcons(actions: Array<Record<string, unknown> | undefined>, icons: Record<string, string>): void {
+  for (const a of actions) {
+    if (!a || typeof a !== "object") continue;
+    const own = a.default_icon;
+    if (typeof own === "string" ? own !== "" : own && typeof own === "object" && Object.keys(own).length > 0) continue;
+    a.default_icon = { ...icons };
+  }
 }
 
 /**
@@ -996,6 +1247,7 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   const allSites = opts.debuggerEmulation === true;
   if (allSites) {
     for (const p of DEBUGGER_EMULATION_PERMISSIONS) {
+      if (p === "webRequestFilterResponse" && (out.manifest_version ?? 2) < 3) continue;
       if (!permissions.includes(p)) permissions.push(p);
       const i = optionalPermissions.indexOf(p);
       if (i >= 0) optionalPermissions.splice(i, 1);
@@ -1028,7 +1280,12 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   };
   // For Android alone, a desktop minimum would gate Firefox for Android as well.
   if (opts.platforms === "android") delete gecko.strict_min_version;
-  else gecko.strict_min_version = opts.minFirefoxVersion;
+  else {
+    gecko.strict_min_version = opts.minFirefoxVersion;
+    // The author's cap below the minimum leaves no Firefox the add-on installs on.
+    const max = gecko.strict_max_version;
+    if (typeof max === "string" && compareFirefoxVersions(max, opts.minFirefoxVersion) < 0) delete gecko.strict_max_version;
+  }
   if (opts.dataCollection) {
     const declared = typeof gecko.data_collection_permissions === "object" ? gecko.data_collection_permissions : {};
     gecko.data_collection_permissions = { ...declared, required: [...opts.dataCollection] };
@@ -1044,17 +1301,18 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
   // never does.
   const sidePanelPath = typeof out.side_panel?.default_path === "string" ? out.side_panel.default_path : "";
   const panel = out.side_panel !== undefined ? sidePanelPath : (opts.sidebarPanel ?? "");
+  const icons = out.icons && typeof out.icons === "object" && Object.keys(out.icons).length ? out.icons : undefined;
   if (!out.sidebar_action && panel) {
     const actionTitle = (out.action ?? out.browser_action ?? out.page_action)?.default_title;
     const title = typeof actionTitle === "string" && actionTitle ? actionTitle : out.name;
     const sidebar: NonNullable<Manifest["sidebar_action"]> = { default_panel: withQuery(panel, opts.sidebarPanelQuery) };
     if (title) sidebar.default_title = title;
-    const icons = out.icons;
-    if (icons && typeof icons === "object" && Object.keys(icons).length) sidebar.default_icon = { ...icons };
+    if (icons) sidebar.default_icon = { ...icons };
     sidebar.open_at_install = false;
     out.sidebar_action = sidebar;
   }
   delete out.side_panel;
+  if (icons) wireActionIcons([out.page_action], icons);
 
   // Firefox would treat "split" as "not_allowed"; without the key the add-on spans
   // normal and private windows.
@@ -1069,6 +1327,15 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     }
   }
 
+  if (lacksExtensionPagesCsp(out)) {
+    const csp = out.content_security_policy;
+    out.content_security_policy = { ...(typeof csp === "object" && csp !== null ? csp : {}), extension_pages: CHROME_EXTENSION_PAGES_CSP };
+  }
+
+  mapManifestCsps(out, withWildcardHostPorts);
+  if (extensionPagesCsp(out) !== undefined) {
+    mapManifestCsps(out, (policy, where) => (where === "extension_pages" ? splitLocalhostSources(policy).policy : policy));
+  }
   // An extension that only adds rules at runtime may declare rule_resources: [],
   // which Chrome accepts. Firefox wants at least one ruleset there and refuses the
   // whole manifest otherwise; the permission alone gives the API.
@@ -1105,6 +1372,10 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     if (typeof provider === "object" && provider !== null) Reflect.deleteProperty(provider, "favicon_url");
   }
 
+  const omniboxKeyword = firefoxOmniboxKeyword(out);
+  if (omniboxKeyword?.to) Reflect.set(out.omnibox as object, "keyword", omniboxKeyword.to);
+  else if (omniboxKeyword) delete out.omnibox;
+
   if (typeof out.author === "object" && out.author !== null) {
     const email = "email" in out.author ? out.author.email : undefined;
     if (typeof email === "string" && email) out.author = email;
@@ -1118,6 +1389,9 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     for (const k of Object.keys(urlOverrides)) if (k !== "newtab") Reflect.deleteProperty(urlOverrides, k);
     if (Object.keys(urlOverrides).length === 0) delete out.chrome_url_overrides;
   }
+
+  for (const name of commandsChromeIgnores(out)) Reflect.deleteProperty(out.commands as object, name);
+  if (out.commands && typeof out.commands === "object" && Object.keys(out.commands).length === 0) delete out.commands;
 
   // A shortcut Firefox can't parse makes it refuse the manifest. Drop just that chord;
   // the command stays, and users can bind it in about:addons.
