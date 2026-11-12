@@ -2002,6 +2002,22 @@
     });
   }
 
+  // ── browserAction in an MV3 add-on ──────────────────────────────────────────
+  // Firefox gives an MV3 add-on `action` and no `browserAction`, as Chrome does.
+  // A bundle that also ships to Firefox as MV2 picks its Firefox branch by user
+  // agent, and that branch reads browserAction (Web Scraper: its toolbar button
+  // opens the sidebar through browserAction.onClicked). The two are the same
+  // API, so a bundle that reads browserAction's members gets `action` under
+  // that name; Firefox's own browserAction (MV2) is kept.
+  function installBrowserActionAlias() {
+    if (!CONFIG.browserActionAlias) return;
+    namespaces.forEach(function (ns) {
+      var action = null;
+      try { action = ns.action; } catch (e) {}
+      if (action && typeof action === "object") defineMissing(ns, "browserAction", action);
+    });
+  }
+
   // ── webpack chunks of a worker bundle ──────────────────────────────────────
   // A webpack service worker loads an async chunk with importScripts, which runs
   // it synchronously, so startup code can require the chunk a microtask later.
@@ -3520,6 +3536,7 @@
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
+  try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }
