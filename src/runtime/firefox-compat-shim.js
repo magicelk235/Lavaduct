@@ -2574,6 +2574,37 @@
     return out;
   }
 
+  // Chrome's storage.set also reads a value's properties the plain way, so a
+  // getter's value is stored. Firefox 160 reads the items through Xrays, which
+  // see only data properties: storage.local drops a value held in an accessor at
+  // any depth, and every area drops a top-level key that is one. Ghostery's
+  // options store (hybrids) keeps record entries as getters, so pausing a site
+  // stored paused: {}. Items with an accessor in an object or array are copied
+  // with the getters' values; anything else goes to Firefox as the same object.
+  function withAccessorValues(value, ancestors) {
+    if (value === null || typeof value !== "object") return value;
+    var isArray = Array.isArray(value);
+    if (!isArray && Object.prototype.toString.call(value) !== "[object Object]") return value;
+    if (ancestors.indexOf(value) >= 0) return value;
+    ancestors.push(value);
+    var keys = Object.keys(value);
+    var copy = null;
+    for (var i = 0; i < keys.length; i++) {
+      var desc = Object.getOwnPropertyDescriptor(value, keys[i]);
+      if (!desc) continue;
+      var accessor = !("value" in desc);
+      var v = accessor ? value[keys[i]] : desc.value;
+      var next = withAccessorValues(v, ancestors);
+      if (copy === null && (accessor || next !== v)) {
+        copy = isArray ? [] : {};
+        for (var j = 0; j < i; j++) copy[keys[j]] = value[keys[j]];
+      }
+      if (copy !== null) copy[keys[i]] = next;
+    }
+    ancestors.pop();
+    return copy === null ? value : copy;
+  }
+
   function installStorageCloneFallback() {
     if (!CONFIG.storageClone) return;
     namespaces.forEach(function (ns) {
@@ -2587,6 +2618,9 @@
         if (typeof set !== "function") return;
         replaceMember(area, "set", function (items) {
           var args = Array.prototype.slice.call(arguments);
+          var resolved = items;
+          try { resolved = withAccessorValues(items, []); } catch (e) {}
+          if (resolved !== items) { items = resolved; args[0] = resolved; }
           var storable = function () { return chromeStorable(items, []); };
           var last = args.length - 1;
           if (last >= 1 && typeof args[last] === "function") {
