@@ -907,10 +907,39 @@ export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: s
 // strict code, ending the script there. window already is the global in a page.
 const WINDOW_SELF_ALIAS_RE = /(^|[^.\w$])(?:self|globalThis)\s*\.\s*window\s*=\s*(self|globalThis)\b(?!\s*[.[(=])/g;
 
+// `import "./x.js"`, `import { a } from "../y.js"`, `export * from "./z.mjs"`:
+// relative static imports, the only ones resolvable without running the code.
+const STATIC_IMPORT_RE = /(?:^|[;\s}])(?:import|export)\s*(?:[\w$*{}\s,]+?\s*from\s*)?(["'])(\.{1,2}\/[^"'\n]+)\1/g;
+
+/** The background's scripts plus, for a module worker, every module they import statically. */
+function backgroundModuleClosure(stageDir: string, manifest: Manifest): string[] {
+  const files = backgroundScriptPaths(stageDir, manifest);
+  if (manifest.background?.type !== "module") return files;
+  const root = resolve(stageDir);
+  const seen = new Set(files);
+  for (let i = 0; i < files.length; i++) {
+    let content: string;
+    try {
+      content = readFileSync(files[i], "utf-8");
+    } catch {
+      continue;
+    }
+    for (const m of content.matchAll(STATIC_IMPORT_RE)) {
+      const target = resolve(dirname(files[i]), m[2].split(/[?#]/)[0]);
+      if (!target.startsWith(root + sep) || seen.has(target) || !existsSync(target)) continue;
+      seen.add(target);
+      files.push(target);
+    }
+  }
+  return files;
+}
+
 function rewriteWorkerWindowAlias(stageDir: string, manifest: Manifest): number {
   if (typeof manifest.background?.service_worker !== "string") return 0;
   let modified = 0;
-  for (const file of backgroundScriptPaths(stageDir, manifest)) {
+  // An imported module may be the pages' too; in a page window already is the
+  // global, so dropping the alias changes nothing there.
+  for (const file of backgroundModuleClosure(stageDir, manifest)) {
     let content: string;
     try {
       content = readFileSync(file, "utf-8");
