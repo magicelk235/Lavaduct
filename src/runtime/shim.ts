@@ -114,6 +114,12 @@ const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|ses
 // an MV3 bundle's Firefox branch does; not the name alone, which polyfill
 // metadata and message keys carry.
 const BROWSER_ACTION_MEMBER_RE = /\bbrowserAction\s*(?:\?\.|\.)\s*[A-Za-z_$]/;
+// Methods Firefox only promises and Chrome calls back from (the shim's
+// PROMISE_ONLY, userScripts aside), by name.
+const PROMISE_ONLY_CALL_RE = /\.\s*(getBadgeTextColor|setBadgeTextColor|isEnabled|openPopup|setPopup|discard|ungroup)\b/g;
+// storage.session.setAccessLevel: content scripts get the session area through
+// the background (the shim's installContentSession).
+const SESSION_ACCESS_RE = /\bsetAccessLevel\b/;
 
 // A listener added with a last argument that can be false: a falsy literal,
 // which is what a Chrome build compiles `isFirefox && { … }` to, or an `&&`
@@ -177,6 +183,8 @@ interface Usage {
   storageGlobalsAssigned: string[];
   falsyListenerArg: boolean;
   browserAction: boolean;
+  promiseOnlyCalls: string[];
+  sessionAccess: boolean;
 }
 
 function scanUsage(dir: string): Usage {
@@ -184,6 +192,7 @@ function scanUsage(dir: string): Usage {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false,
+    promiseOnlyCalls: [], sessionAccess: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -215,8 +224,12 @@ function scanUsage(dir: string): Usage {
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
       if (!found.injectsFiles) found.injectsFiles = INJECTS_FILES_RE.test(src);
       if (!found.declarativeContent) found.declarativeContent = DECLARATIVE_CONTENT_RE.test(src);
+      if (!found.sessionAccess) found.sessionAccess = SESSION_ACCESS_RE.test(src);
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
+      }
+      for (const m of src.matchAll(PROMISE_ONLY_CALL_RE)) {
+        if (!found.promiseOnlyCalls.includes(m[1])) found.promiseOnlyCalls.push(m[1]);
       }
       if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
       if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
@@ -286,6 +299,8 @@ function shimSource(dir: string, config: ShimConfig): string {
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,
     browserActionAlias: usage.browserAction,
+    promiseOnlyCalls: usage.promiseOnlyCalls.sort(),
+    sessionAccess: usage.sessionAccess,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
