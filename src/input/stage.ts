@@ -873,12 +873,68 @@ const regexEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 /** `typeof document === "undefined"` and its spellings, as WINDOW_IS_UNDEFINED has them for window. */
 const DOCUMENT_IS_UNDEFINED = WINDOW_IS_UNDEFINED.split("window").join("document");
 
-// A function named for the question, whose body has no nested braces:
-// `static isBackground() { return … "undefined" == typeof document }`,
-// `isServiceWorker: () => typeof window === "undefined"`.
-const BG_PREDICATE_RE =
-  /(\bis_?(?:bg|background\w*|service_?worker\w*|sw)\s*(?:\(\s*\)\s*\{|[:=]\s*(?:function\s*)?\(\s*\)\s*(?:=>\s*)?\{))([^{}]*)\}|(\bis_?(?:bg|background\w*|service_?worker\w*|sw)\s*[:=]\s*\(\s*\)\s*=>)([^{};,]*)/gi;
+// A function named for the question: `static isBackground() { return … "undefined"
+// == typeof document }`, `isServiceWorker: () => typeof window === "undefined"`. The
+// test often sits after blocks of the body's own (Total Adblock's isBackgroundScript()
+// checks script tags under `if (this.isMv2()) { … }` first), so a braced body is
+// found by matching its braces, not by stopping at the first one.
+const BG_PREDICATE_NAME = String.raw`\bis_?(?:bg|background\w*|service_?worker\w*|sw)`;
+const BG_PREDICATE_HEAD_RE = new RegExp(
+  String.raw`${BG_PREDICATE_NAME}\s*(?:\(\s*\)\s*\{|[:=]\s*(?:function\s*)?\(\s*\)\s*(?:=>\s*)?\{)`,
+  "gi",
+);
+const BG_PREDICATE_ARROW_RE = new RegExp(String.raw`(${BG_PREDICATE_NAME}\s*[:=]\s*\(\s*\)\s*=>)([^{};,]*)`, "gi");
 const UNDEFINED_GLOBAL_RE = new RegExp(`${WINDOW_IS_UNDEFINED}|${DOCUMENT_IS_UNDEFINED}`, "g");
+// A predicate is a few lines; a longer "body" means the scan lost its way.
+const BG_PREDICATE_MAX_BODY = 2000;
+
+/**
+ * Index of the `}` closing the block whose body starts at `from`, skipping strings
+ * and comments; -1 when it isn't found within BG_PREDICATE_MAX_BODY or the body
+ * holds a template literal with substitutions, which this scan doesn't follow.
+ */
+function blockEnd(src: string, from: number): number {
+  const stop = Math.min(src.length, from + BG_PREDICATE_MAX_BODY);
+  let depth = 0;
+  for (let i = from; i < stop; i++) {
+    const c = src[i];
+    if (c === "{") depth++;
+    else if (c === "}") {
+      if (depth === 0) return i;
+      depth--;
+    } else if (c === '"' || c === "'" || c === "`") {
+      for (i++; i < stop && src[i] !== c; i++) {
+        if (src[i] === "\\") i++;
+        else if (c === "`" && src[i] === "$" && src[i + 1] === "{") return -1;
+        else if (c !== "`" && src[i] === "\n") return -1;
+      }
+    } else if (c === "/" && src[i + 1] === "/") {
+      while (i < stop && src[i] !== "\n") i++;
+    } else if (c === "/" && src[i + 1] === "*") {
+      const close = src.indexOf("*/", i + 2);
+      if (close < 0) return -1;
+      i = close + 1;
+    }
+  }
+  return -1;
+}
+
+/** Applies `yes` to the worker tests inside every is…Background()/isServiceWorker() body. */
+function rewritePredicateBodies(src: string, yes: (check: string) => string): string {
+  let out = "";
+  let last = 0;
+  BG_PREDICATE_HEAD_RE.lastIndex = 0;
+  for (let m; (m = BG_PREDICATE_HEAD_RE.exec(src)); ) {
+    const start = m.index + m[0].length;
+    const end = blockEnd(src, start);
+    if (end < 0) continue;
+    out += src.slice(last, start) + src.slice(start, end).replace(UNDEFINED_GLOBAL_RE, yes);
+    last = end;
+    BG_PREDICATE_HEAD_RE.lastIndex = end;
+  }
+  return (out + src.slice(last)).replace(BG_PREDICATE_ARROW_RE, (_whole, head: string, body: string) =>
+    head + body.replace(UNDEFINED_GLOBAL_RE, yes));
+}
 
 /**
  * The worker's "am I the worker?" checks in every script the background loads,
@@ -910,10 +966,7 @@ export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: s
     const isWorker = name === worker;
     const yes = (check: string) => (isWorker ? "true" : `(${check}||${BACKGROUND_FLAG})`);
     let next = content.replace(pathRe, (check) => yes(check));
-    next = next.replace(BG_PREDICATE_RE, (whole, head?: string, body?: string, arrowHead?: string, arrowBody?: string) =>
-      head !== undefined
-        ? `${head}${(body ?? "").replace(UNDEFINED_GLOBAL_RE, yes)}}`
-        : `${arrowHead}${(arrowBody ?? "").replace(UNDEFINED_GLOBAL_RE, yes)}`);
+    next = rewritePredicateBodies(next, yes);
     if (!isWorker) {
       next = next
         .replace(BG_CHECK_RETURN_RE, (whole, pre: string, post: string) => pre + yes(whole.slice(pre.length, whole.length - post.length)) + post)
