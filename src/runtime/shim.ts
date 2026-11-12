@@ -110,6 +110,9 @@ const DECLARATIVE_CONTENT_RE = /\bdeclarativeContent\b/;
 // A worker's own localStorage or sessionStorage, which it doesn't have:
 // `self.localStorage = polyfill`. The event page's are getter-only.
 const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
+// A CustomEvent the code makes itself, whose detail a content script may hand
+// the page's world.
+const CUSTOM_EVENT_RE = /\bnew\s+(?:[\w$]+\s*\.\s*)?CustomEvent\b|\binitCustomEvent\s*\(/;
 // A member of MV2's browserAction read (`chrome.browserAction.onClicked`), which
 // an MV3 bundle's Firefox branch does; not the name alone, which polyfill
 // metadata and message keys carry.
@@ -178,6 +181,7 @@ interface Usage {
   storage: boolean;
   proxySettings: boolean;
   messaging: boolean;
+  customEvent: boolean;
   injectsFiles: boolean;
   declarativeContent: boolean;
   storageGlobalsAssigned: string[];
@@ -191,7 +195,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false,
+    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false,
     promiseOnlyCalls: [], sessionAccess: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -222,6 +226,7 @@ function scanUsage(dir: string): Usage {
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.proxySettings) found.proxySettings = PROXY_SETTINGS_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
+      if (!found.customEvent) found.customEvent = CUSTOM_EVENT_RE.test(src);
       if (!found.injectsFiles) found.injectsFiles = INJECTS_FILES_RE.test(src);
       if (!found.declarativeContent) found.declarativeContent = DECLARATIVE_CONTENT_RE.test(src);
       if (!found.sessionAccess) found.sessionAccess = SESSION_ACCESS_RE.test(src);
@@ -296,6 +301,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     proxySettings: usage.proxySettings,
     pacPage: usage.proxySettings ? PAC_PAGE : "",
     messageJson: usage.messaging,
+    pageEventDetail: usage.customEvent,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,
     browserActionAlias: usage.browserAction,
