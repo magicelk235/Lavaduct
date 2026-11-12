@@ -72,15 +72,19 @@ test(
         return JSON.stringify({ one: ids.getId(one), two: ids.getId(two) });
       })()`));
       // Selecting a tab does nothing while the new profile's onboarding dialog
-      // is up, which can come up late; it goes first.
+      // is up, which can come up late; it goes first. The tab is found by its
+      // ID, not its URL: each new tab's page commits in a content process
+      // Firefox starts for it, and on a busy machine the tab can still read
+      // about:blank a minute later, long after the server has answered.
       const select = async (which) => {
         let last = null;
         for (let i = 0; i < 50; i++) {
           last = JSON.parse(await ff.chrome(`(() => {
+            const { ExtensionParent } = ChromeUtils.importESModule("resource://gre/modules/ExtensionParent.sys.mjs");
             const win = Services.wm.getMostRecentWindow("navigator:browser");
             const dialog = !!win.gDialogBox?.isOpen;
             if (dialog) win.gDialogBox.dialog?.close();
-            const tab = win.gBrowser.tabs.find((t) => t.linkedBrowser.currentURI.spec.endsWith("/${which}"));
+            const tab = ExtensionParent.apiManager.global.tabTracker.getTab(${tabs[which]}, null);
             if (tab) win.gBrowser.selectedTab = tab;
             return JSON.stringify({ selected: !!tab && win.gBrowser.selectedTab === tab, found: !!tab, dialog, urls: win.gBrowser.tabs.map((t) => t.linkedBrowser.currentURI.spec), current: win.gBrowser.selectedTab.linkedBrowser.currentURI.spec });
           })()`));

@@ -62,7 +62,8 @@ export interface ShimConfig {
 // to be a service worker changes what code testing for one does, and so do the
 // service worker's `clients` and `registration` in the background and
 // navigator.serviceWorker in the extension's pages; the background's Web Lock
-// names are translated only for code that takes locks.
+// names are translated only for code that takes locks, and getManifest() gains
+// the worker's script only for code that reads service_worker.
 const FAVICON_REF_RE = /chrome:\/\/favicon|(?:^|[^\w$])_favicon\//m;
 const OFFSCREEN_REF_RE = /\.\s*offscreen\b|\[\s*["']offscreen["']\s*\]/;
 const NEW_TAB_REF_RE = /["'`]chrome:\/\/new-?tab(?:-page)?\/?["'`]/i;
@@ -78,15 +79,64 @@ const SW_REGISTRATION_REF_RE = /\b(?:self|globalThis)\s*\.\s*registration\s*(?:\
 const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
 // The worker's lifecycle: install/activate listeners and handlers, and skipWaiting().
 const SW_LIFECYCLE_REF_RE = /\bon(?:install|activate)\s*=(?!=)|\baddEventListener\s*\(\s*["'`](?:install|activate)["'`]|\bskipWaiting\b/;
+// The worker's own state (`self.serviceWorker.state`), read through any alias
+// of self, which minifiers introduce: `"activated" === a.serviceWorker.state`.
+// A ServiceWorker object has no pushManager, so web push doesn't rule it out.
+const SW_STATE_REF_RE = /\.\s*serviceWorker\s*(?:\?\.|\.)\s*state\b/;
 const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
+// The manifest's worker script read at runtime: bundles resolve it against their
+// own location to decide whether they run in the background.
+const SW_MANIFEST_REF_RE = /\bservice_worker\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
+// The storage areas whose set the clone fallback wraps.
+const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
 // Content scripts injected at runtime from files (scripting.executeScript,
 // registerContentScripts and updateContentScripts, MV2 tabs.executeScript).
 const INJECTS_FILES_RE = /\b(?:executeScript|registerContentScripts|updateContentScripts)\b/;
+// A worker's own localStorage or sessionStorage, which it doesn't have:
+// `self.localStorage = polyfill`. The event page's are getter-only.
+const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
+
+// A listener added with a last argument that can be false: a falsy literal,
+// which is what a Chrome build compiles `isFirefox && { … }` to, or an `&&`
+// expression that isn't a conditional.
+const ADD_LISTENER_RE = /\.\s*addListener\s*\(/g;
+const FALSY_LITERAL_RE = /^(?:!\s*1|false|0|""|''|null|void\s+0)$/;
+
+// Whether a call in `src` passes addListener a last argument that may be false.
+function hasFalsyListenerArg(src: string): boolean {
+  if (!src.includes("addListener")) return false;
+  ADD_LISTENER_RE.lastIndex = 0;
+  for (let m = ADD_LISTENER_RE.exec(src); m; m = ADD_LISTENER_RE.exec(src)) {
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    let lastComma = -1;
+    let and = false;
+    let conditional = false;
+    const close = walkCode(src, open, (c, i) => {
+      if (c === "(" || c === "[" || c === "{") depth++;
+      else if (c === ")" || c === "]" || c === "}") {
+        depth--;
+        if (depth === 0) return true;
+      } else if (depth === 1) {
+        if (c === ",") {
+          lastComma = i;
+          and = conditional = false;
+        } else if (c === "&" && src[i + 1] === "&") and = true;
+        else if (c === "?" && src[i + 1] !== "?" && src[i + 1] !== "." && src[i - 1] !== "?") conditional = true;
+      }
+      return false;
+    });
+    if (close < 0) continue;
+    if (lastComma < 0) continue;
+    if (FALSY_LITERAL_RE.test(src.slice(lastComma + 1, close).trim()) || (and && !conditional)) return true;
+  }
+  return false;
+}
 
 interface Usage {
   favicon: boolean;
@@ -96,20 +146,25 @@ interface Usage {
   serviceWorkerScope: boolean;
   serviceWorkerClients: boolean;
   serviceWorkerRegistration: boolean;
+  serviceWorkerState: boolean;
   pushManager: boolean;
   serviceWorkerLifecycle: boolean;
+  serviceWorkerManifest: boolean;
   locks: boolean;
   permissions: boolean;
   extraHeaders: boolean;
+  storage: boolean;
   messaging: boolean;
   injectsFiles: boolean;
+  storageGlobalsAssigned: string[];
+  falsyListenerArg: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
-    serviceWorkerClients: false, serviceWorkerRegistration: false, pushManager: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, messaging: false, injectsFiles: false,
+    serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
+    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -127,13 +182,20 @@ function scanUsage(dir: string): Usage {
       if (!found.serviceWorkerScope) found.serviceWorkerScope = SW_SCOPE_REF_RE.test(src);
       if (!found.serviceWorkerClients) found.serviceWorkerClients = SW_CLIENTS_REF_RE.test(src);
       if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
+      if (!found.serviceWorkerState) found.serviceWorkerState = SW_STATE_REF_RE.test(src);
       if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
       if (!found.serviceWorkerLifecycle) found.serviceWorkerLifecycle = SW_LIFECYCLE_REF_RE.test(src);
+      if (!found.serviceWorkerManifest) found.serviceWorkerManifest = SW_MANIFEST_REF_RE.test(src);
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
+      if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
       if (!found.injectsFiles) found.injectsFiles = INJECTS_FILES_RE.test(src);
+      for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
+        if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
+      }
+      if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
     }
   }
   return found;
@@ -179,7 +241,9 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerController: config.serviceWorker === true && usage.serviceWorkerClients && !workerHandlesFetch(dir, config.serviceWorkerScript ?? ""),
     serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
     serviceWorkerLifecycle: config.serviceWorker === true && usage.serviceWorkerLifecycle,
+    serviceWorkerSelf: config.serviceWorker === true && (usage.serviceWorkerState || (usage.serviceWorkerRegistration && !usage.pushManager)),
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
+    serviceWorkerManifest: config.serviceWorker === true && usage.serviceWorkerManifest,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
     // lavaduct adds session rules of its own: the backend Origin rule, and the
     // frame grants' rules.
@@ -188,7 +252,10 @@ function shimSource(dir: string, config: ShimConfig): string {
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
     extraHeaders: usage.extraHeaders,
+    storageClone: usage.storage,
     messageJson: usage.messaging,
+    storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
+    falsyListenerArgs: usage.falsyListenerArg,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so

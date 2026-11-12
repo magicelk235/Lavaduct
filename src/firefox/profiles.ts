@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { compareFirefoxVersions } from "../manifest/compat-data.js";
 import { DEDICATED_PROFILE } from "../name.js";
 import { stateDir } from "../state.js";
 import { installHash } from "./cityhash.js";
@@ -210,6 +211,38 @@ export function resolveProfile(selector: string | undefined, install: FirefoxIns
 /** Whether a running Firefox has the profile open. */
 export function profileInUse(profilePath: string): boolean {
   return platform.profileLocked(profilePath);
+}
+
+/**
+ * The version of the Firefox that last ran the profile, from compatibility.ini
+ * (`LastVersion=<version>_<build id>/<platform build id>`). Undefined for a
+ * profile no Firefox has run, or one last run in safe mode.
+ */
+export function profileLastVersion(profilePath: string): string | undefined {
+  let text: string;
+  try {
+    text = readFileSync(join(profilePath, "compatibility.ini"), "utf-8");
+  } catch {
+    return undefined;
+  }
+  return /^LastVersion=([^_\r\n]+)_/m.exec(text)?.[1];
+}
+
+/**
+ * Why `install` can't open the profile, when a newer Firefox ran it last.
+ * Firefox refuses such a profile unless MOZ_ALLOW_DOWNGRADE is set: it shows
+ * its "older version of Firefox" dialog, or quits without a window. The
+ * dedicated profile is shared by every install, so switching to an older
+ * channel (ESR after release, release after Nightly) runs into this.
+ */
+export function profileDowngradeProblem(install: FirefoxInstall, profilePath: string): string | undefined {
+  if (process.env.MOZ_ALLOW_DOWNGRADE) return undefined;
+  const last = profileLastVersion(profilePath);
+  if (last === undefined || compareFirefoxVersions(last, install.version) <= 0) return undefined;
+  return (
+    `Firefox ${last} last used the profile at ${profilePath}, and Firefox ${install.version} won't open a profile ` +
+    "a newer Firefox has used. Pick a Firefox at least that new with --firefox, or another profile with --profile."
+  );
 }
 
 /**

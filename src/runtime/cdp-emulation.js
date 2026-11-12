@@ -38,6 +38,8 @@
     return CDP_KEY + "_" + h.toString(16);
   })();
   var CDP_KEEPALIVE_MS = 20000;
+  // How long a document an attached tab loads waits for its hooks at most.
+  var CDP_HOLD_MS = 2000;
   // Firefox's extensions.webextensions.restrictedDomains: pages no add-on may script.
   var CDP_RESTRICTED_HOSTS = [
     "accounts-static.cdn.mozilla.net", "accounts.firefox.com", "addons.cdn.mozilla.net", "addons.mozilla.org",
@@ -1384,6 +1386,8 @@
     var keepAlive = null;
     var lifecycleHooked = false;
     var networkHooked = false;
+    var holding = false;
+    var holds = {};
     var requests = {};
     var commitWaiters = {};
     var session = null;
@@ -1422,6 +1426,8 @@
       delete sessions[tabId];
       persist();
       updateKeepAlive();
+      releaseTab(tabId);
+      if (!Object.keys(sessions).length) holdDocuments(false);
       if (!anyNetwork()) hookNetwork(false);
       if (!reason) return;
       var source = { tabId: tabId };
@@ -1496,6 +1502,76 @@
         return undefined;
       }).catch(noop);
     }
+    // The hooks go in through executeScript once webNavigation reports the
+    // commit, and by then Firefox has usually run the page's inline scripts and
+    // even its DOMContentLoaded and load handlers: an alert() there opened
+    // Firefox's own dialog, which nothing reported, and console calls went
+    // unheard. So while a tab is attached, the response body of each document
+    // it loads is held back by a stream filter until hookPage has run in the
+    // new document, which Firefox creates before any of the body arrives. The
+    // bytes then pass through unchanged. A document is let go after
+    // CDP_HOLD_MS whatever happens, so a response that never commits (a
+    // download) is only delayed.
+    function holdKey(tabId, frameId) { return tabId + ":" + (frameId || 0); }
+    function releaseHold(key) {
+      var h = holds[key];
+      if (!h) return;
+      delete holds[key];
+      clearTimeout(h.timer);
+      if (h.done) return;
+      h.done = true;
+      if (h.started) flushHold(h);
+    }
+    function flushHold(h) {
+      try {
+        h.chunks.forEach(function (chunk) { h.filter.write(chunk); });
+        h.chunks = [];
+        if (h.stopped) h.filter.close();
+        else h.filter.disconnect();
+      } catch (e) { dbg("debugger: letting a held document go failed:", errorMessage(e)); }
+    }
+    function releaseTab(tabId) {
+      Object.keys(holds).forEach(function (key) { if (key.split(":")[0] === String(tabId)) releaseHold(key); });
+    }
+    function holdDocument(d) {
+      var wr = api.webRequest;
+      if (!sessions[d.tabId] || typeof wr.filterResponseData !== "function") return undefined;
+      var key = holdKey(d.tabId, d.frameId);
+      releaseHold(key);
+      var filter;
+      try { filter = wr.filterResponseData(d.requestId); } catch (e) { return undefined; }
+      var h = { filter: filter, chunks: [], started: false, stopped: false, done: false, timer: null };
+      filter.onstart = function () {
+        h.started = true;
+        if (h.done) flushHold(h);
+      };
+      filter.ondata = function (e) {
+        if (!h.done) { h.chunks.push(e.data); return; }
+        try { filter.write(e.data); } catch (x) {}
+      };
+      filter.onstop = function () {
+        h.stopped = true;
+        if (h.done) { try { filter.close(); } catch (x) {} }
+      };
+      filter.onerror = function () {
+        h.done = true;
+        h.chunks = [];
+        if (holds[key] === h) { delete holds[key]; clearTimeout(h.timer); }
+      };
+      h.timer = setTimeout(function () { if (holds[key] === h) releaseHold(key); }, CDP_HOLD_MS);
+      holds[key] = h;
+      return undefined;
+    }
+    function holdDocuments(on) {
+      var wr = api.webRequest;
+      if (!wr || !wr.onBeforeRequest || holding === on) return;
+      try {
+        if (on) wr.onBeforeRequest.addListener(holdDocument, { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] }, ["blocking"]);
+        else wr.onBeforeRequest.removeListener(holdDocument);
+        holding = on;
+      } catch (e) { dbg("debugger: holding documents:", errorMessage(e)); }
+      if (!on) Object.keys(holds).forEach(releaseHold);
+    }
     function executionContext(tabId) {
       return getTab(tabId).then(function (tab) {
         var origin = "";
@@ -1548,7 +1624,7 @@
           emit(d.tabId, "Runtime.executionContextsCleared", {});
           executionContext(d.tabId);
         }
-        hookPage(d.tabId, d.frameId);
+        hookPage(d.tabId, d.frameId).then(function () { releaseHold(holdKey(d.tabId, d.frameId)); });
       });
       nav.onDOMContentLoaded.addListener(function (d) {
         if (d.frameId !== 0 || !pageOn(d)) return;
@@ -2047,6 +2123,7 @@
         persist();
         hookLifecycle();
         updateKeepAlive();
+        holdDocuments(true);
         return hookPage(tabId);
       });
     }
@@ -2086,6 +2163,7 @@
         if (Object.keys(sessions).length) {
           hookLifecycle();
           updateKeepAlive();
+          holdDocuments(true);
           if (anyNetwork()) hookNetwork(true);
           Object.keys(sessions).forEach(function (id) { hookPage(Number(id)); });
         }

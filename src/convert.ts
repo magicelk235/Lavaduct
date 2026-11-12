@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { ConvertOptions, ConvertResult, Issue, Manifest, SignRoute } from "./types.js";
 import { ENV_PREFIX, NAME } from "./name.js";
 import { extractExtension } from "./input/extract.js";
-import { applySourceRewrites, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
+import { applySourceRewrites, matchManifestPathCase, normalizeLocaleCatalogs, removeUnreadableLocales, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import {
   analyzeManifest,
@@ -33,11 +33,11 @@ import {
 } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId, framedSites } from "./runtime/oauth-bridge.js";
 import { deriveAddonId } from "./sign/addon-id.js";
-import { signWithAmo } from "./sign/amo.js";
+import { filesTooLargeForAmo, signWithAmo } from "./sign/amo.js";
 import { zipDirectory } from "./zip/write.js";
 import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firefox/locate.js";
-import { dedicatedProfile, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
-import { openXpiInFirefox, quitFirefoxForProfile } from "./firefox/launch.js";
+import { dedicatedProfile, profileDowngradeProblem, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
+import { openXpiInFirefox, otherInstallHolding, quitFirefoxForProfile, startedBeforeUserJs } from "./firefox/launch.js";
 import { BidiSession } from "./firefox/bidi.js";
 import { RdpSession } from "./firefox/rdp.js";
 import {
@@ -174,7 +174,6 @@ function scratchDir(): { path: string; dispose(): void } {
 
 interface Log {
   ok(msg: string): void;
-  warn(msg: string): void;
 }
 
 type BuildSettings = Pick<
@@ -186,19 +185,27 @@ type BuildSettings = Pick<
  * Stage the extension and turn it into a Firefox add-on: source rewrites, the shim,
  * the Firefox manifest, DNR rules, the page bridge, the background scripts and
  * placeholder icons. Writes the final manifest.json and returns it, with the number
- * of static DNR rules the add-on carries. --analyze runs this on a scratch copy, so
- * its preview is exactly what a conversion produces.
+ * of static DNR rules the add-on carries and the issues only the build finds (DNR
+ * rules Firefox won't take, files staging couldn't copy). --analyze runs this on a
+ * scratch copy, so its preview is exactly what a conversion produces.
  */
 function buildAddon(
   src: { extPath: string; manifest: Manifest; permissionsToRemove: string[]; name: string; chromeId?: string; addonId: string },
   stageDir: string,
   settings: BuildSettings,
   log: Log,
-): { manifest: Manifest; staticRules: number } {
+): { manifest: Manifest; staticRules: number; notes: Issue[] } {
   const { manifest } = src;
-  for (const asset of stageExtension(src.extPath, stageDir, collectReferencedPaths(manifest))) {
-    log.warn(`Manifest-referenced asset not staged (broken/external symlink or copy error): ${asset}. It will 404 in Firefox.`);
-  }
+  const notes: Issue[] = stageExtension(src.extPath, stageDir, collectReferencedPaths(manifest)).map((asset) => ({
+    severity: "warning",
+    category: "staging",
+    message: `Manifest-referenced asset not staged (broken/external symlink or copy error): ${asset}. It will 404 in Firefox.`,
+    file: asset,
+  }));
+  const junk = removeUnreadableLocales(stageDir, manifest.default_locale);
+  if (junk.length > 0) log.ok(`Left out ${junk.join(", ")}: no messages.json Chrome reads, so Chrome skips it, and Firefox would refuse the add-on`);
+  const catalogs = normalizeLocaleCatalogs(stageDir);
+  if (catalogs.length > 0) log.ok(`Rewrote ${catalogs.length} locale catalog(s) as plain JSON, which Firefox's reader needs: ${catalogs.join(", ")}`);
   for (const r of applySourceRewrites(stageDir, manifest)) {
     if (r.count > 0) log.ok(`${r.name} in ${r.count} file(s)`);
   }
@@ -251,6 +258,15 @@ function buildAddon(
     sidebarPanel: panelPage,
     debuggerEmulation,
   });
+  for (const change of matchManifestPathCase(stageDir, out)) {
+    notes.push({
+      severity: "info",
+      category: "manifest",
+      message: `Manifest path ${change}, the file's case on disk; Firefox looks files up by exact name in the .xpi, where Chrome's case-insensitive disk found them.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
   if (!manifest.side_panel && out.sidebar_action && panelPage) {
     log.ok(`Sidebar declared for ${panelPage}, the page the extension opens with chrome.sidePanel`);
   }
@@ -263,7 +279,7 @@ function buildAddon(
   }
 
   const dnr = applyDnr(stageDir, out);
-  for (const note of dnr.notes) log.warn(note);
+  notes.push(...dnr.notes);
   if (settings.oauthBridge !== false) {
     for (const note of applyOAuthBridge(stageDir, out, src.chromeId)) log.ok(note);
   }
@@ -277,7 +293,8 @@ function buildAddon(
   if (maps > 0) log.ok(`Stripped dangling sourcemap refs from ${maps} script(s)`);
 
   writeManifest(stageDir, out);
-  return { manifest: out, staticRules: dnr.staticRules };
+  notes.push(...filesTooLargeForAmo(stageDir));
+  return { manifest: out, staticRules: dnr.staticRules, notes };
 }
 
 /** Extract an input and read its manifest and identity. */
@@ -288,9 +305,10 @@ function load(input: string, scratch: string, minFirefox: string) {
   return { extPath, manifest, name, chromeId: deriveChromeId(manifest), minFirefox };
 }
 
-function issuesOf(extPath: string, manifest: Manifest, minFirefox: string) {
-  const { issues, permissionsToRemove } = analyzeManifest(manifest, { minFirefox });
-  return { issues: [...issues, ...scanExtension(extPath, manifest, { minFirefox })], permissionsToRemove };
+function issuesOf(extPath: string, manifest: Manifest, settings: BuildSettings & { minFirefox: string }) {
+  const shim = settings.generateShim !== false;
+  const { issues, permissionsToRemove } = analyzeManifest(manifest, { minFirefox: settings.minFirefox, shim, oauthBridge: settings.oauthBridge !== false });
+  return { issues: [...issues, ...scanExtension(extPath, manifest, { minFirefox: settings.minFirefox, shim })], permissionsToRemove };
 }
 
 export type AnalyzeOptions = Pick<ConvertOptions, "input" | "addonId"> & BuildSettings;
@@ -317,10 +335,11 @@ export function analyzeExtension(opts: AnalyzeOptions): Analysis {
   const scratch = scratchDir();
   try {
     const src = load(opts.input, scratch.path, opts.minFirefoxVersion ?? DEFAULT_MIN_FIREFOX);
-    const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, src.minFirefox);
+    const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, { ...opts, minFirefox: src.minFirefox });
     const addonId = opts.addonId ?? deriveAddonId({ chromeId: src.chromeId, name: src.name });
-    const quiet: Log = { ok() {}, warn() {} };
-    const { manifest: built } = buildAddon({ ...src, permissionsToRemove, addonId }, join(scratch.path, STAGE_DIR), opts, quiet);
+    const quiet: Log = { ok() {} };
+    const { manifest: built, notes } = buildAddon({ ...src, permissionsToRemove, addonId }, join(scratch.path, STAGE_DIR), opts, quiet);
+    issues.push(...notes);
     return {
       name: src.name,
       appName: deriveAppName(src.name),
@@ -379,6 +398,10 @@ function planRoute(opts: ConvertOptions, minFirefox: string): Plan {
   // The temporary route turns remote debugging on in a profile of its own, not the user's, unless told otherwise.
   const profile =
     route.route === "temporary" && opts.profile === undefined ? dedicatedProfile(install) : resolveProfile(opts.profile, install);
+  // A Firefox that has the profile open may take the add-on without a restart;
+  // the install routes check again before they start one.
+  const downgrade = profileInUse(profile.path) ? undefined : profileDowngradeProblem(install, profile.path);
+  if (downgrade) throw new Error(downgrade);
   return { route, target: { install, profile } };
 }
 
@@ -435,12 +458,24 @@ async function installTemporarily(
   if (opts.headless) return installHeadless({ install, profile }, stageDir, addonId, staticRules);
   // A Firefox that an earlier temporary install started still has its devtools
   // server: load this add-on next to the others rather than restart it,
-  // which would drop them.
+  // which would drop them. Unless it is another install than the one
+  // --firefox picks: then the add-on would land in a Firefox nobody asked for.
   let session = await RdpSession.attach(profile.path);
+  const other = session && opts.firefox !== undefined ? otherInstallHolding(install, profile.path) : undefined;
+  if (session && other) {
+    session.end();
+    session = undefined;
+    info(`${profile.path} is open in the Firefox at ${other}, not the one --firefox picks.`);
+  }
   if (session) {
     info(`Using the Firefox that already has ${profile.path} open with remote debugging on`);
     if (raiseRuleLimit(profile.path, staticRules)) warn(RULE_LIMIT_RESTART);
   } else {
+    const downgrade = profileDowngradeProblem(install, profile.path);
+    if (downgrade) {
+      fail(downgrade);
+      return "failed";
+    }
     if (profileInUse(profile.path)) {
       if (!opts.firefoxRestart) {
         fail(
@@ -510,21 +545,28 @@ async function installByPrompt(
 ): Promise<InstallOutcome> {
   if (route === "unsigned") {
     const running = profileInUse(profile.path);
-    if (allowUnsignedInProfile(profile.path).changed) {
-      ok(`Turned off signature checks in ${join(profile.path, "user.js")} (xpinstall.signatures.required = false)`);
-      if (running) {
-        if (!opts.firefoxRestart || !opts.launch) {
-          warn(
-            `Firefox has ${profile.path} open and reads that setting only when it starts. ` +
-              `Quit Firefox and start it again, then open ${xpi} in it to install the add-on.`,
-          );
-          return "skipped";
-        }
-        info("Restarting Firefox so the setting takes effect …");
-        if (!(await quitFirefoxForProfile(install, profile.path))) {
-          fail(`Couldn't quit the Firefox that has ${profile.path} open. Quit it yourself, then run this again.`);
-          return "failed";
-        }
+    const changed = allowUnsignedInProfile(profile.path).changed;
+    if (changed) ok(`Turned off signature checks in ${join(profile.path, "user.js")} (xpinstall.signatures.required = false)`);
+    // Also when the pref was already there but this Firefox started before it
+    // was written, e.g. by an earlier run under --no-firefox-restart or --no-launch.
+    if ((changed && running) || startedBeforeUserJs(install, profile.path)) {
+      if (!changed) info(`The Firefox that has ${profile.path} open started before signature checks were turned off in its user.js.`);
+      if (!opts.firefoxRestart || !opts.launch) {
+        warn(
+          `Firefox has ${profile.path} open and reads that setting only when it starts. ` +
+            `Quit Firefox and start it again, then open ${xpi} in it to install the add-on.`,
+        );
+        return "skipped";
+      }
+      const downgrade = profileDowngradeProblem(install, profile.path);
+      if (downgrade) {
+        fail(downgrade);
+        return "failed";
+      }
+      info("Restarting Firefox so the setting takes effect …");
+      if (!(await quitFirefoxForProfile(install, profile.path))) {
+        fail(`Couldn't quit the Firefox that has ${profile.path} open. Quit it yourself, then run this again.`);
+        return "failed";
       }
     }
   }
@@ -555,7 +597,7 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     result.chromeId = src.chromeId;
     ok(`Loaded "${src.name}" (MV${result.manifestVersion})`);
 
-    const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, src.minFirefox);
+    const { issues, permissionsToRemove } = issuesOf(src.extPath, src.manifest, { ...opts, minFirefox: src.minFirefox });
     result.issues = issues;
     const blocking = countBlocking(issues, opts.strict);
     if (blocking > 0 && !opts.force) {
@@ -613,7 +655,8 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
 
     // Kept in the output directory: a temporary install loads it in place.
     info("Staging clean extension assets …");
-    const { manifest: built, staticRules } = buildAddon({ ...src, permissionsToRemove, addonId }, stageDir, opts, { ok, warn });
+    const { manifest: built, staticRules, notes } = buildAddon({ ...src, permissionsToRemove, addonId }, stageDir, opts, { ok });
+    issues.push(...notes);
     const version = built.version ?? "";
     result.stagedPath = stageDir;
     result.version = version;
@@ -630,6 +673,13 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     };
     const reportPath = writeReportFile(outputDir, meta, issues);
     ok(`Report → ${reportPath}`);
+    // The build's own findings come after the gate above; under --strict a warning
+    // among them blocks just the same.
+    if (opts.strict && !opts.force && countBlocking(notes, true) > 0) {
+      printIssues(issues);
+      fail(`${countBlocking(issues, true)} blocking issue(s) (--strict: warnings count). Re-run with --force to convert anyway.`);
+      return result;
+    }
 
     info("Packing .xpi");
     let packed: { version: string; xpiPath: string; sha256: string } | undefined;
@@ -676,6 +726,15 @@ export async function convert(opts: ConvertOptions): Promise<ConvertResult> {
     if (route === "amo") {
       const credentials = opts.amo;
       if (!credentials) throw new Error(AMO_CREDENTIALS_MISSING);
+      // AMO's validator would reject the upload, and --force can't change that.
+      const tooLarge = notes.filter((i) => i.category === "amo");
+      if (tooLarge.length > 0) {
+        for (const i of tooLarge) i.severity = "error";
+        writeReportFile(outputDir, meta, issues);
+        printIssues(issues);
+        fail(`AMO won't sign an add-on with text files of 5 MiB or more (${tooLarge.map((i) => i.file).join(", ")}); nothing was uploaded.`);
+        return result;
+      }
       const outcome = await signWithAmo({ addonId, baseVersion: version, credentials, pack, outDir: outputDir });
       if (outcome.kind === "pending") {
         printIssues(issues);

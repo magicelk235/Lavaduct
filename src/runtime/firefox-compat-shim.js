@@ -1106,6 +1106,28 @@
     defineMissing(G, "skipWaiting", function () { return Promise.resolve(); });
   }
 
+  // ── A worker's own localStorage ─────────────────────────────────────────────
+  // A service worker has no localStorage or sessionStorage, so a bundle may
+  // give itself one: `self.localStorage = polyfill`. In the event page both are
+  // getter-only accessors, and the assignment throws in strict and module code,
+  // ending the background there. The names the bundle assigns become plain
+  // writable properties holding Firefox's storage, so reads still reach it
+  // until the bundle replaces it. Only in the background of a converted worker.
+  function installAssignableStorageGlobals() {
+    var names = CONFIG.storageGlobalsAssigned;
+    if (!isBackground || !Array.isArray(names)) return;
+    names.forEach(function (name) {
+      var desc = null;
+      for (var o = G; o && !desc; o = Object.getPrototypeOf(o)) desc = Object.getOwnPropertyDescriptor(o, name) || null;
+      if (!desc || typeof desc.get !== "function" || desc.set) return;
+      var value;
+      try { value = G[name]; } catch (e) {}
+      try {
+        Object.defineProperty(G, name, { value: value, writable: true, configurable: true, enumerable: desc.enumerable === true });
+      } catch (e) { dbg("can't make " + name + " assignable:", errorMessage(e)); }
+    });
+  }
+
   // ── Service worker messaging ────────────────────────────────────────────────
   // A Chrome extension's pages reach its service worker through
   // navigator.serviceWorker (ready, controller, getRegistration), and the worker
@@ -1427,9 +1449,11 @@
   // Chrome worker restarted after its install is in. No update ever arrives, so
   // the registration's events never fire. Its postMessage reaches the worker
   // itself, with the worker as the source, as in Chrome. Only emitted for a
-  // bundle that reads them.
+  // bundle that reads them. A bundle with web push code gets the worker without
+  // the registration (see PUSH_MANAGER_REF_RE in shim.ts): MetaMask boots on
+  // `"activated" === self.serviceWorker.state` and carries Firebase's push code.
   function installServiceWorkerRegistration() {
-    if (!CONFIG.serviceWorkerRegistration || !isBackground || typeof EventTarget !== "function") return;
+    if (!CONFIG.serviceWorkerSelf || !isBackground || typeof EventTarget !== "function") return;
     var worker = makeServiceWorker(function postMessage(message, transfer) {
       var list = transferList(transfer);
       var copy = structuredClone({ m: message, t: list }, { transfer: list });
@@ -1444,7 +1468,7 @@
       }, 0);
     });
     defineMissing(G, "serviceWorker", worker);
-    defineMissing(G, "registration", makeRegistration(worker));
+    if (CONFIG.serviceWorkerRegistration) defineMissing(G, "registration", makeRegistration(worker));
   }
 
   // ── The worker's install and activate events ───────────────────────────────
@@ -1523,6 +1547,34 @@
       var args = Array.prototype.slice.call(arguments);
       if (typeof name === "string" && Object.prototype.hasOwnProperty.call(names, name)) args[0] = names[name];
       return native.apply(locks, args);
+    });
+  }
+
+  // ── The worker's script in getManifest() ────────────────────────────────────
+  // Firefox returns the converted manifest, whose background has scripts and no
+  // service_worker. Bundles tell the worker from their pages by resolving that
+  // script against their own location (Loom):
+  //   new URL(getManifest().background.service_worker, location.origin).pathname === location.pathname
+  // Without the key the background answers no and sends what it would handle
+  // itself to itself with runtime.sendMessage, where nothing receives it. The
+  // background is told its own page is the worker's script, so the check says
+  // yes there; everywhere else the key is Chrome's, the worker's real script,
+  // which navigator.serviceWorker.register() in the pages matches.
+  function installServiceWorkerManifest() {
+    if (!CONFIG.serviceWorkerManifest || !CONFIG.serviceWorkerScript) return;
+    var script = isBackground ? stripSlashes(loc.pathname) : stripSlashes(CONFIG.serviceWorkerScript);
+    namespaces.forEach(function (ns) {
+      var rt = ns && ns.runtime;
+      var native = rt && rt.getManifest;
+      if (typeof native !== "function") return;
+      replaceMember(rt, "getManifest", function () {
+        var manifest = native.apply(rt, arguments);
+        var bg = manifest && manifest.background;
+        if (!bg || typeof bg !== "object" || typeof bg.service_worker === "string") return manifest;
+        var copy = Object.assign({}, manifest);
+        copy.background = Object.assign({}, bg, { service_worker: script });
+        return copy;
+      });
     });
   }
 
@@ -1639,10 +1691,22 @@
   var DNR_DOMAIN_CONDITIONS = ["requestDomains", "excludedRequestDomains", "initiatorDomains", "excludedInitiatorDomains"];
   var DNR_MISSING_TYPES = { webbundle: true, webtransport: true };
 
+  // Chrome's extension ID is the host of its own origin, so code names it in a
+  // rule's domains to mean its own requests: initiatorDomains: [chrome.runtime.id].
+  // Firefox's add-on ID isn't a domain, and its pages' host is a per-install
+  // UUID, so the add-on's ID, and its Chrome ID written into the code, become
+  // that host.
+  var OWN_HOST = "";
+  try { OWN_HOST = new URL(ORIGIN + "/").host; } catch (e) {}
+  var ownIds = {};
+  try { ownIds[String(api.runtime.id).toLowerCase()] = true; } catch (e) {}
+  if (CONFIG.extensionId) ownIds[String(CONFIG.extensionId).toLowerCase()] = true;
+
   // Chrome lower-cases a rule's domains, and Firefox refuses an upper-case one.
   function firefoxDomain(d) {
     if (typeof d !== "string") return d;
     var lower = d.toLowerCase();
+    if (OWN_HOST && ownIds[lower] === true) return OWN_HOST;
     if (lower.indexOf(":") < 0 || lower.charAt(0) === "[") return lower;
     try { return new URL("http://[" + lower + "]/").hostname; } catch (e) { return d; }
   }
@@ -2371,6 +2435,93 @@
     });
   }
 
+  // ── Values Chrome's storage keeps and Firefox can't clone ───────────────────
+  // Chrome's storage.set serializes values: a function, or an object without
+  // own data such as a URL, is stored as {}. Firefox structured-clones them and
+  // refuses the whole call (in Firefox 160 for local, sync and session alike):
+  // the promise rejects with "DataCloneError: Function object could not be
+  // cloned.", the callback sees it as lastError, and nothing is stored. Rabby
+  // keeps rules with a getValue function in storage.local. A call Firefox
+  // takes stays Firefox's; one it refuses for a clone error is sent again with
+  // what it couldn't clone replaced the way Chrome stores it. Only emitted for
+  // a bundle that uses storage.
+  function chromeStorable(value, ancestors) {
+    if (typeof value === "function") return {};
+    if (typeof value === "symbol") return undefined;
+    if (value === null || typeof value !== "object") return value;
+    if (ancestors.indexOf(value) >= 0) return undefined;
+    var proto = Object.getPrototypeOf(value);
+    var plain = Array.isArray(value) || proto === Object.prototype || proto === null;
+    if (!plain && typeof structuredClone === "function") {
+      try {
+        structuredClone(value);
+        return value;
+      } catch (e) {
+        if (!isCloneError(e)) return value;
+      }
+    }
+    ancestors.push(value);
+    var out;
+    if (Array.isArray(value)) {
+      out = [];
+      for (var i = 0; i < value.length; i++) {
+        var item = chromeStorable(value[i], ancestors);
+        out.push(item === undefined ? null : item);
+      }
+    } else {
+      out = {};
+      Object.keys(value).forEach(function (k) {
+        var v = chromeStorable(value[k], ancestors);
+        if (v !== undefined) out[k] = v;
+      });
+    }
+    ancestors.pop();
+    return out;
+  }
+
+  function installStorageCloneFallback() {
+    if (!CONFIG.storageClone) return;
+    namespaces.forEach(function (ns) {
+      var storage = null;
+      try { storage = ns.storage; } catch (e) {}
+      if (!storage) return;
+      ["local", "sync", "session"].forEach(function (name) {
+        var area = null;
+        try { area = storage[name]; } catch (e) {}
+        var set = area && area.set;
+        if (typeof set !== "function") return;
+        replaceMember(area, "set", function (items) {
+          var args = Array.prototype.slice.call(arguments);
+          var storable = function () { return chromeStorable(items, []); };
+          var last = args.length - 1;
+          if (last >= 1 && typeof args[last] === "function") {
+            var cb = args[last];
+            args[last] = function () {
+              var err = null;
+              try { err = ns.runtime.lastError; } catch (e) {}
+              if (err && isCloneError(err)) {
+                var copy = null;
+                try { copy = storable(); } catch (e) {}
+                if (copy) return set.call(area, copy, cb);
+              }
+              return cb.apply(this, arguments);
+            };
+            return set.apply(area, args);
+          }
+          var retry = function (e) {
+            if (!isCloneError(e)) throw e;
+            var copy;
+            try { copy = storable(); } catch (x) { throw e; }
+            return set.call(area, copy);
+          };
+          var result;
+          try { result = set.apply(area, args); } catch (e) { return retry(e); }
+          return result && typeof result.then === "function" ? result.then(null, retry) : result;
+        });
+      });
+    });
+  }
+
   // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
   // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
   // such as Cookie or Referer; Firefox shows every header without it, has no
@@ -2404,6 +2555,48 @@
         });
       });
     });
+  }
+
+  // ── A listener's filter passed as false ────────────────────────────────────
+  // Code built for both browsers passes an event's filter as
+  // `isFirefox && { … }`, which a Chrome build compiles to
+  // addListener(fn, false). Firefox's schemas refuse false, 0 or "" where a
+  // filter object or nothing goes ("Incorrect argument types for
+  // tabs.onUpdated"), and the throw ends the script that registered it. A
+  // trailing argument that is falsy (false, 0, "", null, undefined) is left
+  // out instead: that's what the add-on means by it. The function is passed on
+  // as it is, so removeListener and hasListener still find it. Every event
+  // object the namespaces hold is wrapped once (chrome and browser share them);
+  // a namespace a later permission grant adds isn't. Only emitted for a bundle
+  // that passes addListener a last argument that may be false.
+  function installFalsyListenerArgs() {
+    if (!CONFIG.falsyListenerArgs) return;
+    var wrapped = [];
+    function wrapEvent(ev) {
+      if (wrapped.indexOf(ev) >= 0) return;
+      wrapped.push(ev);
+      var add = ev.addListener;
+      replaceMember(ev, "addListener", function () {
+        var args = Array.prototype.slice.call(arguments);
+        while (args.length > 1 && !args[args.length - 1]) args.length--;
+        return add.apply(ev, args);
+      });
+    }
+    function walk(obj, depth) {
+      var keys;
+      try { keys = Object.keys(obj); } catch (e) { return; }
+      keys.forEach(function (key) {
+        var v = null;
+        try { v = obj[key]; } catch (e) {}
+        if (!v || typeof v !== "object") return;
+        if (/^on[A-Z]/.test(key)) {
+          if (typeof v.addListener === "function") wrapEvent(v);
+        } else if (depth > 0) {
+          walk(v, depth - 1);
+        }
+      });
+    }
+    namespaces.forEach(function (ns) { walk(ns, 2); });
   }
 
   // ── permissions Firefox doesn't know ───────────────────────────────────────
@@ -2573,11 +2766,13 @@
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
   try { installFavicon(); } catch (e) { dbg("favicon shim failed:", errorMessage(e)); }
   try { installServiceWorkerScope(); } catch (e) { dbg("ServiceWorkerGlobalScope shim failed:", errorMessage(e)); }
+  try { installAssignableStorageGlobals(); } catch (e) { dbg("assignable storage globals failed:", errorMessage(e)); }
   try { installServiceWorkerRegistration(); } catch (e) { dbg("registration shim failed:", errorMessage(e)); }
   try { installServiceWorkerClients(); } catch (e) { dbg("clients shim failed:", errorMessage(e)); }
   try { installServiceWorkerContainer(); } catch (e) { dbg("navigator.serviceWorker shim failed:", errorMessage(e)); }
   try { installServiceWorkerLifecycle(); } catch (e) { dbg("worker lifecycle shim failed:", errorMessage(e)); }
   try { installServiceWorkerLocks(); } catch (e) { dbg("Web Locks shim failed:", errorMessage(e)); }
+  try { installServiceWorkerManifest(); } catch (e) { dbg("getManifest service_worker shim failed:", errorMessage(e)); }
   try { installChromeUrls(); } catch (e) { dbg("chrome:// URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
   try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
@@ -2591,8 +2786,10 @@
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
+  try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
   try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
+  try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();

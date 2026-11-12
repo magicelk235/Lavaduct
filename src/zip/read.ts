@@ -218,12 +218,21 @@ function safeSegments(name: string): string[] {
   return segments;
 }
 
+// Caps checked before anything is written. A download is capped at 100 MB, but a
+// small archive can declare honest sizes that inflate to fill memory and disk.
+// More entries than the .xpi writer can pack (no zip64 output) can't convert anyway.
+const MAX_ENTRIES = 0xffff;
+const MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+
 /**
- * Extract every entry into destDir. All names are checked before anything is
- * written, so a malicious archive leaves nothing behind.
+ * Extract every entry into destDir. All names, sizes and data ranges are checked
+ * before anything is written, so a malicious archive leaves nothing behind.
  */
 export function extractZip(buf: Buffer, destDir: string): void {
   const entries = readCentralDirectory(buf);
+  if (entries.length > MAX_ENTRIES) {
+    throw new Error(`Refusing zip archive with ${entries.length} entries; an add-on can hold at most ${MAX_ENTRIES} files.`);
+  }
   const root = resolve(destDir);
   const prefix = root.endsWith(sep) ? root : root + sep;
   const plan: Array<{ entry: CentralEntry; target: string; dir: boolean }> = [];
@@ -232,6 +241,8 @@ export function extractZip(buf: Buffer, destDir: string): void {
   // nothing, instead of failing with EEXIST or EISDIR halfway through.
   const files = new Map<string, string>();
   const folders = new Map<string, string>();
+  let totalBytes = 0;
+  const ranges: Array<{ start: number; end: number; name: string }> = [];
   for (const entry of entries) {
     // Unix file type in the high half of the external attributes; 0o120000 is a symlink.
     if (((entry.externalAttrs >>> 16) & 0o170000) === 0o120000) {
@@ -247,12 +258,29 @@ export function extractZip(buf: Buffer, destDir: string): void {
       const path = segments.slice(0, i).join("/");
       if (!folders.has(path)) folders.set(path, entry.name);
     }
-    if (!dir) files.set(segments.join("/"), entry.name);
+    if (!dir) {
+      files.set(segments.join("/"), entry.name);
+      totalBytes += entry.size;
+      if (totalBytes > MAX_TOTAL_BYTES) {
+        throw new Error(`Refusing zip archive that declares more than ${MAX_TOTAL_BYTES / 1024 ** 3} GiB of files (decompression bomb?)`);
+      }
+      // Entries that share bytes (several names over one deflate stream) are how
+      // small archives expand to petabytes; a real archive never overlaps.
+      const h = entry.localOffset;
+      if (h + 30 > buf.length || buf.readUInt32LE(h) !== SIG_LOCAL) throw new Error(`Corrupt zip archive (bad local header for ${entry.name})`);
+      ranges.push({ start: h, end: h + 30 + buf.readUInt16LE(h + 26) + buf.readUInt16LE(h + 28) + entry.compressedSize, name: entry.name });
+    }
     plan.push({ entry, target, dir });
   }
   for (const [path, name] of files) {
     const other = folders.get(path);
     if (other !== undefined) throw new Error(`Refusing zip archive that uses "${path}" as both a file (${name}) and a folder (${other})`);
+  }
+  ranges.sort((a, b) => a.start - b.start);
+  for (let i = 1; i < ranges.length; i++) {
+    if (ranges[i].start < ranges[i - 1].end) {
+      throw new Error(`Refusing zip archive whose entries ${ranges[i - 1].name} and ${ranges[i].name} share data (decompression bomb?)`);
+    }
   }
 
   mkdirSync(root, { recursive: true });

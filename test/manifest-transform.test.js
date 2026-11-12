@@ -107,15 +107,17 @@ test("the debugger emulation gets the APIs it runs on and access to every page, 
     permissions: ["debugger", "storage"], optional_permissions: ["tabs"], host_permissions: ["https://a.test/*"],
   };
   const out = transformManifest(m, ["debugger"], options({ debuggerEmulation: true }));
-  assert.deepEqual(out.permissions, ["storage", "scripting", "tabs", "webNavigation", "webRequest"]);
+  assert.deepEqual(out.permissions, ["storage", "scripting", "tabs", "webNavigation", "webRequest", "webRequestBlocking", "webRequestFilterResponse"]);
   assert.equal(out.optional_permissions, undefined, "tabs is granted outright now");
   assert.deepEqual(out.host_permissions, ["https://a.test/*", "<all_urls>"]);
   const lines = summarizeManifestChanges(m, out);
-  assert.ok(lines.includes("Added permission(s) `scripting`, `webNavigation`, `webRequest`, which the converter's emulations run on."), lines.join("\n"));
+  assert.ok(lines.includes("Added permission(s) `scripting`, `webNavigation`, `webRequest`, `webRequestBlocking`, `webRequestFilterResponse`, which the converter's emulations run on."), lines.join("\n"));
   assert.ok(lines.some((l) => l.startsWith("Added `host_permissions` pattern(s) `<all_urls>`")), lines.join("\n"));
 
   const mv2 = transformManifest({ manifest_version: 2, name: "Agent", version: "1", permissions: ["debugger"] }, ["debugger"], options({ debuggerEmulation: true }));
   assert.ok(mv2.permissions.includes("<all_urls>"), "Manifest V2 keeps host patterns among the permissions");
+  assert.ok(mv2.permissions.includes("webRequestBlocking"));
+  assert.ok(!mv2.permissions.includes("webRequestFilterResponse"), "Manifest V2 filters responses on webRequestBlocking alone");
   assert.equal(mv2.host_permissions, undefined);
   assert.deepEqual(transformManifest(m, ["debugger"], options()).permissions, ["storage"], "nothing is added without the emulation");
 });
