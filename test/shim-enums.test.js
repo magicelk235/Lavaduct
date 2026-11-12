@@ -81,3 +81,17 @@ test("each namespace of an MV2 page gets the objects, and a context without decl
   const ctx = runInContext(buildShim(), { browser: content, href: "https://example.com/" });
   assert.equal(vm.runInContext("typeof chrome.declarativeNetRequest", ctx), "undefined");
 });
+
+test("a temporary load repeated is a CHROME_UPDATE by Chrome's own enum key", () => {
+  // Speechify redoes its setup on reason === runtime.OnInstalledReason.CHROME_UPDATE;
+  // Firefox's enum has BROWSER_UPDATE instead, so the repeat the onInstalled
+  // wrapper reports compared equal to undefined.
+  const browser = fakeBrowser();
+  const firefoxReasons = { INSTALL: "install", UPDATE: "update", BROWSER_UPDATE: "browser_update" };
+  browser.runtime.OnInstalledReason = firefoxReasons;
+  runInContext(buildShim(), { browser });
+  assert.equal(browser.runtime.OnInstalledReason, firefoxReasons, "Firefox's object is kept");
+  assert.deepEqual(plain(firefoxReasons), {
+    INSTALL: "install", UPDATE: "update", BROWSER_UPDATE: "browser_update", CHROME_UPDATE: "chrome_update", SHARED_MODULE_UPDATE: "shared_module_update",
+  });
+});

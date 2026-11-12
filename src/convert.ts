@@ -31,7 +31,7 @@ import {
   workerChunkGlobal,
   writeShim,
 } from "./runtime/shim.js";
-import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
+import { applyOAuthBridge, deriveChromeId, framedSites } from "./runtime/oauth-bridge.js";
 import { deriveAddonId } from "./sign/addon-id.js";
 import { filesTooLargeForAmo, signWithAmo } from "./sign/amo.js";
 import { zipDirectory } from "./zip/write.js";
@@ -233,6 +233,11 @@ function buildAddon(
       userScripts: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].includes("userScripts"),
       webpackChunkGlobal: workerChunkGlobal(stageDir, manifest),
       declaredPermissions: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].filter((p): p is string => typeof p === "string"),
+      newTabPage: typeof manifest.chrome_url_overrides?.newtab === "string" ? manifest.chrome_url_overrides.newtab : "",
+      externalIds: manifest.externally_connectable && typeof manifest.externally_connectable === "object"
+        ? (Array.isArray(manifest.externally_connectable.ids) ? manifest.externally_connectable.ids : [])
+        : undefined,
+      frameGrants: settings.oauthBridge !== false && !!src.chromeId && framedSites(stageDir, manifest).length > 0,
     });
     if (settings.debug) {
       log.ok(`Debug build: shim tracing on, kept in storage.local under ${DEBUG_LOG_KEY} (read it with ${NAME} --logs). Don't ship this build.`);

@@ -44,6 +44,16 @@ export interface ShimConfig {
   userScripts?: boolean;
   /** The Chrome manifest's permissions and optional_permissions, before the transform removes any. */
   declaredPermissions?: string[];
+  /** The Chrome manifest's chrome_url_overrides.newtab: the add-on's own new tab page. */
+  newTabPage?: string;
+  /**
+   * The Chrome manifest's externally_connectable.ids: the other extensions it
+   * lets in, [] when the key has no ids. Undefined without the key, where
+   * Chrome lets every extension in.
+   */
+  externalIds?: string[];
+  /** The page bridge lets the add-on's pages frame sites (framedSites), with session rules of its own. */
+  frameGrants?: boolean;
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
@@ -57,6 +67,7 @@ export interface ShimConfig {
 const FAVICON_REF_RE = /chrome:\/\/favicon|(?:^|[^\w$])_favicon\//m;
 const OFFSCREEN_REF_RE = /\.\s*offscreen\b|\[\s*["']offscreen["']\s*\]/;
 const NEW_TAB_REF_RE = /["'`]chrome:\/\/new-?tab(?:-page)?\/?["'`]/i;
+const SHORTCUTS_REF_RE = /["'`]chrome:\/\/extensions\/(?:shortcuts|configureCommands)\/?["'`]/i;
 const SW_SCOPE_REF_RE = /\bServiceWorkerGlobalScope\b/;
 // The worker's clients (`self.clients`, `clients.matchAll(`, `const { clients } = self`),
 // and its pages' navigator.serviceWorker: the two ends of one channel.
@@ -66,6 +77,8 @@ const SW_CLIENTS_REF_RE = /\b(?:self|globalThis)\s*\.\s*clients\b|\bclients\s*\.
 // Firefox gives add-ons no Push API, so it must keep finding none.
 const SW_REGISTRATION_REF_RE = /\b(?:self|globalThis)\s*\.\s*registration\s*(?:\?\.|\.)\s*(?:active|installing|waiting|scope|addEventListener|update|unregister)\b/;
 const PUSH_MANAGER_REF_RE = /\.\s*pushManager\b/;
+// The worker's lifecycle: install/activate listeners and handlers, and skipWaiting().
+const SW_LIFECYCLE_REF_RE = /\bon(?:install|activate)\s*=(?!=)|\baddEventListener\s*\(\s*["'`](?:install|activate)["'`]|\bskipWaiting\b/;
 // The worker's own state (`self.serviceWorker.state`), read through any alias
 // of self, which minifiers introduce: `"activated" === a.serviceWorker.state`.
 // A ServiceWorker object has no pushManager, so web push doesn't rule it out.
@@ -81,6 +94,9 @@ const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
+// Content scripts injected at runtime from files (scripting.executeScript,
+// registerContentScripts and updateContentScripts, MV2 tabs.executeScript).
+const INJECTS_FILES_RE = /\b(?:executeScript|registerContentScripts|updateContentScripts)\b/;
 // A worker's own localStorage or sessionStorage, which it doesn't have:
 // `self.localStorage = polyfill`. The event page's are getter-only.
 const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
@@ -126,26 +142,29 @@ interface Usage {
   favicon: boolean;
   offscreen: boolean;
   newTab: boolean;
+  shortcutsPage: boolean;
   serviceWorkerScope: boolean;
   serviceWorkerClients: boolean;
   serviceWorkerRegistration: boolean;
   serviceWorkerState: boolean;
   pushManager: boolean;
+  serviceWorkerLifecycle: boolean;
   serviceWorkerManifest: boolean;
   locks: boolean;
   permissions: boolean;
   extraHeaders: boolean;
   storage: boolean;
   messaging: boolean;
+  injectsFiles: boolean;
   storageGlobalsAssigned: string[];
   falsyListenerArg: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
-    favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
-    serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false,
+    favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
+    serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
+    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -159,17 +178,20 @@ function scanUsage(dir: string): Usage {
     if (/\.m?js$/i.test(file)) {
       if (!found.offscreen) found.offscreen = OFFSCREEN_REF_RE.test(src);
       if (!found.newTab) found.newTab = NEW_TAB_REF_RE.test(src);
+      if (!found.shortcutsPage) found.shortcutsPage = SHORTCUTS_REF_RE.test(src);
       if (!found.serviceWorkerScope) found.serviceWorkerScope = SW_SCOPE_REF_RE.test(src);
       if (!found.serviceWorkerClients) found.serviceWorkerClients = SW_CLIENTS_REF_RE.test(src);
       if (!found.serviceWorkerRegistration) found.serviceWorkerRegistration = SW_REGISTRATION_REF_RE.test(src);
       if (!found.serviceWorkerState) found.serviceWorkerState = SW_STATE_REF_RE.test(src);
       if (!found.pushManager) found.pushManager = PUSH_MANAGER_REF_RE.test(src);
+      if (!found.serviceWorkerLifecycle) found.serviceWorkerLifecycle = SW_LIFECYCLE_REF_RE.test(src);
       if (!found.serviceWorkerManifest) found.serviceWorkerManifest = SW_MANIFEST_REF_RE.test(src);
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
+      if (!found.injectsFiles) found.injectsFiles = INJECTS_FILES_RE.test(src);
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
       }
@@ -196,22 +218,36 @@ function shimSource(dir: string, config: ShimConfig): string {
   // The config goes in as a JSON literal, so nothing from the manifest is ever
   // interpolated into code. JSON.stringify leaves U+2028/U+2029 raw, which are
   // line terminators inside a JS string literal; escape them.
+  const sidePanelPath = (config.sidePanelPath ?? "").split(/[?#]/)[0].replace(/^\/+/, "");
   const json = JSON.stringify({
-    sidePanelPath: (config.sidePanelPath ?? "").split(/[?#]/)[0].replace(/^\/+/, ""),
+    // Chrome defines chrome.sidePanel only for an add-on that asks for the
+    // permission; one that declares or sets a panel page gets it as well.
+    sidePanel: (config.declaredPermissions ?? []).includes("sidePanel") || sidePanelPath !== "",
+    sidePanelPath,
     noDefaultPanel: config.noDefaultPanel === true,
     panelQuery: (config.panelQuery ?? "").replace(/^\?/, ""),
     extensionId: config.extensionId ?? "",
     favicon: usage.favicon,
     offscreen: usage.offscreen,
     newTab: usage.newTab,
+    // The add-on's own new tab page, which chrome://newtab shows in Chrome.
+    newTabPage: usage.newTab ? (config.newTabPage ?? "").split(/[?#]/)[0].replace(/^\/+/, "") : "",
+    shortcutsPage: usage.shortcutsPage,
+    externalIds: Array.isArray(config.externalIds) ? config.externalIds.filter((id) => typeof id === "string") : null,
+    injectShim: usage.injectsFiles ? SHIM_FILENAME : "",
     serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
     serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
+    serviceWorkerController: config.serviceWorker === true && usage.serviceWorkerClients && !workerHandlesFetch(dir, config.serviceWorkerScript ?? ""),
     serviceWorkerRegistration: config.serviceWorker === true && usage.serviceWorkerRegistration && !usage.pushManager,
+    serviceWorkerLifecycle: config.serviceWorker === true && usage.serviceWorkerLifecycle,
     serviceWorkerSelf: config.serviceWorker === true && (usage.serviceWorkerState || (usage.serviceWorkerRegistration && !usage.pushManager)),
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
     serviceWorkerManifest: config.serviceWorker === true && usage.serviceWorkerManifest,
     backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
+    // lavaduct adds session rules of its own: the backend Origin rule, and the
+    // frame grants' rules.
+    reservedSessionRules: (!!config.extensionId && (config.backendHosts ?? []).length > 0) || config.frameGrants === true,
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
@@ -794,6 +830,48 @@ function insideStage(dir: string, rootRel: string): boolean {
   const root = resolve(dir);
   const rel = relative(root, resolve(root, rootRel.replace(/^\/+/, "")));
   return rel !== "" && rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel);
+}
+
+const FETCH_HANDLER_RE = /\bonfetch\s*=(?!=)|\baddEventListener\s*\(\s*["'`]fetch["'`]/;
+const IMPORT_SCRIPTS_CALL_RE = /\bimportScripts\s*\(([^)]*)\)/g;
+const STATIC_IMPORT_RE = /(?:^|[;\s}])(?:import|export)\s*(?:[\w$*{},\s]+?\s*from\s*)?["']([^"']+)["']/g;
+
+/**
+ * Whether the Chrome background worker handles `fetch`: its script or one it
+ * pulls in with importScripts() or a static import sets onfetch or listens for
+ * "fetch". Such a worker serves requests its pages make, which the event page
+ * can't, so its pages mustn't be told they are controlled. Ported from
+ * aqueduct's backgroundHandlesFetch. Paths come from the untrusted bundle, so
+ * nothing outside the staged add-on is read.
+ */
+export function workerHandlesFetch(dir: string, worker: string): boolean {
+  const entry = worker.replace(/^(?:\.?\/)+/, "");
+  if (!entry) return false;
+  const seen = new Set<string>();
+  const queue = [entry];
+  while (queue.length > 0 && seen.size < 200) {
+    const rel = queue.shift() as string;
+    if (seen.has(rel) || !insideStage(dir, rel)) continue;
+    seen.add(rel);
+    let src: string;
+    try {
+      src = readFileSync(join(dir, rel), "utf-8");
+    } catch {
+      continue;
+    }
+    if (FETCH_HANDLER_RE.test(src)) return true;
+    const refs: string[] = [];
+    for (const m of src.matchAll(IMPORT_SCRIPTS_CALL_RE)) {
+      for (const lit of rootLiteralsFromGetURL(m[1]).matchAll(/["'`]([^"'`]+)["'`]/g)) refs.push(lit[1]);
+    }
+    for (const m of src.matchAll(STATIC_IMPORT_RE)) refs.push(m[1]);
+    for (const ref of refs) {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(ref)) continue;
+      const next = ref.startsWith("/") ? ref.slice(1) : join(dirname(rel), ref).split(sep).join("/");
+      if (!seen.has(next)) queue.push(next);
+    }
+  }
+  return false;
 }
 
 function isFile(path: string): boolean {

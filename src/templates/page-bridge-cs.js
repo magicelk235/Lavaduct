@@ -16,24 +16,28 @@
   var REQUEST_EVENT = "__pageBridge:" + CHANNEL + ":request";
   var RESPONSE_EVENT = "__pageBridge:" + CHANNEL + ":response";
   var PORT_NAME = "__pageBridge";
-  var TIMEOUT_MS = 30000;
   var DEBUG = function () { try { return !!(typeof globalThis !== "undefined" && globalThis.__pageBridgeDebug); } catch (e) { return false; } };
   var DBG = function () { if (DEBUG()) try { console.log.apply(console, arguments); } catch (e) {} };
   // __FRAME_VIEW__
 
+  // Chrome keeps a page's message open for as long as a listener holds on to
+  // its answer (a sign-in finished in another window takes minutes), so the
+  // relay sets no deadline of its own: the answer comes back, or the port
+  // closes when the background goes away. The page hears at once that the
+  // relay has the request, so its own deadline only covers a page the relay
+  // never heard.
   window.addEventListener(REQUEST_EVENT, function (ev) {
     var d = null;
     try { d = JSON.parse(String(ev.detail)); } catch (e) { return; }
     if (!d || typeof d.reqId !== "string") return;
     var reqId = d.reqId;
+    window.dispatchEvent(new CustomEvent(RESPONSE_EVENT, { detail: JSON.stringify({ reqId: reqId, ack: true }) }));
 
     var port = null;
     var settled = false;
-    var timer = null;
     function reply(response, error) {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
       try { if (port) port.disconnect(); } catch (e) {}
       var detail;
       try {
@@ -43,7 +47,6 @@
       }
       window.dispatchEvent(new CustomEvent(RESPONSE_EVENT, { detail: detail }));
     }
-    timer = setTimeout(function () { reply(undefined, "No response from the extension."); }, TIMEOUT_MS);
     try {
       port = api.runtime.connect({ name: PORT_NAME });
       port.onMessage.addListener(function (m) {
