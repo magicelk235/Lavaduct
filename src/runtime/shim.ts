@@ -127,6 +127,10 @@ const SESSION_ACCESS_RE = /\bsetAccessLevel\b/;
 // the like; Firefox refuses even the default store from an add-on without the
 // cookies permission.
 const COOKIE_STORE_ID_RE = /\bcookieStoreId\b/;
+// The add-on's own ID read, and selector calls it can end up in unquoted: a
+// Chrome ID is a CSS identifier, Firefox's gecko ID isn't.
+const RUNTIME_ID_RE = /\bruntime\s*(?:\?\.|\.)\s*id\b/;
+const SELECTOR_CALL_RE = /\b(?:querySelector(?:All)?|matches|closest|webkitMatchesSelector)\s*\(/;
 
 // A listener added with a last argument that can be false: a falsy literal,
 // which is what a Chrome build compiles `isFirefox && { … }` to, or an `&&`
@@ -194,6 +198,8 @@ interface Usage {
   promiseOnlyCalls: string[];
   sessionAccess: boolean;
   cookieStoreId: boolean;
+  runtimeId: boolean;
+  selectorCall: boolean;
 }
 
 function scanUsage(dir: string): Usage {
@@ -201,7 +207,7 @@ function scanUsage(dir: string): Usage {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
-    promiseOnlyCalls: [], sessionAccess: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -244,6 +250,8 @@ function scanUsage(dir: string): Usage {
       if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
       if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
       if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
+      if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
+      if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
     }
   }
   return found;
@@ -308,6 +316,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     pacPage: usage.proxySettings ? PAC_PAGE : "",
     messageJson: usage.messaging,
     pageEventDetail: usage.customEvent,
+    ownIdSelectors: usage.runtimeId && usage.selectorCall,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,
     browserActionAlias: usage.browserAction,
