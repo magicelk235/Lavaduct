@@ -1780,7 +1780,8 @@
   // Adblock excludes `${chrome.runtime.id}*`. Firefox refuses the whole call over
   // such an entry (its canonicalDomain format: the string must be the host name
   // a URL makes of it), and the add-on's ID with its '@' never is one. Those
-  // entries are left out; non-ASCII ones stay, as Chrome refuses those too.
+  // entries are left out; non-ASCII ones stay, as Chrome refuses those too. Keep
+  // identical to inertDomain in src/manifest/dnr.ts, which does it for static rules.
   function inertDomain(d) {
     if (typeof d !== "string" || !/^[\x00-\x7f]*$/.test(d)) return false;
     try { return new URL("http://" + d + "/").hostname !== d; } catch (e) { return true; }
