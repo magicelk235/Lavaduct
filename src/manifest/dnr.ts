@@ -127,7 +127,7 @@ function exposeRedirectFiles(manifest: Manifest): void {
   manifest.web_accessible_resources = list;
 }
 
-type RuleOutcome = { rule: unknown; renamed: boolean; narrowed: boolean; bracketed: boolean } | { reason: string };
+type RuleOutcome = { rule: unknown; renamed: boolean; narrowed: boolean; bracketed: boolean; pruned: string[] } | { reason: string };
 
 const DOMAIN_CONDITIONS = ["requestDomains", "excludedRequestDomains", "initiatorDomains", "excludedInitiatorDomains"];
 
@@ -141,12 +141,24 @@ function firefoxDomain(domain: unknown): unknown {
   return URL.parse(`http://[${lower}]/`)?.hostname ?? domain;
 }
 
+// Chrome takes any ASCII string as a rule's domain and matches it against the
+// request's host, so an entry that is no host name just never matches: Total
+// Adblock excludes `${chrome.runtime.id}*`. Firefox's canonicalDomain format wants
+// the host name a URL makes of the string, and drops the static rule (with a
+// warning) over any other entry. Non-ASCII entries stay, as Chrome refuses those
+// too. Keep identical to inertDomain in src/runtime/firefox-compat-shim.js, which
+// does the same for runtime rules.
+export function inertDomain(d: unknown): boolean {
+  if (typeof d !== "string" || !/^[\x00-\x7f]*$/.test(d)) return false;
+  return URL.parse(`http://${d}/`)?.hostname !== d;
+}
+
 // Rewrite one rule into the form Firefox evaluates the way Chrome does, or say why it
 // can't be.
 function adaptRule(rule: unknown): RuleOutcome {
-  if (typeof rule !== "object" || rule === null || !("condition" in rule)) return { rule, renamed: false, narrowed: false, bracketed: false };
+  if (typeof rule !== "object" || rule === null || !("condition" in rule)) return { rule, renamed: false, narrowed: false, bracketed: false, pruned: [] };
   const condition = rule.condition;
-  if (typeof condition !== "object" || condition === null) return { rule, renamed: false, narrowed: false, bracketed: false };
+  if (typeof condition !== "object" || condition === null) return { rule, renamed: false, narrowed: false, bracketed: false, pruned: [] };
 
   const missing = MISSING_CONDITIONS.find((k) => k in condition);
   if (missing) return { reason: missing };
@@ -163,11 +175,18 @@ function adaptRule(rule: unknown): RuleOutcome {
 
   let narrowed = false;
   let bracketed = false;
+  const pruned: string[] = [];
   const adapted: Record<string, unknown> = {};
   for (const [k, v] of entries) {
-    if (DOMAIN_CONDITIONS.includes(k) && Array.isArray(v) && v.some((d) => firefoxDomain(d) !== d)) {
-      adapted[k] = v.map(firefoxDomain);
-      bracketed = true;
+    if (DOMAIN_CONDITIONS.includes(k) && Array.isArray(v) && v.some((d) => firefoxDomain(d) !== d || inertDomain(firefoxDomain(d)))) {
+      const domains = v.map(firefoxDomain);
+      const kept = domains.filter((d) => !inertDomain(d));
+      // A list of nothing but such entries matches no request in Chrome, so the rule
+      // never applies there; emptied, Firefox would apply it everywhere.
+      if ((k === "requestDomains" || k === "initiatorDomains") && kept.length === 0) return { reason: `only ${k} that are no host name` };
+      pruned.push(...domains.filter((d) => inertDomain(d)).map(String));
+      adapted[k] = kept;
+      if (domains.some((d, i) => d !== v[i])) bracketed = true;
     } else if ((k === "resourceTypes" || k === "excludedResourceTypes") && Array.isArray(v) && v.some((t) => MISSING_RESOURCE_TYPES[t] === true)) {
       const left = v.filter((t) => MISSING_RESOURCE_TYPES[t] !== true);
       // Emptied, the list would make the rule match every type, while it only ever
@@ -191,7 +210,7 @@ function adaptRule(rule: unknown): RuleOutcome {
       return { reason: "regexFilter JavaScript can't compile" };
     }
   }
-  return { rule: { ...rule, condition: adapted }, renamed, narrowed, bracketed };
+  return { rule: { ...rule, condition: adapted }, renamed, narrowed, bracketed, pruned };
 }
 
 /**
@@ -258,6 +277,8 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
     let narrowed = 0;
     let redirected = 0;
     let bracketed = false;
+    let prunedRules = 0;
+    const pruned = new Set<string>();
     for (const rule of rules) {
       const outcome = adaptRule(rule);
       if ("reason" in outcome) {
@@ -271,10 +292,14 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
       if (outcome.narrowed) narrowed++;
       if (adapted !== outcome.rule) redirected++;
       if (outcome.bracketed) bracketed = true;
+      if (outcome.pruned.length) {
+        prunedRules++;
+        for (const d of outcome.pruned) pruned.add(d);
+      }
     }
     ruleset.rules = kept;
 
-    if (!strict || removed.length || renamed || narrowed || redirected || bracketed) {
+    if (!strict || removed.length || renamed || narrowed || redirected || bracketed || prunedRules) {
       writeFileSync(file, JSON.stringify(kept, null, 2) + "\n", "utf-8");
     }
     if (removed.length) {
@@ -292,6 +317,11 @@ export function applyDnr(stageDir: string, manifest: Manifest): DnrResult {
     }
     if (narrowed) {
       fixed(`DNR ruleset "${id}": removed the webbundle/webtransport resource types from ${narrowed} rule(s); Firefox never makes those requests.`, res.path);
+    }
+    if (prunedRules) {
+      const names = [...pruned];
+      const shown = names.slice(0, 5).map((d) => JSON.stringify(d)).join(", ") + (names.length > 5 ? `, and ${names.length - 5} more` : "");
+      fixed(`DNR ruleset "${id}": left ${shown} out of the domains of ${prunedRules} rule(s); they are no host name, so they never match in Chrome, and Firefox drops a rule over them.`, res.path);
     }
     if (redirected) {
       redirectedRules += redirected;
