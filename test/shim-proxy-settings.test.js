@@ -129,8 +129,8 @@ test("a bundle that never names proxy.settings keeps Firefox's", () => {
 // The PAC side: pac-sandbox.js runs in the sandbox page the background frames.
 const PAC_SOURCE = readFileSync(new URL("../dist/runtime/pac-sandbox.js", import.meta.url), "utf-8");
 
-function pacContext() {
-  const ctx = vm.createContext({});
+function pacContext(options) {
+  const ctx = vm.createContext({}, options);
   vm.runInContext(PAC_SOURCE, ctx);
   return ctx;
 }
@@ -156,10 +156,9 @@ test("a PAC script's answer, its helpers, and DNS asked for between rounds", () 
   assert.throws(() => ctx.evaluatePac("var x = 1;", "http://a/", "a"), /FindProxyForURL/);
 });
 
-test("pac_script routes through the sandbox's answer, and a failing script goes direct unless mandatory", async () => {
-  const { ctx, route } = load();
-  // Stand in for the sandbox frame: answer as pac-sandbox.js would.
-  const pac = pacContext();
+// Stand in for the sandbox frame the shim creates: answer as pac-sandbox.js does
+// in the given context.
+function framePac(ctx, pac) {
   ctx.document = {
     body: { appendChild(f) { setTimeout(() => f.onloadCb && f.onloadCb(), 0); } },
     createElement() {
@@ -168,9 +167,7 @@ test("pac_script routes through the sandbox's answer, and a failing script goes 
         addEventListener(type, cb) { if (type === "load") f.onloadCb = cb; },
         contentWindow: {
           postMessage(m) {
-            let reply;
-            try { reply = pac.evaluatePac(m.script, m.url, m.host, m.dns); } catch (e) { reply = { error: e.message }; }
-            Object.assign(reply, { __lavaductPac: true, id: m.id });
+            const reply = plain(pac.answer(m));
             setTimeout(() => ctx.__onMessage({ source: f.contentWindow, data: reply }), 0);
           },
         },
@@ -179,6 +176,11 @@ test("pac_script routes through the sandbox's answer, and a failing script goes 
     },
   };
   ctx.addEventListener = (type, cb) => { if (type === "message") ctx.__onMessage = cb; };
+}
+
+test("pac_script routes through the sandbox's answer, and a failing script goes direct unless mandatory", async () => {
+  const { ctx, route } = load();
+  framePac(ctx, pacContext());
   const data = "function FindProxyForURL(url, host) { return host === 'go.test' ? 'DIRECT' : 'PROXY p.test:3128; SOCKS s.test:1080'; }";
   await vm.runInContext(`chrome.proxy.settings.set({ value: { mode: "pac_script", pacScript: { data: ${JSON.stringify(data)} } } })`, ctx);
   assert.deepEqual(await route("http://go.test/"), [{ type: "direct" }]);
@@ -188,4 +190,28 @@ test("pac_script routes through the sandbox's answer, and a failing script goes 
   assert.deepEqual(await route("http://example.com/"), { type: "direct" });
   await vm.runInContext(`chrome.proxy.settings.set({ value: { mode: "pac_script", pacScript: { data: "function FindProxyForURL() { throw new Error('x'); }", mandatory: true } } })`, ctx);
   assert.deepEqual(await route("http://example.com/"), [{ type: "http", host: "pac-script-failed.invalid", port: 1 }]);
+});
+
+// Firefox reads a manifest's sandbox pages from 154 on. Firefox ESR 153.7 loads
+// the PAC page as an ordinary extension page, whose CSP refuses Function(): the
+// set() call used to resolve, and every request then went direct with only a
+// line in the debug log.
+test("on a Firefox that can't compile PAC scripts, the sandbox says so and set() is refused with the reason", async () => {
+  const blocked = pacContext({ codeGeneration: { strings: false } });
+  const reply = plain(blocked.answer({ __lavaductPac: true, id: 1, script: "function FindProxyForURL() { return 'DIRECT'; }", url: "http://a/", host: "a" }));
+  assert.equal(reply.compileBlocked, true);
+
+  const { ctx, route } = load();
+  framePac(ctx, blocked);
+  await assert.rejects(
+    vm.runInContext(`chrome.proxy.settings.set({ value: { mode: "pac_script", pacScript: { data: "function FindProxyForURL() { return 'PROXY p.test:1'; }" } } })`, ctx),
+    /Firefox 154/,
+  );
+  assert.equal(plain(await vm.runInContext("chrome.proxy.settings.get({})", ctx)).value.mode, "system", "nothing was set");
+  assert.equal(await route("http://example.com/"), undefined);
+
+  // A script that merely fails is Chrome's case: set() succeeds, requests go direct.
+  const { ctx: ok } = load();
+  framePac(ok, pacContext());
+  await vm.runInContext(`chrome.proxy.settings.set({ value: { mode: "pac_script", pacScript: { data: "syntax error here(" } } })`, ok);
 });
