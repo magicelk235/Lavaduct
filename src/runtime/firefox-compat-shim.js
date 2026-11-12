@@ -2447,6 +2447,223 @@
     });
   }
 
+  // ── chrome.declarativeContent ──────────────────────────────────────────────
+  // Firefox has no declarativeContent. Add-ons that list the permission call it
+  // without testing for it, usually inside onInstalled, so the rest of that
+  // listener never ran (Tactiq's setup, Chrome extension source viewer's
+  // action.disable()). The rules are kept here and applied by the background:
+  //   - PageStateMatcher: pageUrl (Chrome's UrlFilter fields), css (selectors
+  //     checked in the page once it has loaded, where the add-on may script
+  //     it), isBookmarked (with the bookmarks API);
+  //   - ShowAction / ShowPageAction: the tab's action is enabled while a rule
+  //     matches, and back to the add-on's own setting for all tabs when none
+  //     does; an MV2 page_action is shown and hidden instead;
+  //   - SetIcon: the tab's icon while a rule matches;
+  //   - RequestContentScript: its files are injected once per page load.
+  // Chrome keeps rules across restarts, so they live in the background's
+  // localStorage. A tab's URL is only visible with the tabs permission or
+  // access to its site, so pageUrl conditions can't match other pages.
+  // Emitted for an add-on whose Chrome manifest asks for declarativeContent
+  // and whose code uses it.
+  var DC_RULES_KEY = "__lavaductDeclarativeContent";
+
+  function urlFilterMatches(f, href) {
+    var u;
+    try { u = new URL(href); } catch (e) { return false; }
+    if (!f || typeof f !== "object") return true;
+    var host = u.hostname, path = u.pathname, query = u.search.replace(/^\?/, "");
+    var full = u.href.replace(/#.*$/, "");
+    var originAndPath = u.origin + u.pathname;
+    function has(k) { return typeof f[k] === "string"; }
+    var lc = function (s) { return String(s).toLowerCase(); };
+    if (has("hostContains") && lc(host).indexOf(lc(f.hostContains)) < 0 && lc("." + host).indexOf(lc(f.hostContains)) < 0) return false;
+    if (has("hostEquals") && lc(host) !== lc(f.hostEquals)) return false;
+    if (has("hostPrefix") && lc(host).indexOf(lc(f.hostPrefix)) !== 0) return false;
+    if (has("hostSuffix") && !(lc(host).slice(-lc(f.hostSuffix).length) === lc(f.hostSuffix) || lc("." + host).slice(-lc(f.hostSuffix).length) === lc(f.hostSuffix))) return false;
+    if (has("pathContains") && path.indexOf(f.pathContains) < 0) return false;
+    if (has("pathEquals") && path !== f.pathEquals) return false;
+    if (has("pathPrefix") && path.indexOf(f.pathPrefix) !== 0) return false;
+    if (has("pathSuffix") && path.slice(-f.pathSuffix.length) !== f.pathSuffix) return false;
+    if (has("queryContains") && query.indexOf(f.queryContains) < 0) return false;
+    if (has("queryEquals") && query !== f.queryEquals) return false;
+    if (has("queryPrefix") && query.indexOf(f.queryPrefix) !== 0) return false;
+    if (has("querySuffix") && query.slice(-f.querySuffix.length) !== f.querySuffix) return false;
+    if (has("urlContains") && full.indexOf(f.urlContains) < 0) return false;
+    if (has("urlEquals") && full !== f.urlEquals) return false;
+    if (has("urlPrefix") && full.indexOf(f.urlPrefix) !== 0) return false;
+    if (has("urlSuffix") && full.slice(-f.urlSuffix.length) !== f.urlSuffix) return false;
+    try {
+      if (has("urlMatches") && !new RegExp(f.urlMatches).test(full)) return false;
+      if (has("originAndPathMatches") && !new RegExp(f.originAndPathMatches).test(originAndPath)) return false;
+    } catch (e) { return false; }
+    if (Array.isArray(f.schemes) && f.schemes.indexOf(u.protocol.replace(/:$/, "")) < 0) return false;
+    if (Array.isArray(f.ports)) {
+      var port = Number(u.port || (u.protocol === "https:" ? 443 : u.protocol === "http:" ? 80 : 0));
+      var portOk = f.ports.some(function (p) { return Array.isArray(p) ? port >= p[0] && port <= p[1] : port === p; });
+      if (!portOk) return false;
+    }
+    return true;
+  }
+
+  function installDeclarativeContent() {
+    if (!CONFIG.declarativeContent || !isExtensionPage) return;
+    function typed(type, fields) {
+      var C = function (opts) {
+        var o = opts && typeof opts === "object" ? opts : {};
+        var self = this instanceof C ? this : Object.create(C.prototype);
+        fields.forEach(function (k) { if (o[k] !== undefined) self[k] = o[k]; });
+        Object.defineProperty(self, "instanceType", { value: "declarativeContent." + type, enumerable: true });
+        return self;
+      };
+      return C;
+    }
+    var PageStateMatcher = typed("PageStateMatcher", ["pageUrl", "css", "isBookmarked"]);
+    var ShowAction = typed("ShowAction", []);
+    var ShowPageAction = typed("ShowPageAction", []);
+    var SetIcon = typed("SetIcon", ["imageData", "path"]);
+    var RequestContentScript = typed("RequestContentScript", ["js", "css", "allFrames", "matchAboutBlank"]);
+
+    function stored() { var r = readLocal(DC_RULES_KEY); return Array.isArray(r) ? r : []; }
+    function plainRule(rule, i) {
+      return {
+        id: typeof rule.id === "string" && rule.id ? rule.id : "_" + Date.now().toString(36) + "_" + i,
+        priority: typeof rule.priority === "number" ? rule.priority : 100,
+        tags: Array.isArray(rule.tags) ? rule.tags : undefined,
+        conditions: (rule.conditions || []).map(function (c) { return JSON.parse(JSON.stringify(Object.assign({}, c, { instanceType: c.instanceType }))); }),
+        actions: (rule.actions || []).map(function (a) { return JSON.parse(JSON.stringify(Object.assign({}, a, { instanceType: a.instanceType }))); }),
+      };
+    }
+    function changed() {
+      // The background applies the rules; other pages wake it to do so.
+      if (isBackground) { if (applyAll) applyAll(); }
+      else { try { Promise.resolve(api.runtime.getBackgroundPage()).then(function (bg) { if (bg && bg.__lavaductDeclarativeContentApply) bg.__lavaductDeclarativeContentApply(); }, noop); } catch (e) {} }
+    }
+    var onPageChanged = makeEvent().event;
+    onPageChanged.addRules = function (rules, cb) {
+      var p = Promise.resolve().then(function () {
+        var list = Array.isArray(rules) ? rules.map(plainRule) : [];
+        var ids = list.map(function (r) { return r.id; });
+        var kept = stored().filter(function (r) { return ids.indexOf(r.id) < 0; });
+        writeLocal(DC_RULES_KEY, kept.concat(list));
+        changed();
+        return list;
+      });
+      return respond(api, p, cb);
+    };
+    onPageChanged.removeRules = function (ids, cb) {
+      if (typeof ids === "function") { cb = ids; ids = undefined; }
+      var p = Promise.resolve().then(function () {
+        writeLocal(DC_RULES_KEY, Array.isArray(ids) ? stored().filter(function (r) { return ids.indexOf(r.id) < 0; }) : []);
+        changed();
+      });
+      return respond(api, p, cb);
+    };
+    onPageChanged.getRules = function (ids, cb) {
+      if (typeof ids === "function") { cb = ids; ids = undefined; }
+      var p = Promise.resolve().then(function () {
+        var all = stored();
+        return Array.isArray(ids) ? all.filter(function (r) { return ids.indexOf(r.id) >= 0; }) : all;
+      });
+      return respond(api, p, cb);
+    };
+    var dc = {
+      PageStateMatcher: PageStateMatcher, ShowAction: ShowAction, ShowPageAction: ShowPageAction,
+      SetIcon: SetIcon, RequestContentScript: RequestContentScript, onPageChanged: onPageChanged,
+    };
+    namespaces.forEach(function (ns) { defineMissing(ns, "declarativeContent", dc); });
+
+    var applyAll = null;
+    if (!isBackground || !api.tabs || !api.tabs.onUpdated) return;
+    var action = api.action || api.browserAction || null;
+    var pageAction = api.pageAction || null;
+    var shown = {};     // tabId → whether a Show rule matched last time
+    var iconSet = {};   // tabId → whether a SetIcon rule set its icon
+    var injected = {};  // tabId → the URL its RequestContentScript files went into
+
+    function cssMatches(tabId, selectors) {
+      if (!api.scripting || typeof api.scripting.executeScript !== "function") return Promise.resolve(false);
+      return Promise.resolve(api.scripting.executeScript({
+        target: { tabId: tabId },
+        func: function (sels) { try { return sels.every(function (s) { return !!document.querySelector(s); }); } catch (e) { return false; } },
+        args: [selectors],
+      })).then(function (r) { return !!(r && r[0] && r[0].result); }, function () { return false; });
+    }
+    function bookmarked(url) {
+      var b = api.bookmarks;
+      if (!b || typeof b.search !== "function") return Promise.resolve(false);
+      return Promise.resolve(b.search({ url: url })).then(function (r) { return !!(r && r.length); }, function () { return false; });
+    }
+    function conditionMatches(c, tab) {
+      if (!c || c.instanceType !== "declarativeContent.PageStateMatcher") return Promise.resolve(false);
+      if (c.pageUrl && !(tab.url && urlFilterMatches(c.pageUrl, tab.url))) return Promise.resolve(false);
+      var checks = [];
+      if (Array.isArray(c.css) && c.css.length) checks.push(cssMatches(tab.id, c.css));
+      if (typeof c.isBookmarked === "boolean") checks.push(tab.url ? bookmarked(tab.url).then(function (b) { return b === c.isBookmarked; }) : Promise.resolve(false));
+      return Promise.all(checks).then(function (r) { return r.every(Boolean); });
+    }
+    function ruleMatches(rule, tab) {
+      return Promise.all((rule.conditions || []).map(function (c) { return conditionMatches(c, tab); })).then(function (r) { return r.some(Boolean); });
+    }
+    function call(obj, name, arg) {
+      try { if (obj && typeof obj[name] === "function") return Promise.resolve(obj[name](arg)).catch(noop); } catch (e) {}
+      return Promise.resolve();
+    }
+    function applyTab(tab) {
+      if (!tab || tab.id == null || tab.id < 0) return Promise.resolve();
+      var rules = stored();
+      return Promise.all(rules.map(function (r) { return ruleMatches(r, tab); })).then(function (hits) {
+        var show = false, icon = null, scripts = [];
+        rules.forEach(function (rule, i) {
+          if (!hits[i]) return;
+          (rule.actions || []).forEach(function (a) {
+            var t = a && a.instanceType;
+            if (t === "declarativeContent.ShowAction" || t === "declarativeContent.ShowPageAction") show = true;
+            else if (t === "declarativeContent.SetIcon") icon = a;
+            else if (t === "declarativeContent.RequestContentScript") scripts.push(a);
+          });
+        });
+        var id = tab.id;
+        var jobs = [];
+        if (pageAction && !api.action) {
+          if (show) jobs.push(call(pageAction, "show", id));
+          else if (shown[id]) jobs.push(call(pageAction, "hide", id));
+        } else if (action) {
+          if (show) jobs.push(call(action, "enable", id));
+          else if (shown[id]) {
+            // Back to what the add-on set for all tabs.
+            jobs.push(Promise.resolve(typeof action.isEnabled === "function" ? action.isEnabled({}) : true).then(function (on) {
+              return call(action, on ? "enable" : "disable", id);
+            }, noop));
+          }
+        }
+        shown[id] = show;
+        if (action && icon) { iconSet[id] = true; jobs.push(call(action, "setIcon", { tabId: id, imageData: icon.imageData, path: icon.path })); }
+        else if (action && iconSet[id]) { delete iconSet[id]; jobs.push(call(action, "setIcon", { tabId: id, path: null })); }
+        if (scripts.length && tab.url && injected[id] !== tab.url && api.scripting) {
+          injected[id] = tab.url;
+          scripts.forEach(function (s) {
+            var target = { tabId: id, allFrames: s.allFrames === true };
+            if (Array.isArray(s.css) && s.css.length) jobs.push(call(api.scripting, "insertCSS", { target: target, files: s.css }));
+            if (Array.isArray(s.js) && s.js.length) jobs.push(call(api.scripting, "executeScript", { target: target, files: s.js }));
+          });
+        }
+        return Promise.all(jobs);
+      });
+    }
+    applyAll = function () {
+      return Promise.resolve(api.tabs.query({})).then(function (tabs) { return Promise.all((tabs || []).map(applyTab)); }).catch(function (e) {
+        dbg("declarativeContent:", errorMessage(e));
+      });
+    };
+    try { Object.defineProperty(G, "__lavaductDeclarativeContentApply", { value: applyAll, configurable: true }); } catch (e) {}
+    api.tabs.onUpdated.addListener(function (tabId, info, tab) {
+      if (info.url && injected[tabId] !== info.url) delete injected[tabId];
+      if (info.status === "complete" || info.url) applyTab(tab).catch(noop);
+    });
+    if (api.tabs.onRemoved) api.tabs.onRemoved.addListener(function (tabId) { delete shown[tabId]; delete iconSet[tabId]; delete injected[tabId]; });
+    applyAll();
+  }
+
   // ── externally_connectable ids ─────────────────────────────────────────────
   // In Chrome a manifest with externally_connectable lets in only the
   // extensions its `ids` lists: none when the list is missing, every one for
@@ -2870,6 +3087,7 @@
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
   try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
+  try { installDeclarativeContent(); } catch (e) { dbg("declarativeContent shim failed:", errorMessage(e)); }
   try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
