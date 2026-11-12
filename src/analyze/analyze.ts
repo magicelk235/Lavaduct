@@ -254,6 +254,23 @@ function scanJsContent(
       line: lineAt(isFirstAt),
     });
   }
+  // importScripts reached as a value instead of called by name: Closure's safe
+  // importScripts (`a.importScripts.apply(a, urls)`, Google Dictionary), a bound or
+  // aliased copy, or a bracketed lookup. The converter only finds `importScripts(` calls,
+  // so these targets are never hoisted, and the event page has no importScripts to
+  // call: the code they load (Google Dictionary's mustache.js) never runs.
+  const IS_INDIRECT_RE = /\bimportScripts\s*\.\s*(?:apply|call|bind)\s*\(|\[\s*["'`]importScripts["'`]\s*\]|=\s*(?:self|globalThis)\s*\.\s*importScripts\b(?!\s*\()/;
+  const indirect = isClassicServiceWorker ? IS_INDIRECT_RE.exec(content) : null;
+  if (indirect) {
+    issues.push({
+      severity: "warning",
+      category: "background",
+      message: "importScripts is called indirectly (through apply, call, bind, an alias or a bracketed name), so its targets can't be found or hoisted; the scripts it loads won't run in Firefox's background scripts.",
+      file: rel,
+      line: lineAt(indirect.index),
+      fix: "List the imported scripts in background.scripts ahead of the worker, or load them with a literal importScripts(\"a.js\").",
+    });
+  }
 }
 
 /**
