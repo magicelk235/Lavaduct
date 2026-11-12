@@ -2817,6 +2817,428 @@
     });
   }
 
+  // ── chrome.proxy.settings ──────────────────────────────────────────────────
+  // Chrome takes the proxy as proxy.settings.set({ value: { mode, rules,
+  // pacScript } }). Firefox's proxy.settings wants another shape (proxyType,
+  // http, ssl, autoConfigUrl) and refuses every change unless the user lets the
+  // add-on run in private windows ("proxy.settings requires private browsing
+  // permission."), so a Chrome VPN's connect fails. proxy.onRequest needs no
+  // such grant, and the emulation routes requests with it:
+  //   - direct, fixed_servers (singleProxy, proxyForHttp/Https/Ftp,
+  //     fallbackProxy, bypassList with Chrome's rule syntax, <local>, CIDR and
+  //     the implicit loopback bypass) and pac_script (data or url) are applied
+  //     by a listener in the background;
+  //   - a PAC script is code, so it runs in a manifest sandbox page the
+  //     background frames (the add-on's CSP forbids eval in its own pages), and
+  //     its synchronous DNS calls are answered from lookups the background makes
+  //     between rounds (dns.resolve when the add-on may use it, otherwise as a
+  //     failed lookup). A script that fails sends requests direct, or, with
+  //     pacScript.mandatory, to a proxy that can't exist, as Chrome refuses them;
+  //   - system leaves requests to Firefox's own settings; auto_detect has no
+  //     onRequest form and goes to Firefox's settings, which need the grant.
+  // The config lives in the add-on's localStorage, shared by all its pages, so
+  // the background reads it synchronously when Firefox wakes it and registers
+  // its listener before any request waits on it. get() reports it with Chrome's
+  // levelOfControl, clear() drops it, onChange fires in every page. A value in
+  // Firefox's own shape (no mode) goes to Firefox's proxy.settings as before.
+  // Only emitted for a bundle that names proxy.settings.
+  var PROXY_STATE_KEY = "__lavaductProxySettings";
+  var PROXY_MODES = ["direct", "auto_detect", "pac_script", "fixed_servers", "system"];
+  var PROXY_SCOPES = ["regular", "regular_only", "incognito_persistent", "incognito_session_only"];
+  var PROXY_PORTS = { http: 80, https: 443, socks4: 1080, socks5: 1080 };
+
+  function isIpv4(s) {
+    var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+    return !!m && m.slice(1).every(function (p) { return Number(p) <= 255; });
+  }
+
+  // An IP literal as eight 16-bit words (IPv4 as ::ffff:a.b.c.d), or null.
+  function ipWords(s) {
+    s = String(s).replace(/^\[|\]$/g, "");
+    if (isIpv4(s)) s = "::ffff:" + s;
+    if (!/^[0-9a-f:.]+$/i.test(s) || s.indexOf(":") < 0) return null;
+    var tail4 = /^(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(s);
+    var extra = [];
+    if (tail4) {
+      if (!isIpv4(tail4[2])) return null;
+      var p = tail4[2].split(".").map(Number);
+      extra = [(p[0] << 8) | p[1], (p[2] << 8) | p[3]];
+      s = tail4[1].replace(/:$/, "") || ":";
+      if (s === ":") s = "::";
+    }
+    var halves = s.split("::");
+    if (halves.length > 2) return null;
+    var head = halves[0] ? halves[0].split(":") : [];
+    var tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+    var fill = 8 - extra.length - head.length - tail.length;
+    if (halves.length === 1 ? fill !== 0 : fill < 0) return null;
+    var words = head.concat(new Array(halves.length === 2 ? fill : 0).fill("0"), tail);
+    for (var i = 0; i < words.length; i++) {
+      if (!/^[0-9a-f]{1,4}$/i.test(words[i])) return null;
+      words[i] = parseInt(words[i], 16);
+    }
+    return words.concat(extra);
+  }
+
+  function inCidr(words, cidr) {
+    var bits = cidr.bits;
+    for (var i = 0; i < 8 && bits > 0; i++, bits -= 16) {
+      var m = bits >= 16 ? 0xffff : (0xffff << (16 - bits)) & 0xffff;
+      if ((words[i] & m) !== (cidr.words[i] & m)) return false;
+    }
+    return true;
+  }
+
+  function globRegExp(pattern) {
+    return new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\?]/g, "\\$&").replace(/\*/g, ".*") + "$", "i");
+  }
+
+  // Chrome's ProxyBypassRules: [scheme://]host-pattern[:port], ".suffix",
+  // IP literals, a.b.c.d/n and [v6]/n, <local> (names without a dot), and
+  // <-loopback>, which turns off the implicit localhost/127.0.0.0/8/[::1] bypass.
+  function parseBypass(list) {
+    var rules = [], loopback = true;
+    (Array.isArray(list) ? list : []).forEach(function (raw) {
+      var r = String(raw).trim().toLowerCase();
+      if (!r) return;
+      if (r === "<local>") { rules.push({ local: true }); return; }
+      if (r === "<-loopback>") { loopback = false; return; }
+      var slash = /^\[?([0-9a-f:.]+)\]?\/(\d{1,3})$/.exec(r);
+      if (slash && ipWords(slash[1])) {
+        rules.push({ cidr: { words: ipWords(slash[1]), bits: Number(slash[2]) + (isIpv4(slash[1]) ? 96 : 0) } });
+        return;
+      }
+      var scheme = null, port = null;
+      var sm = /^([a-z][a-z0-9+.-]*):\/\//.exec(r);
+      if (sm) { scheme = sm[1]; r = r.slice(sm[0].length); }
+      var pm = /^(\[[^\]]*\]|[^:]*):(\d+)$/.exec(r);
+      if (pm) { r = pm[1]; port = Number(pm[2]); }
+      var ip = ipWords(r);
+      if (ip) { rules.push({ scheme: scheme, port: port, ip: ip }); return; }
+      if (r.charAt(0) === ".") r = "*" + r;
+      rules.push({ scheme: scheme, port: port, host: globRegExp(r) });
+    });
+    return { rules: rules, loopback: loopback };
+  }
+
+  var LOOPBACK = parseBypass(["localhost", "*.localhost", "127.0.0.1/8", "[::1]"]).rules;
+
+  function bypassed(bypass, u) {
+    var host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    var ip = ipWords(host);
+    var scheme = u.protocol.replace(/:$/, "");
+    var port = u.port ? Number(u.port) : ({ http: 80, ws: 80, https: 443, wss: 443, ftp: 21 })[scheme];
+    var rules = bypass.loopback ? LOOPBACK.concat(bypass.rules) : bypass.rules;
+    return rules.some(function (r) {
+      if (r.local) return !ip && host.indexOf(".") < 0;
+      if (r.cidr) return !!ip && inCidr(ip, r.cidr);
+      if (r.scheme && r.scheme !== scheme) return false;
+      if (r.port && r.port !== port) return false;
+      if (r.ip) return !!ip && r.ip.join() === ip.join();
+      return r.host.test(host);
+    });
+  }
+
+  function firefoxProxy(server) {
+    var scheme = server.scheme || "http";
+    var info = { type: scheme === "socks5" ? "socks" : scheme, host: String(server.host).replace(/^\[|\]$/g, ""), port: Number(server.port) || PROXY_PORTS[scheme] };
+    if (scheme === "socks5") info.proxyDNS = true;
+    return info;
+  }
+
+  function fixedServers(rules, u) {
+    if (bypassed(parseBypass(rules.bypassList), u)) return { type: "direct" };
+    var scheme = u.protocol.replace(/:$/, "");
+    var server = rules.singleProxy ||
+      (scheme === "http" || scheme === "ws" ? rules.proxyForHttp : scheme === "https" || scheme === "wss" ? rules.proxyForHttps : scheme === "ftp" ? rules.proxyForFtp : null) ||
+      rules.fallbackProxy;
+    return server ? firefoxProxy(server) : { type: "direct" };
+  }
+
+  // "PROXY a:1; SOCKS5 b:2; DIRECT" as Firefox's failover list.
+  function pacProxies(text) {
+    var out = [];
+    String(text).split(";").forEach(function (entry) {
+      var e = entry.trim();
+      if (/^direct$/i.test(e)) { out.push({ type: "direct" }); return; }
+      var m = /^(proxy|http|https|socks|socks4|socks5)\s+(\[[^\]]+\]|[^:\s]+)(?::(\d+))?$/i.exec(e);
+      if (!m) return;
+      var kind = m[1].toLowerCase();
+      var scheme = kind === "https" ? "https" : kind === "socks5" ? "socks5" : kind === "socks" || kind === "socks4" ? "socks4" : "http";
+      out.push(firefoxProxy({ scheme: scheme, host: m[2], port: m[3] }));
+    });
+    return out.length ? out : [{ type: "direct" }];
+  }
+
+  function validateProxyValue(v) {
+    if (PROXY_MODES.indexOf(v.mode) < 0) throw new Error("Invalid value for proxy config mode: " + v.mode + "; expected one of " + PROXY_MODES.join(", ") + ".");
+    if (v.mode === "fixed_servers") {
+      var r = v.rules;
+      if (!r || typeof r !== "object") throw new Error("fixed_servers requires rules.");
+      ["singleProxy", "proxyForHttp", "proxyForHttps", "proxyForFtp", "fallbackProxy"].forEach(function (k) {
+        var s = r[k];
+        if (s == null) return;
+        if (typeof s !== "object" || typeof s.host !== "string" || !s.host) throw new Error("rules." + k + " needs a host.");
+        var scheme = s.scheme || "http";
+        if (scheme === "quic") throw new Error("rules." + k + ": QUIC proxies have no Firefox equivalent.");
+        if (!PROXY_PORTS[scheme]) throw new Error("rules." + k + ": unknown proxy scheme " + scheme + ".");
+      });
+    }
+    if (v.mode === "pac_script") {
+      var p = v.pacScript;
+      if (!p || (typeof p.data !== "string" && typeof p.url !== "string")) throw new Error("pac_script requires pacScript.url or pacScript.data.");
+    }
+  }
+
+  // A value in Firefox's shape, in Chrome's: mode added, Firefox's members kept
+  // for code written against either.
+  function chromeProxyValue(v) {
+    var out = {};
+    if (v && typeof v === "object") Object.keys(v).forEach(function (k) { out[k] = v[k]; });
+    var t = out.proxyType;
+    var server = function (s, scheme) {
+      var m = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(String(s || ""));
+      return m ? { scheme: scheme, host: m[1], port: m[2] ? Number(m[2]) : PROXY_PORTS[scheme] } : null;
+    };
+    if (t === "none") out.mode = "direct";
+    else if (t === "autoDetect") out.mode = "auto_detect";
+    else if (t === "autoConfig") { out.mode = "pac_script"; out.pacScript = { url: out.autoConfigUrl || "", mandatory: false }; }
+    else if (t === "manual") {
+      out.mode = "fixed_servers";
+      var rules = {};
+      if (out.http && out.httpProxyAll) rules.singleProxy = server(out.http, "http");
+      else {
+        if (out.http) rules.proxyForHttp = server(out.http, "http");
+        if (out.ssl) rules.proxyForHttps = server(out.ssl, "http");
+        if (out.socks) rules.fallbackProxy = server(out.socks, out.socksVersion === 4 ? "socks4" : "socks5");
+      }
+      if (out.passthrough) rules.bypassList = String(out.passthrough).split(/[,\s]+/).filter(Boolean);
+      out.rules = rules;
+    } else out.mode = "system";
+    return out;
+  }
+
+  function proxyEffective(state, incognito) {
+    return incognito ? state.incognito || (state.regularOnly ? null : state.regular) || null : state.regular || null;
+  }
+
+  // Whether the background must route requests itself.
+  function proxyRouting(state) {
+    return [state.regular, state.incognito].some(function (v) {
+      return !!v && (v.mode === "direct" || v.mode === "fixed_servers" || v.mode === "pac_script");
+    });
+  }
+
+  function readProxyState() {
+    var s = readLocal(PROXY_STATE_KEY);
+    return s && typeof s === "object" ? s : {};
+  }
+
+  function installProxySettings() {
+    if (!CONFIG.proxySettings || !isExtensionPage) return;
+    var nativeProxy = null, nativeSettings = null;
+    try { nativeProxy = api.proxy; nativeSettings = nativeProxy && nativeProxy.settings; } catch (e) {}
+    if (!nativeSettings || !localStore) return;
+    var state = readProxyState();
+    var changed = makeEvent();
+    var listening = false;
+    var pacTexts = {};
+
+    function nativeCall(name, details) {
+      try { return Promise.resolve(nativeSettings[name](details || {})); } catch (e) { return Promise.reject(e); }
+    }
+
+    function levelFromFirefox(level) {
+      return level === "controlled_by_other_extensions" ? level : level === "controlled_by_this_extension" ? level : "controllable_by_this_extension";
+    }
+
+    function getDetails(details) {
+      var incognito = !!(details && details.incognito);
+      var v = proxyEffective(state, incognito);
+      if (v && v.mode !== "auto_detect") {
+        var own = { value: JSON.parse(JSON.stringify(v)), levelOfControl: "controlled_by_this_extension" };
+        if (incognito) own.incognitoSpecific = !!state.incognito;
+        return Promise.resolve(own);
+      }
+      return nativeCall("get", {}).then(function (n) {
+        var out = { value: v ? { mode: "auto_detect" } : chromeProxyValue(n && n.value), levelOfControl: v ? "controlled_by_this_extension" : levelFromFirefox(n && n.levelOfControl) };
+        if (incognito) out.incognitoSpecific = !!state.incognito;
+        return out;
+      }, function () {
+        return { value: { mode: v ? "auto_detect" : "system" }, levelOfControl: v ? "controlled_by_this_extension" : "controllable_by_this_extension" };
+      });
+    }
+
+    function announce() {
+      getDetails({}).then(function (d) { changed.dispatch(d); }, noop);
+    }
+
+    function save(next) {
+      state = next;
+      try {
+        if (state.regular || state.incognito) localStore.setItem(PROXY_STATE_KEY, JSON.stringify(state));
+        else localStore.removeItem(PROXY_STATE_KEY);
+      } catch (e) {}
+      if (isBackground) route();
+      else {
+        // A suspended event page reads the config when it wakes; one that runs
+        // hears the storage event.
+        try { var w = api.runtime.getBackgroundPage(); if (w && typeof w.then === "function") w.then(noop, noop); } catch (e) {}
+      }
+      announce();
+    }
+
+    function setDetails(details) {
+      details = details || {};
+      var value = details.value;
+      if (!value || typeof value !== "object" || value.mode === undefined) return nativeCall("set", details);
+      try { validateProxyValue(value); } catch (e) { return Promise.reject(e); }
+      var scope = details.scope || "regular";
+      if (PROXY_SCOPES.indexOf(scope) < 0) return Promise.reject(new Error("Invalid scope: " + scope + "."));
+      var copy = JSON.parse(JSON.stringify(value));
+      var apply = function () {
+        var next = JSON.parse(JSON.stringify(state));
+        if (scope === "regular" || scope === "regular_only") { next.regular = copy; next.regularOnly = scope === "regular_only"; }
+        else next.incognito = copy;
+        save(next);
+      };
+      if (copy.mode !== "auto_detect") { apply(); return Promise.resolve(); }
+      return nativeCall("set", { value: { proxyType: "autoDetect" } }).then(apply, function (e) {
+        throw new Error("proxy mode auto_detect needs Firefox's own proxy settings, which Firefox lets an add-on change only when it may run in private windows (" + errorMessage(e) + ")");
+      });
+    }
+
+    function clearDetails(details) {
+      var scope = (details && details.scope) || "regular";
+      var next = JSON.parse(JSON.stringify(state));
+      var cleared = scope === "regular" || scope === "regular_only" ? next.regular : next.incognito;
+      if (scope === "regular" || scope === "regular_only") { delete next.regular; delete next.regularOnly; }
+      else delete next.incognito;
+      if (cleared) save(next);
+      if (!cleared || cleared.mode === "auto_detect") return nativeCall("clear", {}).then(noop, noop);
+      return Promise.resolve();
+    }
+
+    // ── the background's router ──
+    var pacFrame = null, pacLoaded = null, pacWaiting = {}, pacSeq = 0;
+
+    function pacEval(message) {
+      if (!pacFrame) {
+        pacFrame = document.createElement("iframe");
+        try { pacFrame.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden;"; } catch (e) {}
+        pacLoaded = new Promise(function (resolve) { pacFrame.addEventListener("load", resolve); });
+        pacFrame.src = extensionUrl(CONFIG.pacPage);
+        (document.body || document.documentElement).appendChild(pacFrame);
+        G.addEventListener("message", function (e) {
+          var d = e.data;
+          if (!pacFrame || e.source !== pacFrame.contentWindow || !d || d.__lavaductPac !== true) return;
+          var w = pacWaiting[d.id];
+          if (w) { delete pacWaiting[d.id]; w(d); }
+        });
+      }
+      return pacLoaded.then(function () {
+        return new Promise(function (resolve, reject) {
+          var id = ++pacSeq;
+          var timer = setTimeout(function () { delete pacWaiting[id]; reject(new Error("the PAC script didn't answer within 10 s")); }, 10000);
+          pacWaiting[id] = function (d) { clearTimeout(timer); resolve(d); };
+          message.__lavaductPac = true;
+          message.id = id;
+          pacFrame.contentWindow.postMessage(message, "*");
+        });
+      });
+    }
+
+    function resolveName(name) {
+      try {
+        if (api.dns && typeof api.dns.resolve === "function") {
+          return api.dns.resolve(name).then(function (r) { return (r && r.addresses) || []; }, function () { return []; });
+        }
+      } catch (e) {}
+      return Promise.resolve([]);
+    }
+
+    function pacText(p) {
+      if (typeof p.data === "string") return Promise.resolve(p.data);
+      var cached = pacTexts[p.url];
+      if (!cached) {
+        cached = pacTexts[p.url] = (nativeFetch ? nativeFetch(p.url, { cache: "no-store" }) : Promise.reject(new Error("no fetch"))).then(function (r) {
+          if (!r.ok) throw new Error("PAC file " + p.url + " answered " + r.status);
+          return r.text();
+        });
+        cached.catch(function () { if (pacTexts[p.url] === cached) delete pacTexts[p.url]; });
+      }
+      return cached;
+    }
+
+    function routePac(p, u) {
+      // The PAC file's own download goes direct.
+      if (typeof p.data !== "string" && u.href === p.url) return { type: "direct" };
+      var url = u.href;
+      // Chrome hands PAC scripts only the origin of secure URLs.
+      if (u.protocol === "https:" || u.protocol === "wss:") url = u.protocol + "//" + u.host + "/";
+      var host = u.hostname.replace(/^\[|\]$/g, "");
+      var dns = {};
+      function round(n) {
+        return pacText(p).then(function (script) {
+          return pacEval({ script: script, url: url, host: host, dns: dns });
+        }).then(function (r) {
+          if (r.error) throw new Error(r.error);
+          if (r.needDns == null) return pacProxies(r.result);
+          if (n >= 16) throw new Error("the PAC script asked for more than 16 DNS lookups");
+          return resolveName(r.needDns).then(function (ips) { dns[r.needDns] = ips; return round(n + 1); });
+        });
+      }
+      return round(0).then(null, function (e) {
+        dbg("PAC script failed for", url + ":", errorMessage(e));
+        return p.mandatory ? [{ type: "http", host: "pac-script-failed.invalid", port: 1 }] : { type: "direct" };
+      });
+    }
+
+    function onRequest(info) {
+      var v = proxyEffective(state, !!info.incognito);
+      if (!v) return undefined;
+      var u;
+      try { u = new URL(info.url); } catch (e) { return undefined; }
+      if (v.mode === "direct") return { type: "direct" };
+      if (v.mode === "fixed_servers") return fixedServers(v.rules || {}, u);
+      if (v.mode === "pac_script") return routePac(v.pacScript || {}, u);
+      return undefined;
+    }
+
+    function route() {
+      var want = proxyRouting(state);
+      if (want === listening) return;
+      try {
+        if (want) nativeProxy.onRequest.addListener(onRequest, { urls: ["<all_urls>"] });
+        else nativeProxy.onRequest.removeListener(onRequest);
+        listening = want;
+      } catch (e) { dbg("proxy.onRequest failed:", errorMessage(e)); }
+    }
+
+    if (isBackground && nativeProxy.onRequest) route();
+    // Another page of the add-on changed the config.
+    try {
+      G.addEventListener("storage", function (e) {
+        if (e.key !== PROXY_STATE_KEY && e.key !== null) return;
+        state = readProxyState();
+        if (isBackground) route();
+        announce();
+      });
+    } catch (e) {}
+
+    namespaces.forEach(function (ns) {
+      var p = null;
+      try { p = ns.proxy; } catch (e) {}
+      if (!p || typeof p !== "object") return;
+      replaceMember(p, "settings", {
+        get: function (details, cb) { return respond(ns, getDetails(details), cb); },
+        set: function (details, cb) { return respond(ns, setDetails(details), cb); },
+        clear: function (details, cb) { return respond(ns, clearDetails(details), cb); },
+        onChange: changed.event,
+      });
+    });
+  }
+
   // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
   // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
   // such as Cookie or Referer; Firefox shows every header without it, has no
@@ -3089,5 +3511,6 @@
   try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
   try { installDeclarativeContent(); } catch (e) { dbg("declarativeContent shim failed:", errorMessage(e)); }
   try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
+  try { installProxySettings(); } catch (e) { dbg("proxy.settings shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();

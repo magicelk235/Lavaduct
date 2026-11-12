@@ -409,7 +409,7 @@ function commandsChromeIgnores(m: Manifest): string[] {
 
 // Chrome's CSP for manifest sandbox pages when the manifest sets none. Firefox
 // applies script-src 'self' to them instead, so eval() and inline scripts fail.
-const CHROME_SANDBOX_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' 'unsafe-eval'; child-src 'self';";
+export const CHROME_SANDBOX_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' 'unsafe-eval'; child-src 'self';";
 
 // Sandbox pages with no sandbox CSP of their own: content_security_policy.sandbox in
 // Manifest V3, sandbox.content_security_policy in V2. An MV3 string CSP is invalid
