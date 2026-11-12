@@ -1775,6 +1775,17 @@
     try { return new URL("http://[" + lower + "]/").hostname; } catch (e) { return d; }
   }
 
+  // Chrome takes any ASCII string as a rule's domain and matches it against the
+  // request's host, so an entry that is no host name just never matches: Total
+  // Adblock excludes `${chrome.runtime.id}*`. Firefox refuses the whole call over
+  // such an entry (its canonicalDomain format: the string must be the host name
+  // a URL makes of it), and the add-on's ID with its '@' never is one. Those
+  // entries are left out; non-ASCII ones stay, as Chrome refuses those too.
+  function inertDomain(d) {
+    if (typeof d !== "string" || !/^[\x00-\x7f]*$/.test(d)) return false;
+    try { return new URL("http://" + d + "/").hostname !== d; } catch (e) { return true; }
+  }
+
   // The rule as Firefox takes it, or null when it can't.
   function firefoxRule(rule) {
     if (!rule || typeof rule !== "object") return rule;
@@ -1795,7 +1806,13 @@
           if (key === "resourceTypes" && value.length && !left.length) return null;
           value = left;
         }
-        if (DNR_DOMAIN_CONDITIONS.indexOf(key) >= 0 && Array.isArray(value)) value = value.map(firefoxDomain);
+        if (DNR_DOMAIN_CONDITIONS.indexOf(key) >= 0 && Array.isArray(value)) {
+          var domains = value.map(firefoxDomain).filter(function (d) { return !inertDomain(d); });
+          // A list of nothing but such entries matches no request in Chrome, so
+          // the rule never applies there; empty, Firefox would apply it everywhere.
+          if ((key === "requestDomains" || key === "initiatorDomains") && value.length && !domains.length) return null;
+          value = domains;
+        }
         cond[key] = value;
       }
       if (typeof cond.regexFilter === "string") {
@@ -3193,6 +3210,37 @@
     return out;
   }
 
+  // Chrome's storage.set also reads a value's properties the plain way, so a
+  // getter's value is stored. Firefox 160 reads the items through Xrays, which
+  // see only data properties: storage.local drops a value held in an accessor at
+  // any depth, and every area drops a top-level key that is one. Ghostery's
+  // options store (hybrids) keeps record entries as getters, so pausing a site
+  // stored paused: {}. Items with an accessor in an object or array are copied
+  // with the getters' values; anything else goes to Firefox as the same object.
+  function withAccessorValues(value, ancestors) {
+    if (value === null || typeof value !== "object") return value;
+    var isArray = Array.isArray(value);
+    if (!isArray && Object.prototype.toString.call(value) !== "[object Object]") return value;
+    if (ancestors.indexOf(value) >= 0) return value;
+    ancestors.push(value);
+    var keys = Object.keys(value);
+    var copy = null;
+    for (var i = 0; i < keys.length; i++) {
+      var desc = Object.getOwnPropertyDescriptor(value, keys[i]);
+      if (!desc) continue;
+      var accessor = !("value" in desc);
+      var v = accessor ? value[keys[i]] : desc.value;
+      var next = withAccessorValues(v, ancestors);
+      if (copy === null && (accessor || next !== v)) {
+        copy = isArray ? [] : {};
+        for (var j = 0; j < i; j++) copy[keys[j]] = value[keys[j]];
+      }
+      if (copy !== null) copy[keys[i]] = next;
+    }
+    ancestors.pop();
+    return copy === null ? value : copy;
+  }
+
   function installStorageCloneFallback() {
     if (!CONFIG.storageClone) return;
     namespaces.forEach(function (ns) {
@@ -3206,6 +3254,9 @@
         if (typeof set !== "function") return;
         replaceMember(area, "set", function (items) {
           var args = Array.prototype.slice.call(arguments);
+          var resolved = items;
+          try { resolved = withAccessorValues(items, []); } catch (e) {}
+          if (resolved !== items) { items = resolved; args[0] = resolved; }
           var storable = function () { return chromeStorable(items, []); };
           var last = args.length - 1;
           if (last >= 1 && typeof args[last] === "function") {
