@@ -102,7 +102,10 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     typeof m.content_security_policy === "object" ? m.content_security_policy.sandbox : (m.sandbox as Record<string, unknown> | undefined)?.content_security_policy;
   if (sandboxCsp(before) === undefined && sandboxCsp(after) !== undefined)
     out.push("Added Chrome's default sandbox CSP (Firefox would apply script-src 'self' to the sandbox pages, blocking eval and inline scripts).");
-  const pagesCsp = (m: Manifest): unknown => (typeof m.content_security_policy === "object" ? m.content_security_policy.extension_pages : undefined);
+  const pagesCsp = (m: Manifest): string | undefined => {
+    const csp = m.content_security_policy;
+    return (m.manifest_version ?? 2) >= 3 && typeof csp === "object" && typeof csp.extension_pages === "string" ? csp.extension_pages : undefined;
+  };
   if ((before.manifest_version ?? 2) >= 3 && pagesCsp(before) === undefined && pagesCsp(after) !== undefined)
     out.push("Added Chrome's default `extension_pages` CSP (Firefox's default would upgrade the add-on's http:// requests to https://).");
 
@@ -115,20 +118,7 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
   const cspPorted = [...new Set(cspSources(before))].filter((s) => !cspSources(after).includes(s));
   if (cspPorted.length) out.push(`Wrote the default port after the wildcard host in CSP source(s) ${quoted(cspPorted)} (Firefox drops a wildcard host followed by a path).`);
 
-  const cspSources = (m: Manifest): string[] => {
-    const csp = m.content_security_policy;
-    const sandbox = (m.sandbox as Record<string, unknown> | undefined)?.content_security_policy;
-    const all = [...(typeof csp === "string" ? [csp] : Object.values(csp ?? {})), sandbox].filter((p): p is string => typeof p === "string");
-    return all.flatMap(cspWildcardHostPaths);
-  };
-  const cspPorted = [...new Set(cspSources(before))].filter((s) => !cspSources(after).includes(s));
-  if (cspPorted.length) out.push(`Wrote the default port after the wildcard host in CSP source(s) ${quoted(cspPorted)} (Firefox drops a wildcard host followed by a path).`);
-
-  const pagesCsp = (m: Manifest): string => {
-    const csp = m.content_security_policy;
-    return (m.manifest_version ?? 2) >= 3 && typeof csp === "object" && typeof csp.extension_pages === "string" ? csp.extension_pages : "";
-  };
-  const localhost = cspLocalhostSources(pagesCsp(before)).filter((s) => !cspLocalhostSources(pagesCsp(after)).includes(s));
+  const localhost = cspLocalhostSources(pagesCsp(before) ?? "").filter((s) => !cspLocalhostSources(pagesCsp(after) ?? "").includes(s));
   if (localhost.length) out.push(`Removed the local development server source(s) ${quoted(localhost)} from \`content_security_policy.extension_pages\` (Firefox drops the whole policy over them on install).`);
 
   const omniboxKeyword = (m: Manifest): unknown => (typeof m.omnibox === "object" && m.omnibox !== null ? Reflect.get(m.omnibox, "keyword") : undefined);

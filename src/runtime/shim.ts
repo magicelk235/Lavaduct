@@ -1,5 +1,5 @@
 import { writeFileSync, readFileSync, readdirSync, existsSync, statSync } from "node:fs";
-import { join, dirname, relative, basename, resolve, isAbsolute, sep } from "node:path";
+import { join, dirname, relative, basename, resolve, isAbsolute, sep, posix } from "node:path";
 import type { Manifest } from "../types.js";
 import { RUNTIME_DIR } from "../paths.js";
 import { NAME } from "../name.js";
@@ -915,7 +915,52 @@ function collectWebpackChunks(dir: string, swPath: string, hoisted: Set<string>)
     if (!CHUNK_SUFFIX_RE.test(src.slice(end))) continue;
     chunks.push(rel);
   }
-  return chunks.sort();
+  const named = chunkFileTemplate(swSrc);
+  if (!named) return chunks.sort();
+  // The worker only ever loads what its filename function names, relative to its
+  // own folder (webpack's automatic publicPath). The pages' build may share the
+  // chunk global, and its chunks must stay out of the background.
+  const base = posix.dirname(swPath);
+  return chunks
+    .filter((rel) => {
+      const fromWorker = base === "." ? rel : posix.relative(base, rel);
+      return !fromWorker.startsWith("../") && fromWorker.startsWith(named.prefix) && fromWorker.endsWith(named.suffix);
+    })
+    .sort();
+}
+
+/**
+ * The fixed start and end of the file names a webpack worker's chunk filename
+ * function returns, read from its text without running it:
+ *   __webpack_require__.u = chunkId => "bg." + ({96: "vendors"}[chunkId] || chunkId) + ".bundle.js"
+ * gives { prefix: "bg.", suffix: ".bundle.js" }. Null when there is no such
+ * function or it isn't a plain concatenation.
+ */
+function chunkFileTemplate(swSrc: string): { prefix: string; suffix: string } | null {
+  const m = /(?:^|[^\w$.])[\w$]+\.u\s*=\s*(?:function\s*\(\s*[\w$]+\s*\)\s*\{\s*return\s+|\(?\s*[\w$]+\s*\)?\s*=>\s*)/.exec(swSrc);
+  if (!m) return null;
+  // The body runs to the first `;`, `,` or closing bracket outside brackets and strings.
+  const start = m.index + m[0].length;
+  let depth = 0;
+  let end = start;
+  for (; end < swSrc.length; end++) {
+    const c = swSrc[end];
+    if (c === '"' || c === "'" || c === "`") {
+      const close = swSrc.indexOf(c, end + 1);
+      if (close < 0) return null;
+      end = close;
+    } else if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") {
+      if (depth === 0) break;
+      depth--;
+    } else if ((c === ";" || c === "," || c === "\n") && depth === 0) break;
+  }
+  const body = swSrc.slice(start, end).trim();
+  if (!body.includes("+")) return null;
+  const lit = String.raw`(["'])([^"'\\]*)\1`;
+  const head = new RegExp(`^${lit}\\s*\\+`).exec(body);
+  const tail = new RegExp(`\\+\\s*${lit}$`).exec(body);
+  return { prefix: head ? head[2] : "", suffix: tail ? tail[2] : "" };
 }
 
 // The chunk-loading global a webpack bundle declares, dot or bracket form:
