@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { ConvertOptions, ConvertResult, Issue, Manifest, SignRoute } from "./types.js";
 import { ENV_PREFIX, NAME } from "./name.js";
 import { extractExtension } from "./input/extract.js";
-import { applySourceRewrites, matchManifestPathCase, normalizeLocaleCatalogs, removeUnreadableLocales, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
+import { applySourceRewrites, matchManifestPathCase, normalizeLocaleCatalogs, removeUnreadableLocales, rewriteHoistedBackgroundChecks, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import {
   analyzeManifest,
@@ -206,7 +206,7 @@ function buildAddon(
   if (junk.length > 0) log.ok(`Left out ${junk.join(", ")}: no messages.json Chrome reads, so Chrome skips it, and Firefox would refuse the add-on`);
   const catalogs = normalizeLocaleCatalogs(stageDir);
   if (catalogs.length > 0) log.ok(`Rewrote ${catalogs.length} locale catalog(s) as plain JSON, which Firefox's reader needs: ${catalogs.join(", ")}`);
-  for (const r of applySourceRewrites(stageDir, manifest)) {
+  for (const r of applySourceRewrites(stageDir, manifest, src.chromeId)) {
     if (r.count > 0) log.ok(`${r.name} in ${r.count} file(s)`);
   }
 
@@ -286,6 +286,10 @@ function buildAddon(
   const bg = wireBackground(stageDir, out, shimFile);
   if (bg.converted) {
     log.ok(`Service worker → background.scripts${bg.hoisted.length ? `, importScripts hoisted: ${bg.hoisted.join(", ")}` : ""}`);
+    const worker = manifest.background?.service_worker;
+    const loaded = (out.background?.scripts ?? []).filter((s): s is string => typeof s === "string" && s !== shimFile);
+    const checks = typeof worker === "string" ? rewriteHoistedBackgroundChecks(stageDir, worker, loaded) : 0;
+    if (checks > 0) log.ok(`Corrected the worker's background checks in ${checks} background script(s)`);
   }
   const icons = synthesizePlaceholderIcons(stageDir, out, src.name);
   if (icons.length > 0) log.ok(`Synthesized placeholder icons (${icons.join("/")}px); the manifest had none`);
