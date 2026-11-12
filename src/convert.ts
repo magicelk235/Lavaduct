@@ -206,7 +206,7 @@ function buildAddon(
   if (junk.length > 0) log.ok(`Left out ${junk.join(", ")}: no messages.json Chrome reads, so Chrome skips it, and Firefox would refuse the add-on`);
   const catalogs = normalizeLocaleCatalogs(stageDir);
   if (catalogs.length > 0) log.ok(`Rewrote ${catalogs.length} locale catalog(s) as plain JSON, which Firefox's reader needs: ${catalogs.join(", ")}`);
-  for (const r of applySourceRewrites(stageDir, manifest)) {
+  for (const r of applySourceRewrites(stageDir, manifest, src.chromeId)) {
     if (r.count > 0) log.ok(`${r.name} in ${r.count} file(s)`);
   }
 

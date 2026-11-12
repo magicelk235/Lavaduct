@@ -699,7 +699,25 @@ const EXT_ORIGIN_CONCAT_RE = new RegExp(
   "g",
 );
 
-function rewriteExtensionOriginFromRuntimeId(stageDir: string): number {
+// The same origin sent to a server as a referer header names the extension to its
+// backend, which knows it by its Chrome origin. Google Dictionary sends
+//   fetch(url, { headers: { "x-referer": "chrome-extension://" + chrome.runtime.id } })
+// to an API whose key only accepts chrome-extension://<its Chrome ID>: the add-on's
+// moz-extension origin is refused with 403, and so is no referer at all, which is what
+// Firefox sends from an extension page. Where the origin is a quoted referer header's
+// value (a headers object key, or headers.set/append and setRequestHeader) and the
+// Chrome ID is known, it becomes that Chrome origin, exactly what Chrome sends. A fetch
+// init's `referrer:` must be the page's own URL, so a bare key is left to the rewrite above.
+const REFERER_HEADER = "([\"'])(?:x-)?referr?er\\";
+const EXT_ORIGIN_EXPR =
+  "(?:`chrome-extension://\\$\\{\\s*" + NS_CHAIN + "\\s*\\.\\s*runtime\\s*\\.\\s*id\\s*\\}`" +
+  "|([\"'])chrome-extension://\\4\\s*\\+\\s*" + NS_CHAIN + "\\s*\\.\\s*runtime\\s*\\.\\s*id\\b)";
+const EXT_ORIGIN_HEADER_RE = new RegExp(
+  "(" + REFERER_HEADER + "2\\s*:\\s*|\\.\\s*(?:set|append|setRequestHeader)\\s*\\(\\s*" + REFERER_HEADER + "3\\s*,\\s*)" + EXT_ORIGIN_EXPR,
+  "gi",
+);
+
+function rewriteExtensionOriginFromRuntimeId(stageDir: string, chromeId?: string): number {
   let modified = 0;
   for (const file of walkScripts(stageDir)) {
     let content: string;
@@ -714,7 +732,14 @@ function rewriteExtensionOriginFromRuntimeId(stageDir: string): number {
       changed = true;
       return 'new URL(' + ns + '.runtime.getURL("/")).origin';
     };
-    const next = content
+    let next = content;
+    if (chromeId) {
+      next = next.replace(EXT_ORIGIN_HEADER_RE, (_whole, head: string) => {
+        changed = true;
+        return head + JSON.stringify(`chrome-extension://${chromeId}`);
+      });
+    }
+    next = next
       .replace(EXT_ORIGIN_TEMPLATE_RE, (_whole, ns: string) => origin(ns))
       .replace(EXT_ORIGIN_CONCAT_RE, (_whole, _q: string, ns: string) => origin(ns));
     if (changed) {
@@ -1058,12 +1083,12 @@ function renameNonJsScripts(stageDir: string, manifest: Manifest): number {
  * per rewrite, phrased to read as "<name> in <count> file(s)"; entries with a
  * zero count did nothing.
  */
-export function applySourceRewrites(stageDir: string, manifest: Manifest): Array<{ name: string; count: number }> {
+export function applySourceRewrites(stageDir: string, manifest: Manifest, chromeId?: string): Array<{ name: string; count: number }> {
   return [
     // First, so every later pass (and the background lookups) sees the new names.
     { name: "Gave scripts without a .js extension a name Firefox loads", count: renameNonJsScripts(stageDir, manifest) },
     { name: "Rewrote runtime.id-based port matchers", count: rewriteRuntimeIdUrlMatchers(stageDir) },
-    { name: "Rewrote runtime.id-based extension-origin checks", count: rewriteExtensionOriginFromRuntimeId(stageDir) },
+    { name: "Rewrote runtime.id-based extension-origin checks", count: rewriteExtensionOriginFromRuntimeId(stageDir, chromeId) },
     { name: "Rewrote chrome-extension: scheme literals", count: rewriteChromeSchemeLiterals(stageDir) },
     { name: "Rewrote self-page chrome-extension: URLs to runtime.getURL", count: rewriteSelfPageExtensionUrls(stageDir) },
     { name: "Rewrote @@extension_id placeholder URLs", count: rewriteExtensionIdPlaceholderUrls(stageDir) },
