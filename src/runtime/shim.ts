@@ -85,6 +85,43 @@ const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onC
 // `self.localStorage = polyfill`. The event page's are getter-only.
 const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
 
+// A listener added with a last argument that can be false: a falsy literal,
+// which is what a Chrome build compiles `isFirefox && { … }` to, or an `&&`
+// expression that isn't a conditional.
+const ADD_LISTENER_RE = /\.\s*addListener\s*\(/g;
+const FALSY_LITERAL_RE = /^(?:!\s*1|false|0|""|''|null|void\s+0)$/;
+
+// Whether a call in `src` passes addListener a last argument that may be false.
+function hasFalsyListenerArg(src: string): boolean {
+  if (!src.includes("addListener")) return false;
+  ADD_LISTENER_RE.lastIndex = 0;
+  for (let m = ADD_LISTENER_RE.exec(src); m; m = ADD_LISTENER_RE.exec(src)) {
+    const open = m.index + m[0].length - 1;
+    let depth = 0;
+    let lastComma = -1;
+    let and = false;
+    let conditional = false;
+    const close = walkCode(src, open, (c, i) => {
+      if (c === "(" || c === "[" || c === "{") depth++;
+      else if (c === ")" || c === "]" || c === "}") {
+        depth--;
+        if (depth === 0) return true;
+      } else if (depth === 1) {
+        if (c === ",") {
+          lastComma = i;
+          and = conditional = false;
+        } else if (c === "&" && src[i + 1] === "&") and = true;
+        else if (c === "?" && src[i + 1] !== "?" && src[i + 1] !== "." && src[i - 1] !== "?") conditional = true;
+      }
+      return false;
+    });
+    if (close < 0) continue;
+    if (lastComma < 0) continue;
+    if (FALSY_LITERAL_RE.test(src.slice(lastComma + 1, close).trim()) || (and && !conditional)) return true;
+  }
+  return false;
+}
+
 interface Usage {
   favicon: boolean;
   offscreen: boolean;
@@ -101,13 +138,14 @@ interface Usage {
   storage: boolean;
   messaging: boolean;
   storageGlobalsAssigned: string[];
+  falsyListenerArg: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [],
+    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -135,6 +173,7 @@ function scanUsage(dir: string): Usage {
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
       }
+      if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
     }
   }
   return found;
@@ -180,6 +219,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     storageClone: usage.storage,
     messageJson: usage.messaging,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
+    falsyListenerArgs: usage.falsyListenerArg,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so

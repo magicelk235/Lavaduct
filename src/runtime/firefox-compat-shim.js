@@ -2274,6 +2274,48 @@
     });
   }
 
+  // ── A listener's filter passed as false ────────────────────────────────────
+  // Code built for both browsers passes an event's filter as
+  // `isFirefox && { … }`, which a Chrome build compiles to
+  // addListener(fn, false). Firefox's schemas refuse false, 0 or "" where a
+  // filter object or nothing goes ("Incorrect argument types for
+  // tabs.onUpdated"), and the throw ends the script that registered it. A
+  // trailing argument that is falsy (false, 0, "", null, undefined) is left
+  // out instead: that's what the add-on means by it. The function is passed on
+  // as it is, so removeListener and hasListener still find it. Every event
+  // object the namespaces hold is wrapped once (chrome and browser share them);
+  // a namespace a later permission grant adds isn't. Only emitted for a bundle
+  // that passes addListener a last argument that may be false.
+  function installFalsyListenerArgs() {
+    if (!CONFIG.falsyListenerArgs) return;
+    var wrapped = [];
+    function wrapEvent(ev) {
+      if (wrapped.indexOf(ev) >= 0) return;
+      wrapped.push(ev);
+      var add = ev.addListener;
+      replaceMember(ev, "addListener", function () {
+        var args = Array.prototype.slice.call(arguments);
+        while (args.length > 1 && !args[args.length - 1]) args.length--;
+        return add.apply(ev, args);
+      });
+    }
+    function walk(obj, depth) {
+      var keys;
+      try { keys = Object.keys(obj); } catch (e) { return; }
+      keys.forEach(function (key) {
+        var v = null;
+        try { v = obj[key]; } catch (e) {}
+        if (!v || typeof v !== "object") return;
+        if (/^on[A-Z]/.test(key)) {
+          if (typeof v.addListener === "function") wrapEvent(v);
+        } else if (depth > 0) {
+          walk(v, depth - 1);
+        }
+      });
+    }
+    namespaces.forEach(function (ns) { walk(ns, 2); });
+  }
+
   // ── permissions Firefox doesn't know ───────────────────────────────────────
   // The conversion removes the permissions Firefox doesn't know, offscreen and
   // sidePanel among them, and Firefox's permissions.contains, request and
@@ -2460,6 +2502,7 @@
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
+  try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
