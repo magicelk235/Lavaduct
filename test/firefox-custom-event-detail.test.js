@@ -2,7 +2,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { setTimeout as sleep } from "node:timers/promises";
 import { buildShim } from "./shim-sandbox.js";
 import { firefox, loadAddon } from "./firefox-load.js";
 
@@ -32,7 +31,7 @@ document.addEventListener("t-own", (e) => { document.title = JSON.stringify({ re
 addEventListener("DOMContentLoaded", () => document.dispatchEvent(new CustomEvent("t-ask")));
 `;
 
-test("a world: \"MAIN\" script reads the object an isolated content script put in a CustomEvent's detail", { skip: !firefox && "no Firefox installed" }, async (t) => {
+test("a world: \"MAIN\" script reads the object an isolated content script put in a CustomEvent's detail", { skip: !firefox && "no Firefox installed", timeout: 180_000 }, async (t) => {
   const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "text/html" });
     res.end("<!doctype html><title>waiting</title><p>page</p>");
@@ -58,12 +57,20 @@ test("a world: \"MAIN\" script reads the object an isolated content script put i
       globalThis.__customEventTab = win.gBrowser.addTab(${JSON.stringify(url)}, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
       return 1;
     })()`);
-    for (let i = 0; i < 150; i++) {
-      const now = await chrome(`globalThis.__customEventTab.linkedBrowser.contentTitle`);
-      if (now && now.startsWith("{")) return now;
-      await sleep(100);
+    // Wait for the tab's page to finish loading, however long a loaded machine
+    // takes to commit it; its scripts set the title during DOMContentLoaded,
+    // before that. Each check returns within the devtools reply timeout, and
+    // the test's own timeout bounds the whole wait.
+    for (;;) {
+      const state = JSON.parse(await chrome(`(async () => {
+        const tab = globalThis.__customEventTab;
+        const browser = tab.linkedBrowser;
+        const loaded = () => browser.currentURI.spec === ${JSON.stringify(url)} && !tab.hasAttribute("busy");
+        for (const end = Date.now() + 20000; !loaded() && Date.now() < end;) await new Promise((r) => setTimeout(r, 100));
+        return JSON.stringify({ loaded: loaded(), title: browser.contentTitle, uri: browser.currentURI.spec, busy: tab.hasAttribute("busy") });
+      })()`));
+      if (state.loaded) return state.title;
     }
-    return "timed out";
   });
   assert.ok(title.startsWith("{"), title);
   const result = JSON.parse(title);
