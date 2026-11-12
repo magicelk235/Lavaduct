@@ -987,13 +987,23 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: 
   }
   const ids = strings(ec?.ids).filter((id) => id !== "*");
   if (ids.length > 0) {
-    issues.push({
-      severity: "warning",
-      category: "manifest",
-      message: `externally_connectable.ids lists Chrome extension IDs (${ids.join(", ")}); those extensions have other IDs in Firefox, and any add-on may message this one.`,
-      file: "manifest.json",
-      fix: "Check senders against their Firefox add-on IDs instead.",
-    });
+    issues.push(
+      opts.shim === false
+        ? {
+            severity: "warning",
+            category: "manifest",
+            message: `externally_connectable.ids lists Chrome extension IDs (${ids.join(", ")}); Firefox has no externally_connectable, and without the shim any add-on may message this one.`,
+            file: "manifest.json",
+            fix: "Convert without --no-shim to let only the listed extensions through, or check senders against their Firefox add-on IDs.",
+          }
+        : {
+            severity: "warning",
+            category: "manifest",
+            message: `externally_connectable.ids lists Chrome extension IDs (${ids.join(", ")}); the shim keeps other add-ons out, and lets a listed extension through only when it was converted by lavaduct too, since its Firefox build has another ID.`,
+            file: "manifest.json",
+            fix: "Re-test messaging with the companion extensions; a native Firefox build of one of them is refused.",
+          },
+    );
   }
 
   if (required.includes("nativeMessaging") || optional.includes("nativeMessaging")) {
