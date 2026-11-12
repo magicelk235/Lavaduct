@@ -11,12 +11,24 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { RdpSession } from "../dist/firefox/rdp.js";
 import { enableDebuggerServerInProfile } from "../dist/firefox/install.js";
 import { quitFirefoxForProfile } from "../dist/firefox/launch.js";
 import { findFirefoxInstalls, selectFirefox } from "../dist/firefox/locate.js";
+import { platform } from "../dist/firefox/platform/index.js";
+import { profileInUse } from "../dist/firefox/profiles.js";
 
 const firefox = selectFirefox(findFirefoxInstalls());
+
+// On Windows taskkill can't close a Firefox without windows, and one left
+// running keeps the profile locked and the test file from exiting.
+async function stopFirefox(profile) {
+  if (await quitFirefoxForProfile(firefox, profile)) return;
+  const holder = platform.lockHolder(profile, { pathForName: () => undefined, defaultForBinary: () => undefined });
+  if (holder) process.kill(holder.pid);
+  for (let i = 0; i < 300 && profileInUse(profile); i++) await sleep(100);
+}
 
 test(
   "a Firefox started for a temporary install has its window open before anything is installed",
@@ -31,7 +43,7 @@ test(
       assert.ok(tabs.length > 0, "Firefox had no window yet when the session was handed over");
     } finally {
       session.end();
-      await quitFirefoxForProfile(firefox, profile);
+      await stopFirefox(profile);
     }
   },
 );
