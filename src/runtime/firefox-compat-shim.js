@@ -1721,6 +1721,17 @@
     try { return new URL("http://[" + lower + "]/").hostname; } catch (e) { return d; }
   }
 
+  // Chrome takes any ASCII string as a rule's domain and matches it against the
+  // request's host, so an entry that is no host name just never matches: Total
+  // Adblock excludes `${chrome.runtime.id}*`. Firefox refuses the whole call over
+  // such an entry (its canonicalDomain format: the string must be the host name
+  // a URL makes of it), and the add-on's ID with its '@' never is one. Those
+  // entries are left out; non-ASCII ones stay, as Chrome refuses those too.
+  function inertDomain(d) {
+    if (typeof d !== "string" || !/^[\x00-\x7f]*$/.test(d)) return false;
+    try { return new URL("http://" + d + "/").hostname !== d; } catch (e) { return true; }
+  }
+
   // The rule as Firefox takes it, or null when it can't.
   function firefoxRule(rule) {
     if (!rule || typeof rule !== "object") return rule;
@@ -1741,7 +1752,13 @@
           if (key === "resourceTypes" && value.length && !left.length) return null;
           value = left;
         }
-        if (DNR_DOMAIN_CONDITIONS.indexOf(key) >= 0 && Array.isArray(value)) value = value.map(firefoxDomain);
+        if (DNR_DOMAIN_CONDITIONS.indexOf(key) >= 0 && Array.isArray(value)) {
+          var domains = value.map(firefoxDomain).filter(function (d) { return !inertDomain(d); });
+          // A list of nothing but such entries matches no request in Chrome, so
+          // the rule never applies there; empty, Firefox would apply it everywhere.
+          if ((key === "requestDomains" || key === "initiatorDomains") && value.length && !domains.length) return null;
+          value = domains;
+        }
         cond[key] = value;
       }
       if (typeof cond.regexFilter === "string") {
