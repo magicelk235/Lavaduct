@@ -38,7 +38,8 @@ test("the conversion report calls it a rewrite, not a removal and an addition", 
   const before = manifest();
   const changes = summarizeManifestChanges(before, transformManifest(before, [], options));
   assert.ok(changes.some((c) => c.startsWith("Dropped the port wildcard") && c.includes("`http://localhost:*/*`")), changes.join("\n"));
-  assert.ok(!changes.some((c) => c.startsWith("Removed") || c.startsWith("Added")), changes.join("\n"));
+  // Chrome's default extension_pages CSP is added to every MV3 manifest without one; it isn't about host patterns.
+  assert.ok(!changes.some((c) => c.startsWith("Removed") || (c.startsWith("Added") && !c.includes("`extension_pages` CSP"))), changes.join("\n"));
 });
 
 test("the analyzer reports the rewrite instead of blocking on it", () => {

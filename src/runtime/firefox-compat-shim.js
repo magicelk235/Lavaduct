@@ -13,20 +13,21 @@
 //     extension's pages, and `clients`, `registration` and the `message` event
 //     in the background, over window.postMessage;
 //   - chrome://newtab URLs, which tabs.create and windows.create refuse;
-//   - the add-on's Chrome origin on requests to its own backends;
+//   - the add-on's Chrome origin on its own requests;
 //   - Chrome's enum objects that Firefox's declarativeNetRequest, identity and
 //     storage lack;
 //   - declarativeNetRequest rules added at runtime that Firefox would refuse;
 //   - OFFSCREEN_DOCUMENT in runtime.getContexts, for the offscreen emulation;
 //   - storage.session.setAccessLevel, which code waits on, and the session
-//     area in content scripts once the background opens it to them;
-//   - window.chrome in content scripts;
+//     area where Firefox has none (content scripts, pages framed in a site);
+//   - window.chrome in content scripts, and json() bodies in their own realm;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
 //     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
 //   - webpack chunks of a worker bundle, listed ahead of the worker;
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
 //     temporarily again and again;
+//   - the "browser_action" menu context, which Firefox refuses from MV3;
 //   - Chrome's callback on methods Firefox only gives a promise.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
@@ -90,6 +91,12 @@
   var isTopFrame = true;
   try { isTopFrame = typeof window === "undefined" || window.top === window; } catch (e) { isTopFrame = false; }
   var isBackground = isExtensionPage && isTopFrame && detectBackground();
+  // A converted worker's chunks are loaded by its pages too, so their "am I the
+  // worker?" checks were rewritten to `check || globalThis.__lavaductBackground
+  // === true` (src/input/stage.ts rewriteHoistedBackgroundChecks): true here only.
+  if (isBackground) {
+    try { Object.defineProperty(G, "__lavaductBackground", { value: true, configurable: true }); } catch (e) {}
+  }
 
   var ORIGIN = "";
   try { ORIGIN = String(api.runtime.getURL("/")).replace(/\/+$/, ""); } catch (e) {}
@@ -375,7 +382,9 @@
   var PANEL_MSG_KEY = "__sidePanelShim:message";
 
   function installSidePanel() {
-    if (!isExtensionPage) return;
+    // Chrome defines chrome.sidePanel only with the sidePanel permission, and
+    // code tests for it: `if (chrome.sidePanel) open() else openWindow()`.
+    if (!isExtensionPage || !CONFIG.sidePanel) return;
     var sidebar = api.sidebarAction || null;
     if (!sidebar && !api.windows) return;
 
@@ -1190,12 +1199,13 @@
   //     for the page as the source;
   //   - Client.postMessage fires `message` on the page's navigator.serviceWorker,
   //     queued until the page starts its messages, as in Chrome.
-  // The event page can't answer the pages' requests the way a worker's fetch
-  // handler does, so no page is controlled: `controller` is null and `ready`
-  // gives the worker, as for a page Chrome loaded without its worker. Code that
-  // reads `controller` as "my requests went through the worker" then asks the
-  // worker instead. For the same reason clients.matchAll() lists every page of
-  // the add-on whatever includeUncontrolled says.
+  // Chrome's worker controls the add-on's pages, so `controller` is the worker
+  // and code posts to it there. A worker that handles `fetch` serves its pages'
+  // requests, which the event page can't, so its pages get no controller
+  // (CONFIG.serviceWorkerController is off) and code that reads `controller` as
+  // "my requests went through the worker" asks the worker instead; `ready`
+  // still gives it. clients.matchAll() lists every page of the add-on whatever
+  // includeUncontrolled says.
   var SW_ENVELOPE = "__lavaductServiceWorkerMessage";
 
   function swScriptUrl() {
@@ -1327,7 +1337,7 @@
       return url === undefined || String(url).indexOf(ORIGIN + "/") === 0 || !/^[a-z][a-z0-9+.-]*:/i.test(String(url));
     }
     Object.defineProperties(container, {
-      controller: { value: null, enumerable: true },
+      controller: { value: CONFIG.serviceWorkerController ? worker : null, enumerable: true },
       ready: { value: Promise.resolve(registration), enumerable: true },
       getRegistration: { value: function (url) { return Promise.resolve(inScope(url) ? registration : undefined); }, writable: true, configurable: true },
       getRegistrations: { value: function () { return Promise.resolve([registration]); }, writable: true, configurable: true },
@@ -1519,6 +1529,58 @@
     if (CONFIG.serviceWorkerRegistration) defineMissing(G, "registration", makeRegistration(worker));
   }
 
+  // ── The worker's install and activate events ───────────────────────────────
+  // Chrome installs an extension's service worker when the extension is
+  // installed or updated: the worker's script runs, `install` fires, then
+  // `activate`, each waiting on the promises its handlers pass to waitUntil.
+  // Workers boot from those events (MetaMask starts its app from `install`)
+  // and call skipWaiting() in them. The event page gets no such events, and a
+  // page has no skipWaiting, so both are given here: once per add-on version,
+  // after the background's scripts have run, `install` and then `activate`
+  // are dispatched on the global, oninstall and onactivate included. Without
+  // localStorage nothing is dispatched, since the version can't be told apart
+  // and an event page restarts every time it wakes. Only emitted for a bundle
+  // that listens for them or calls skipWaiting().
+  var SW_VERSION_KEY = "__lavaductServiceWorkerVersion";
+
+  function installServiceWorkerLifecycle() {
+    if (!CONFIG.serviceWorkerLifecycle || !isBackground) return;
+    defineMissing(G, "skipWaiting", function skipWaiting() { return Promise.resolve(); });
+    if (typeof G.addEventListener !== "function" || typeof G.dispatchEvent !== "function" || typeof Event !== "function") return;
+    ["install", "activate"].forEach(function (type) {
+      if (!("on" + type in G)) handlerProps(G, [type]);
+    });
+    if (!localStore) return;
+    var version = "";
+    try { version = String(api.runtime.getManifest().version || ""); } catch (e) {}
+    var last = null;
+    try { last = localStore.getItem(SW_VERSION_KEY); } catch (e) {}
+    if (last === version) return;
+
+    // An ExtendableEvent: resolves once every promise passed to waitUntil has
+    // settled, and keeps the event page awake until then.
+    function fire(type) {
+      var pending = [];
+      var evt = new Event(type);
+      try {
+        Object.defineProperty(evt, "waitUntil", {
+          configurable: true, writable: true,
+          value: function waitUntil(p) { pending.push(Promise.resolve(p).catch(noop)); },
+        });
+      } catch (e) {}
+      try { G.dispatchEvent(evt); } catch (e) { dbg("worker " + type + " event failed:", errorMessage(e)); }
+      var all = Promise.all(pending);
+      if (pending.length) keepAliveUntil(all);
+      return all;
+    }
+    function run() {
+      try { localStore.setItem(SW_VERSION_KEY, version); } catch (e) {}
+      fire("install").then(function () { return fire("activate"); });
+    }
+    if (hasDocument && document.readyState === "loading") document.addEventListener("DOMContentLoaded", run, { once: true });
+    else setTimeout(run, 0);
+  }
+
   // ── The worker's location in Web Lock names ────────────────────────────────
   // In Chrome the background's `location` is its script's (/sw.js); the event
   // page's is /_generated_background_page.html. A worker that holds a lock named
@@ -1574,55 +1636,93 @@
     });
   }
 
-  // ── chrome://newtab ─────────────────────────────────────────────────────────
+  // ── chrome://newtab and chrome://extensions/shortcuts ──────────────────────
   // tabs.create, tabs.update and windows.create refuse chrome:// URLs in Firefox
-  // ("Illegal URL"). A bundle that opens Chrome's new tab page gets Firefox's,
-  // which those calls open when given no url. Only emitted for a bundle that
-  // names chrome://newtab.
+  // ("Illegal URL"), and about:newtab and about:home as well. A bundle that
+  // opens Chrome's new tab page gets Firefox's, which tabs.create and
+  // windows.create open when given no url. tabs.update can't navigate a tab to
+  // it, except where the add-on overrides the new tab page itself: chrome://newtab
+  // then shows the add-on's page, as it does in Chrome, in place and in
+  // windows.create lists alike. Chrome's shortcuts page is Firefox's
+  // commands.openShortcutSettings(), which opens about:addons there; the call
+  // answers with the tab that ends up active. Only emitted for a bundle that
+  // names these URLs.
   var NEW_TAB_RE = /^chrome:\/\/new-?tab(?:-page)?\/?$/i;
+  var SHORTCUTS_RE = /^chrome:\/\/extensions\/(?:shortcuts|configureCommands)\/?$/i;
 
-  function installNewTabUrls() {
-    if (!CONFIG.newTab) return;
-    var isNewTab = function (u) { return typeof u === "string" && NEW_TAB_RE.test(u); };
-    function fixed(props) {
+  function installChromeUrls() {
+    if (!CONFIG.newTab && !CONFIG.shortcutsPage) return;
+    var ownNewTab = CONFIG.newTabPage ? extensionUrl(CONFIG.newTabPage) : "";
+    var isNewTab = function (u) { return !!CONFIG.newTab && typeof u === "string" && NEW_TAB_RE.test(u); };
+    var isShortcuts = function (u) { return !!CONFIG.shortcutsPage && typeof u === "string" && SHORTCUTS_RE.test(u); };
+    function fixed(props, inPlace) {
       var url = props.url;
       if (!isNewTab(url) && !(Array.isArray(url) && url.some(isNewTab))) return props;
       var copy = Object.assign({}, props);
-      var rest = Array.isArray(url) ? url.filter(function (u) { return !isNewTab(u); }) : [];
-      if (rest.length) copy.url = rest;
+      var rest = Array.isArray(url)
+        ? (ownNewTab ? url.map(function (u) { return isNewTab(u) ? ownNewTab : u; }) : url.filter(function (u) { return !isNewTab(u); }))
+        : (inPlace && ownNewTab ? ownNewTab : null);
+      if (rest && (!Array.isArray(rest) || rest.length)) copy.url = rest;
       else delete copy.url;
       return copy;
     }
-    function wrap(obj, name) {
+    // Called before anything is awaited, so a user action that opened the call
+    // still counts. Answers with the about:addons tab Firefox opened, or the
+    // active tab of the last focused window when the add-on can't see URLs.
+    function openShortcuts(ns, cb) {
+      var p;
+      try { p = Promise.resolve(ns.commands.openShortcutSettings()); } catch (e) { p = Promise.reject(e); }
+      p = p.then(function () {
+        return api.tabs.query({});
+      }).then(function (tabs) {
+        var list = Array.isArray(tabs) ? tabs : [];
+        var addons = list.filter(function (t) { return t && /^about:addons/.test(String(t.url || "")); });
+        if (addons.length) return addons.filter(function (t) { return t.active; })[0] || addons[0];
+        return Promise.resolve(api.tabs.query({ active: true, lastFocusedWindow: true })).then(function (t) { return t && t[0]; });
+      });
+      return respond(ns, p, cb);
+    }
+    function wrap(ns, obj, name, inPlace, shortcuts) {
       if (!obj || typeof obj[name] !== "function") return;
       var original = obj[name];
       var wrapped = function () {
         var args = Array.prototype.slice.call(arguments);
-        for (var i = 0; i < args.length; i++) if (args[i] && typeof args[i] === "object") args[i] = fixed(args[i]);
+        for (var i = 0; i < args.length; i++) {
+          if (!args[i] || typeof args[i] !== "object") continue;
+          var commands = null;
+          try { commands = ns.commands; } catch (e) {}
+          if (shortcuts && isShortcuts(args[i].url) && commands && typeof commands.openShortcutSettings === "function") {
+            return openShortcuts(ns, typeof args[args.length - 1] === "function" ? args[args.length - 1] : null);
+          }
+          args[i] = fixed(args[i], inPlace);
+        }
         return original.apply(obj, args);
       };
       try { Object.defineProperty(obj, name, { value: wrapped, writable: true, configurable: true, enumerable: true }); } catch (e) {}
     }
     namespaces.forEach(function (ns) {
-      wrap(ns.tabs, "create");
-      wrap(ns.tabs, "update");
-      wrap(ns.windows, "create");
+      wrap(ns, ns.tabs, "create", false, true);
+      wrap(ns, ns.tabs, "update", true, true);
+      wrap(ns, ns.windows, "create", false, false);
     });
   }
 
-  // ── The add-on's origin at its own backends ────────────────────────────────
-  // Chrome sends an extension's requests with its chrome-extension://<id> origin,
-  // and some backends allow the extension by that name: a WebSocket handshake
-  // with Firefox's moz-extension://<random uuid> origin is refused outright.
-  // For the hosts the add-on's own content security policy lets it connect to,
-  // a session rule gives its requests (and only its: the initiator is this
-  // add-on) the Chrome origin they have in Chrome.
+  // ── The add-on's Chrome origin on its own requests ─────────────────────────
+  // Chrome sends every request an extension's own pages make with its
+  // chrome-extension://<id> origin, and some backends allow the extension by
+  // that name only: Firefox's moz-extension://<random uuid> origin gets a
+  // WebSocket handshake refused, or a 403 "Not allowed by CORS". A session rule
+  // gives the add-on's own requests (the initiator is this add-on, never a tab
+  // or a content script) the Chrome origin they have in Chrome. Firefox applies
+  // a modifyHeaders rule only to requests the add-on has host access to, and
+  // those are the ones Firefox exempts from CORS, so the origin a server
+  // reflects back never has to match. Requests to other hosts keep Firefox's
+  // origin, and its CORS check passes as before.
   var BACKEND_ORIGIN_RULE_ID = 2147480001;
 
   function installBackendOrigin() {
-    var hosts = Array.isArray(CONFIG.backendHosts) ? CONFIG.backendHosts : [];
     var dnr = api.declarativeNetRequest;
-    if (!isBackground || !hosts.length || !CONFIG.extensionId || !dnr || typeof dnr.updateSessionRules !== "function") return;
+    if (!isBackground || !CONFIG.extensionId || !dnr || typeof dnr.updateSessionRules !== "function") return;
     var rule = {
       id: BACKEND_ORIGIN_RULE_ID,
       priority: 1,
@@ -1630,7 +1730,7 @@
         type: "modifyHeaders",
         requestHeaders: [{ header: "origin", operation: "set", value: "chrome-extension://" + String(CONFIG.extensionId).toLowerCase() }],
       },
-      condition: { requestDomains: hosts, initiatorDomains: [loc.host], resourceTypes: ["websocket", "xmlhttprequest", "other"] },
+      condition: { initiatorDomains: [loc.host], resourceTypes: ["websocket", "xmlhttprequest", "other"] },
     };
     Promise.resolve(dnr.updateSessionRules({ removeRuleIds: [BACKEND_ORIGIN_RULE_ID], addRules: [rule] })).catch(function (e) {
       dbg("backend origin rule failed:", errorMessage(e));
@@ -1705,15 +1805,28 @@
     return out;
   }
 
+  // The session rules lavaduct adds for itself: the backend Origin rule, and
+  // the frame grants' rules just above it (frame-grants-bg.js). An add-on that
+  // clears every session rule at startup (getSessionRules, then removeRuleIds
+  // of all of them, as Requestly does) or numbers its rules after the highest
+  // one it sees would take them out or collide with them, so with
+  // CONFIG.reservedSessionRules the add-on's getSessionRules leaves them out
+  // and its removeRuleIds can't name them. The frame grants reach Firefox's
+  // own methods through __lavaductNative on the wrappers.
+  function isShimRule(id) {
+    return id === BACKEND_ORIGIN_RULE_ID || (id >= 2147480100 && id < 2147480200);
+  }
+
   function installRuleFilter() {
     namespaces.forEach(function (ns) {
       var dnr = null;
       try { dnr = ns.declarativeNetRequest; } catch (e) {}
       if (!dnr || typeof dnr !== "object") return;
+      var hide = CONFIG.reservedSessionRules === true;
       ["updateDynamicRules", "updateSessionRules"].forEach(function (name) {
         var native = dnr[name];
         if (typeof native !== "function") return;
-        replaceMember(dnr, name, function (options) {
+        var wrapper = function (options) {
           var args = Array.prototype.slice.call(arguments);
           if (options && typeof options === "object" && Array.isArray(options.addRules)) {
             var rules = [];
@@ -1724,9 +1837,28 @@
             });
             args[0] = Object.assign({}, options, { addRules: rules });
           }
+          if (hide && name === "updateSessionRules" && args[0] && typeof args[0] === "object" && Array.isArray(args[0].removeRuleIds)) {
+            args[0] = Object.assign({}, args[0], { removeRuleIds: args[0].removeRuleIds.filter(function (id) { return !isShimRule(id); }) });
+          }
           return native.apply(dnr, args);
-        });
+        };
+        if (hide && name === "updateSessionRules") {
+          try { Object.defineProperty(wrapper, "__lavaductNative", { value: native }); } catch (e) {}
+        }
+        replaceMember(dnr, name, wrapper);
       });
+      var getSession = dnr.getSessionRules;
+      if (!hide || typeof getSession !== "function") return;
+      var getWrapper = function () {
+        var args = Array.prototype.slice.call(arguments);
+        var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+        var p = Promise.resolve(getSession.apply(dnr, args)).then(function (rules) {
+          return Array.isArray(rules) ? rules.filter(function (r) { return !r || !isShimRule(r.id); }) : rules;
+        });
+        return respond(ns, p, cb);
+      };
+      try { Object.defineProperty(getWrapper, "__lavaductNative", { value: getSession }); } catch (e) {}
+      replaceMember(dnr, "getSessionRules", getWrapper);
     });
   }
 
@@ -1825,6 +1957,12 @@
     },
     identity: {
       AccountStatus: ["SYNC", "ANY"],
+    },
+    // Firefox's has INSTALL, UPDATE and BROWSER_UPDATE. Chrome code compares a
+    // repeat with OnInstalledReason.CHROME_UPDATE, the reason the onInstalled
+    // wrapper gives a temporary add-on loaded again.
+    runtime: {
+      OnInstalledReason: ["install", "update", "chrome_update", "shared_module_update"],
     },
     storage: {
       AccessLevel: ["TRUSTED_AND_UNTRUSTED_CONTEXTS", "TRUSTED_CONTEXTS"],
@@ -2032,6 +2170,30 @@
     var ns = api;
     try { if (typeof chrome === "object" && chrome) ns = chrome; } catch (e) {}
     defineMissing(window, "chrome", ns);
+  }
+
+  // ── json() bodies in content scripts ────────────────────────────────────────
+  // A content script's Response and Request are the page's, seen through an
+  // Xray, so json() builds its objects in the page's realm: their prototype is
+  // the page's Object.prototype and arrays fail `instanceof Array`. Chrome's
+  // isolated world gets objects of its own, and code that keeps only objects
+  // whose prototype is Object.prototype drops the rest. json() reads the body
+  // as text and parses it here instead, which is what it does in either
+  // browser: UTF-8, the same SyntaxError, the same TypeError for a body already
+  // read. The method lives on the Xray, so the page never sees it. Only emitted
+  // for a bundle that calls json().
+  function installContentBodyJson() {
+    if (!CONFIG.contentBodyJson || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    ["Response", "Request"].forEach(function (name) {
+      var proto = null;
+      try { proto = G[name] && G[name].prototype; } catch (e) {}
+      if (!proto || typeof proto.json !== "function" || typeof proto.text !== "function") return;
+      var text = proto.text;
+      replaceMember(proto, "json", function json() {
+        var body = this;
+        return new Promise(function (resolve) { resolve(text.call(body)); }).then(function (t) { return JSON.parse(t); });
+      });
+    });
   }
 
   // ── webpack chunks of a worker bundle ──────────────────────────────────────
@@ -2351,6 +2513,422 @@
     });
   }
 
+  // ── the "browser_action" menu context in MV3 ────────────────────────────────
+  // Chrome's contextMenus takes "browser_action" from an MV3 extension and
+  // keeps the item for its other contexts. Firefox's menus schema offers it to
+  // MV2 only, so create() and update() throw a TypeError and the whole item is
+  // lost, page and selection contexts included. MV3 calls the toolbar button's
+  // menu "action"; code that still says browser_action means that menu, as a
+  // user-agent sniff that takes a Firefox branch written for MV2 does. The
+  // name is changed for the call, never in the add-on's object. Chrome itself
+  // shows such an item on no toolbar menu in MV3, so Firefox shows one Chrome
+  // doesn't when the code meant it for Chrome too. "page_action" is left as it
+  // is: Firefox's MV3 still has page actions. Only emitted for a bundle that
+  // names browser_action.
+  function installMenuActionContext() {
+    if (!CONFIG.menuActionContext) return;
+    var version = 0;
+    try { version = api.runtime.getManifest().manifest_version; } catch (e) {}
+    if (version !== 3) return;
+    function firefoxContexts(props) {
+      if (!props || typeof props !== "object" || !Array.isArray(props.contexts) || props.contexts.indexOf("browser_action") < 0) return props;
+      var contexts = [];
+      props.contexts.forEach(function (c) {
+        var name = c === "browser_action" ? "action" : c;
+        if (contexts.indexOf(name) < 0) contexts.push(name);
+      });
+      return Object.assign({}, props, { contexts: contexts });
+    }
+    namespaces.forEach(function (ns) {
+      ["menus", "contextMenus"].forEach(function (area) {
+        var menus = null;
+        try { menus = ns[area]; } catch (e) {}
+        if (!menus || typeof menus !== "object") return;
+        [["create", 0], ["update", 1]].forEach(function (m) {
+          var native = menus[m[0]];
+          if (typeof native !== "function") return;
+          replaceMember(menus, m[0], function () {
+            var args = Array.prototype.slice.call(arguments);
+            args[m[1]] = firefoxContexts(args[m[1]]);
+            return native.apply(menus, args);
+          });
+        });
+      });
+    });
+  }
+
+  // ── Content scripts injected at runtime ────────────────────────────────────
+  // The conversion puts the shim first in every manifest content script, but
+  // files injected later with scripting.executeScript, registered with
+  // registerContentScripts or updateContentScripts, or run with
+  // tabs.executeScript (MV2) ran without it in a tab no manifest script
+  // matched: no window.chrome, no JSON fallback for messages, no favicon URLs.
+  // The shim goes first in each such file list of the isolated world (the
+  // page's own world has no extension API); where it already ran in that
+  // frame, it returns at once. Injections of a function are left alone, and
+  // getRegisteredContentScripts leaves the shim out. Only emitted for a
+  // bundle that injects files.
+  function withShimFirst(files) {
+    var shim = CONFIG.injectShim;
+    if (!Array.isArray(files) || !files.length) return files;
+    var first = String(files[0]).replace(/^\/+/, "");
+    return first === shim ? files : [shim].concat(files);
+  }
+
+  function withoutShim(files) {
+    if (!Array.isArray(files) || !files.length || String(files[0]).replace(/^\/+/, "") !== CONFIG.injectShim) return files;
+    return files.slice(1);
+  }
+
+  function installInjectedScriptShim() {
+    if (typeof CONFIG.injectShim !== "string" || !CONFIG.injectShim || !isExtensionPage) return;
+    function copyWith(obj, key, value) {
+      var c = {};
+      for (var k in obj) c[k] = obj[k];
+      c[key] = value;
+      return c;
+    }
+    function isolated(o) { return o && typeof o === "object" && o.world !== "MAIN"; }
+    namespaces.forEach(function (ns) {
+      var scripting = null, tabs = null;
+      try { scripting = ns.scripting; } catch (e) {}
+      try { tabs = ns.tabs; } catch (e) {}
+      if (scripting && typeof scripting.executeScript === "function") {
+        var exec = scripting.executeScript;
+        replaceMember(scripting, "executeScript", function (details) {
+          var args = Array.prototype.slice.call(arguments);
+          if (isolated(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", withShimFirst(details.files));
+          return exec.apply(scripting, args);
+        });
+      }
+      ["registerContentScripts", "updateContentScripts"].forEach(function (name) {
+        if (!scripting || typeof scripting[name] !== "function") return;
+        var native = scripting[name];
+        replaceMember(scripting, name, function (scripts) {
+          var args = Array.prototype.slice.call(arguments);
+          if (Array.isArray(scripts)) {
+            args[0] = scripts.map(function (s) { return isolated(s) && Array.isArray(s.js) ? copyWith(s, "js", withShimFirst(s.js)) : s; });
+          }
+          return native.apply(scripting, args);
+        });
+      });
+      if (scripting && typeof scripting.getRegisteredContentScripts === "function") {
+        var getRegistered = scripting.getRegisteredContentScripts;
+        replaceMember(scripting, "getRegisteredContentScripts", function () {
+          var args = Array.prototype.slice.call(arguments);
+          var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+          var p = Promise.resolve(getRegistered.apply(scripting, args.length ? args : [])).then(function (list) {
+            return Array.isArray(list) ? list.map(function (s) { return s && Array.isArray(s.js) ? copyWith(s, "js", withoutShim(s.js)) : s; }) : list;
+          });
+          return respond(ns, p, cb);
+        });
+      }
+      // MV2: one file per call, so the shim goes in a call of its own first.
+      if (tabs && typeof tabs.executeScript === "function") {
+        var tabsExec = tabs.executeScript;
+        replaceMember(tabs, "executeScript", function () {
+          var args = Array.prototype.slice.call(arguments);
+          var at = typeof args[0] === "object" && args[0] !== null ? 0 : 1;
+          var details = args[at];
+          if (!details || typeof details.file !== "string" || String(details.file).replace(/^\/+/, "") === CONFIG.injectShim) return tabsExec.apply(tabs, args);
+          var shimDetails = { file: "/" + CONFIG.injectShim };
+          ["allFrames", "frameId", "matchAboutBlank", "runAt"].forEach(function (k) { if (details[k] !== undefined) shimDetails[k] = details[k]; });
+          var shimArgs = at === 1 ? [args[0], shimDetails] : [shimDetails];
+          var first;
+          try { first = Promise.resolve(api.tabs.executeScript.apply(api.tabs, shimArgs)); } catch (e) { first = Promise.reject(e); }
+          var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+          var p = first.catch(function (e) { dbg("shim injection failed:", errorMessage(e)); }).then(function () {
+            return tabsExec.apply(tabs, args);
+          });
+          return respond(ns, p, cb);
+        });
+      }
+    });
+  }
+
+  // ── chrome.declarativeContent ──────────────────────────────────────────────
+  // Firefox has no declarativeContent. Add-ons that list the permission call it
+  // without testing for it, usually inside onInstalled, so the rest of that
+  // listener never ran (Tactiq's setup, Chrome extension source viewer's
+  // action.disable()). The rules are kept here and applied by the background:
+  //   - PageStateMatcher: pageUrl (Chrome's UrlFilter fields), css (selectors
+  //     checked in the page once it has loaded, where the add-on may script
+  //     it), isBookmarked (with the bookmarks API);
+  //   - ShowAction / ShowPageAction: the tab's action is enabled while a rule
+  //     matches, and back to the add-on's own setting for all tabs when none
+  //     does; an MV2 page_action is shown and hidden instead;
+  //   - SetIcon: the tab's icon while a rule matches;
+  //   - RequestContentScript: its files are injected once per page load.
+  // Chrome keeps rules across restarts, so they live in the background's
+  // localStorage. A tab's URL is only visible with the tabs permission or
+  // access to its site, so pageUrl conditions can't match other pages.
+  // Emitted for an add-on whose Chrome manifest asks for declarativeContent
+  // and whose code uses it.
+  var DC_RULES_KEY = "__lavaductDeclarativeContent";
+
+  function urlFilterMatches(f, href) {
+    var u;
+    try { u = new URL(href); } catch (e) { return false; }
+    if (!f || typeof f !== "object") return true;
+    var host = u.hostname, path = u.pathname, query = u.search.replace(/^\?/, "");
+    var full = u.href.replace(/#.*$/, "");
+    var originAndPath = u.origin + u.pathname;
+    function has(k) { return typeof f[k] === "string"; }
+    var lc = function (s) { return String(s).toLowerCase(); };
+    if (has("hostContains") && lc(host).indexOf(lc(f.hostContains)) < 0 && lc("." + host).indexOf(lc(f.hostContains)) < 0) return false;
+    if (has("hostEquals") && lc(host) !== lc(f.hostEquals)) return false;
+    if (has("hostPrefix") && lc(host).indexOf(lc(f.hostPrefix)) !== 0) return false;
+    if (has("hostSuffix") && !(lc(host).slice(-lc(f.hostSuffix).length) === lc(f.hostSuffix) || lc("." + host).slice(-lc(f.hostSuffix).length) === lc(f.hostSuffix))) return false;
+    if (has("pathContains") && path.indexOf(f.pathContains) < 0) return false;
+    if (has("pathEquals") && path !== f.pathEquals) return false;
+    if (has("pathPrefix") && path.indexOf(f.pathPrefix) !== 0) return false;
+    if (has("pathSuffix") && path.slice(-f.pathSuffix.length) !== f.pathSuffix) return false;
+    if (has("queryContains") && query.indexOf(f.queryContains) < 0) return false;
+    if (has("queryEquals") && query !== f.queryEquals) return false;
+    if (has("queryPrefix") && query.indexOf(f.queryPrefix) !== 0) return false;
+    if (has("querySuffix") && query.slice(-f.querySuffix.length) !== f.querySuffix) return false;
+    if (has("urlContains") && full.indexOf(f.urlContains) < 0) return false;
+    if (has("urlEquals") && full !== f.urlEquals) return false;
+    if (has("urlPrefix") && full.indexOf(f.urlPrefix) !== 0) return false;
+    if (has("urlSuffix") && full.slice(-f.urlSuffix.length) !== f.urlSuffix) return false;
+    try {
+      if (has("urlMatches") && !new RegExp(f.urlMatches).test(full)) return false;
+      if (has("originAndPathMatches") && !new RegExp(f.originAndPathMatches).test(originAndPath)) return false;
+    } catch (e) { return false; }
+    if (Array.isArray(f.schemes) && f.schemes.indexOf(u.protocol.replace(/:$/, "")) < 0) return false;
+    if (Array.isArray(f.ports)) {
+      var port = Number(u.port || (u.protocol === "https:" ? 443 : u.protocol === "http:" ? 80 : 0));
+      var portOk = f.ports.some(function (p) { return Array.isArray(p) ? port >= p[0] && port <= p[1] : port === p; });
+      if (!portOk) return false;
+    }
+    return true;
+  }
+
+  function installDeclarativeContent() {
+    if (!CONFIG.declarativeContent || !isExtensionPage) return;
+    function typed(type, fields) {
+      var C = function (opts) {
+        var o = opts && typeof opts === "object" ? opts : {};
+        var self = this instanceof C ? this : Object.create(C.prototype);
+        fields.forEach(function (k) { if (o[k] !== undefined) self[k] = o[k]; });
+        Object.defineProperty(self, "instanceType", { value: "declarativeContent." + type, enumerable: true });
+        return self;
+      };
+      return C;
+    }
+    var PageStateMatcher = typed("PageStateMatcher", ["pageUrl", "css", "isBookmarked"]);
+    var ShowAction = typed("ShowAction", []);
+    var ShowPageAction = typed("ShowPageAction", []);
+    var SetIcon = typed("SetIcon", ["imageData", "path"]);
+    var RequestContentScript = typed("RequestContentScript", ["js", "css", "allFrames", "matchAboutBlank"]);
+
+    function stored() { var r = readLocal(DC_RULES_KEY); return Array.isArray(r) ? r : []; }
+    function plainRule(rule, i) {
+      return {
+        id: typeof rule.id === "string" && rule.id ? rule.id : "_" + Date.now().toString(36) + "_" + i,
+        priority: typeof rule.priority === "number" ? rule.priority : 100,
+        tags: Array.isArray(rule.tags) ? rule.tags : undefined,
+        conditions: (rule.conditions || []).map(function (c) { return JSON.parse(JSON.stringify(Object.assign({}, c, { instanceType: c.instanceType }))); }),
+        actions: (rule.actions || []).map(function (a) { return JSON.parse(JSON.stringify(Object.assign({}, a, { instanceType: a.instanceType }))); }),
+      };
+    }
+    function changed() {
+      // The background applies the rules; other pages wake it to do so.
+      if (isBackground) { if (applyAll) applyAll(); }
+      else { try { Promise.resolve(api.runtime.getBackgroundPage()).then(function (bg) { if (bg && bg.__lavaductDeclarativeContentApply) bg.__lavaductDeclarativeContentApply(); }, noop); } catch (e) {} }
+    }
+    var onPageChanged = makeEvent().event;
+    onPageChanged.addRules = function (rules, cb) {
+      var p = Promise.resolve().then(function () {
+        var list = Array.isArray(rules) ? rules.map(plainRule) : [];
+        var ids = list.map(function (r) { return r.id; });
+        var kept = stored().filter(function (r) { return ids.indexOf(r.id) < 0; });
+        writeLocal(DC_RULES_KEY, kept.concat(list));
+        changed();
+        return list;
+      });
+      return respond(api, p, cb);
+    };
+    onPageChanged.removeRules = function (ids, cb) {
+      if (typeof ids === "function") { cb = ids; ids = undefined; }
+      var p = Promise.resolve().then(function () {
+        writeLocal(DC_RULES_KEY, Array.isArray(ids) ? stored().filter(function (r) { return ids.indexOf(r.id) < 0; }) : []);
+        changed();
+      });
+      return respond(api, p, cb);
+    };
+    onPageChanged.getRules = function (ids, cb) {
+      if (typeof ids === "function") { cb = ids; ids = undefined; }
+      var p = Promise.resolve().then(function () {
+        var all = stored();
+        return Array.isArray(ids) ? all.filter(function (r) { return ids.indexOf(r.id) >= 0; }) : all;
+      });
+      return respond(api, p, cb);
+    };
+    var dc = {
+      PageStateMatcher: PageStateMatcher, ShowAction: ShowAction, ShowPageAction: ShowPageAction,
+      SetIcon: SetIcon, RequestContentScript: RequestContentScript, onPageChanged: onPageChanged,
+    };
+    namespaces.forEach(function (ns) { defineMissing(ns, "declarativeContent", dc); });
+
+    var applyAll = null;
+    if (!isBackground || !api.tabs || !api.tabs.onUpdated) return;
+    var action = api.action || api.browserAction || null;
+    var pageAction = api.pageAction || null;
+    var shown = {};     // tabId → whether a Show rule matched last time
+    var iconSet = {};   // tabId → whether a SetIcon rule set its icon
+    var injected = {};  // tabId → the URL its RequestContentScript files went into
+
+    function cssMatches(tabId, selectors) {
+      if (!api.scripting || typeof api.scripting.executeScript !== "function") return Promise.resolve(false);
+      return Promise.resolve(api.scripting.executeScript({
+        target: { tabId: tabId },
+        func: function (sels) { try { return sels.every(function (s) { return !!document.querySelector(s); }); } catch (e) { return false; } },
+        args: [selectors],
+      })).then(function (r) { return !!(r && r[0] && r[0].result); }, function () { return false; });
+    }
+    function bookmarked(url) {
+      var b = api.bookmarks;
+      if (!b || typeof b.search !== "function") return Promise.resolve(false);
+      return Promise.resolve(b.search({ url: url })).then(function (r) { return !!(r && r.length); }, function () { return false; });
+    }
+    function conditionMatches(c, tab) {
+      if (!c || c.instanceType !== "declarativeContent.PageStateMatcher") return Promise.resolve(false);
+      if (c.pageUrl && !(tab.url && urlFilterMatches(c.pageUrl, tab.url))) return Promise.resolve(false);
+      var checks = [];
+      if (Array.isArray(c.css) && c.css.length) checks.push(cssMatches(tab.id, c.css));
+      if (typeof c.isBookmarked === "boolean") checks.push(tab.url ? bookmarked(tab.url).then(function (b) { return b === c.isBookmarked; }) : Promise.resolve(false));
+      return Promise.all(checks).then(function (r) { return r.every(Boolean); });
+    }
+    function ruleMatches(rule, tab) {
+      return Promise.all((rule.conditions || []).map(function (c) { return conditionMatches(c, tab); })).then(function (r) { return r.some(Boolean); });
+    }
+    function call(obj, name, arg) {
+      try { if (obj && typeof obj[name] === "function") return Promise.resolve(obj[name](arg)).catch(noop); } catch (e) {}
+      return Promise.resolve();
+    }
+    function applyTab(tab) {
+      if (!tab || tab.id == null || tab.id < 0) return Promise.resolve();
+      var rules = stored();
+      return Promise.all(rules.map(function (r) { return ruleMatches(r, tab); })).then(function (hits) {
+        var show = false, icon = null, scripts = [];
+        rules.forEach(function (rule, i) {
+          if (!hits[i]) return;
+          (rule.actions || []).forEach(function (a) {
+            var t = a && a.instanceType;
+            if (t === "declarativeContent.ShowAction" || t === "declarativeContent.ShowPageAction") show = true;
+            else if (t === "declarativeContent.SetIcon") icon = a;
+            else if (t === "declarativeContent.RequestContentScript") scripts.push(a);
+          });
+        });
+        var id = tab.id;
+        var jobs = [];
+        if (pageAction && !api.action) {
+          if (show) jobs.push(call(pageAction, "show", id));
+          else if (shown[id]) jobs.push(call(pageAction, "hide", id));
+        } else if (action) {
+          if (show) jobs.push(call(action, "enable", id));
+          else if (shown[id]) {
+            // Back to what the add-on set for all tabs.
+            jobs.push(Promise.resolve(typeof action.isEnabled === "function" ? action.isEnabled({}) : true).then(function (on) {
+              return call(action, on ? "enable" : "disable", id);
+            }, noop));
+          }
+        }
+        shown[id] = show;
+        if (action && icon) { iconSet[id] = true; jobs.push(call(action, "setIcon", { tabId: id, imageData: icon.imageData, path: icon.path })); }
+        else if (action && iconSet[id]) { delete iconSet[id]; jobs.push(call(action, "setIcon", { tabId: id, path: null })); }
+        if (scripts.length && tab.url && injected[id] !== tab.url && api.scripting) {
+          injected[id] = tab.url;
+          scripts.forEach(function (s) {
+            var target = { tabId: id, allFrames: s.allFrames === true };
+            if (Array.isArray(s.css) && s.css.length) jobs.push(call(api.scripting, "insertCSS", { target: target, files: s.css }));
+            if (Array.isArray(s.js) && s.js.length) jobs.push(call(api.scripting, "executeScript", { target: target, files: s.js }));
+          });
+        }
+        return Promise.all(jobs);
+      });
+    }
+    applyAll = function () {
+      return Promise.resolve(api.tabs.query({})).then(function (tabs) { return Promise.all((tabs || []).map(applyTab)); }).catch(function (e) {
+        dbg("declarativeContent:", errorMessage(e));
+      });
+    };
+    try { Object.defineProperty(G, "__lavaductDeclarativeContentApply", { value: applyAll, configurable: true }); } catch (e) {}
+    api.tabs.onUpdated.addListener(function (tabId, info, tab) {
+      if (info.url && injected[tabId] !== info.url) delete injected[tabId];
+      if (info.status === "complete" || info.url) applyTab(tab).catch(noop);
+    });
+    if (api.tabs.onRemoved) api.tabs.onRemoved.addListener(function (tabId) { delete shown[tabId]; delete iconSet[tabId]; delete injected[tabId]; });
+    applyAll();
+  }
+
+  // ── externally_connectable ids ─────────────────────────────────────────────
+  // In Chrome a manifest with externally_connectable lets in only the
+  // extensions its `ids` lists: none when the list is missing, every one for
+  // "*". Firefox has no such key and delivers every other add-on's messages
+  // and ports to runtime.onMessageExternal and onConnectExternal. The add-on's
+  // listeners now hear only the senders Chrome would let through. The list
+  // holds Chrome IDs, so a sender converted by lavaduct matches by the Chrome
+  // ID its add-on ID starts with. Only emitted for a manifest that declares
+  // externally_connectable; the page bridge feeds web pages' messages to the
+  // listeners directly, past this filter.
+  function allowedSender(sender) {
+    var ids = CONFIG.externalIds;
+    if (ids.indexOf("*") >= 0) return true;
+    var id = "";
+    try { id = String((sender && sender.id) || ""); } catch (e) {}
+    if (!id) return false;
+    for (var i = 0; i < ids.length; i++) {
+      var allowed = String(ids[i]);
+      if (id === allowed) return true;
+      if (id.indexOf(allowed.toLowerCase() + ".") === 0 && /@lavaduct$/.test(id)) return true;
+    }
+    return false;
+  }
+
+  function installExternalSenders() {
+    if (!Array.isArray(CONFIG.externalIds) || typeof WeakMap !== "function") return;
+    namespaces.forEach(function (ns) {
+      var rt = null;
+      try { rt = ns.runtime; } catch (e) {}
+      if (!rt) return;
+      [["onMessageExternal", 1], ["onConnectExternal", 0]].forEach(function (pair) {
+        var ev = null;
+        try { ev = rt[pair[0]]; } catch (e) {}
+        if (!ev || typeof ev.addListener !== "function") return;
+        var senderOf = pair[1] === 1 ? function (args) { return args[1]; } : function (args) { return args[0] && args[0].sender; };
+        var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+        var wrappers = new WeakMap();
+        function wrapperOf(fn) {
+          if (typeof fn !== "function") return fn;
+          var w = wrappers.get(fn);
+          if (!w) {
+            w = function () {
+              if (!allowedSender(senderOf(arguments))) {
+                dbg(pair[0] + ": dropped a sender externally_connectable doesn't list:", senderOf(arguments) && senderOf(arguments).id);
+                if (pair[1] === 0 && arguments[0] && typeof arguments[0].disconnect === "function") {
+                  try { arguments[0].disconnect(); } catch (e) {}
+                }
+                return undefined;
+              }
+              return fn.apply(this, arguments);
+            };
+            wrappers.set(fn, w);
+          }
+          return w;
+        }
+        replaceMember(ev, "addListener", function (fn) {
+          var args = Array.prototype.slice.call(arguments);
+          args[0] = wrapperOf(fn);
+          return add.apply(ev, args);
+        });
+        if (typeof remove === "function") replaceMember(ev, "removeListener", function (fn) { return remove.call(ev, wrappers.get(fn) || fn); });
+        if (typeof has === "function") replaceMember(ev, "hasListener", function (fn) { return has.call(ev, wrappers.get(fn) || fn); });
+      });
+    });
+  }
+
   // ── Values Chrome's storage keeps and Firefox can't clone ───────────────────
   // Chrome's storage.set serializes values: a function, or an object without
   // own data such as a URL, is stored as {}. Firefox structured-clones them and
@@ -2438,6 +3016,428 @@
     });
   }
 
+  // ── chrome.proxy.settings ──────────────────────────────────────────────────
+  // Chrome takes the proxy as proxy.settings.set({ value: { mode, rules,
+  // pacScript } }). Firefox's proxy.settings wants another shape (proxyType,
+  // http, ssl, autoConfigUrl) and refuses every change unless the user lets the
+  // add-on run in private windows ("proxy.settings requires private browsing
+  // permission."), so a Chrome VPN's connect fails. proxy.onRequest needs no
+  // such grant, and the emulation routes requests with it:
+  //   - direct, fixed_servers (singleProxy, proxyForHttp/Https/Ftp,
+  //     fallbackProxy, bypassList with Chrome's rule syntax, <local>, CIDR and
+  //     the implicit loopback bypass) and pac_script (data or url) are applied
+  //     by a listener in the background;
+  //   - a PAC script is code, so it runs in a manifest sandbox page the
+  //     background frames (the add-on's CSP forbids eval in its own pages), and
+  //     its synchronous DNS calls are answered from lookups the background makes
+  //     between rounds (dns.resolve when the add-on may use it, otherwise as a
+  //     failed lookup). A script that fails sends requests direct, or, with
+  //     pacScript.mandatory, to a proxy that can't exist, as Chrome refuses them;
+  //   - system leaves requests to Firefox's own settings; auto_detect has no
+  //     onRequest form and goes to Firefox's settings, which need the grant.
+  // The config lives in the add-on's localStorage, shared by all its pages, so
+  // the background reads it synchronously when Firefox wakes it and registers
+  // its listener before any request waits on it. get() reports it with Chrome's
+  // levelOfControl, clear() drops it, onChange fires in every page. A value in
+  // Firefox's own shape (no mode) goes to Firefox's proxy.settings as before.
+  // Only emitted for a bundle that names proxy.settings.
+  var PROXY_STATE_KEY = "__lavaductProxySettings";
+  var PROXY_MODES = ["direct", "auto_detect", "pac_script", "fixed_servers", "system"];
+  var PROXY_SCOPES = ["regular", "regular_only", "incognito_persistent", "incognito_session_only"];
+  var PROXY_PORTS = { http: 80, https: 443, socks4: 1080, socks5: 1080 };
+
+  function isIpv4(s) {
+    var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+    return !!m && m.slice(1).every(function (p) { return Number(p) <= 255; });
+  }
+
+  // An IP literal as eight 16-bit words (IPv4 as ::ffff:a.b.c.d), or null.
+  function ipWords(s) {
+    s = String(s).replace(/^\[|\]$/g, "");
+    if (isIpv4(s)) s = "::ffff:" + s;
+    if (!/^[0-9a-f:.]+$/i.test(s) || s.indexOf(":") < 0) return null;
+    var tail4 = /^(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(s);
+    var extra = [];
+    if (tail4) {
+      if (!isIpv4(tail4[2])) return null;
+      var p = tail4[2].split(".").map(Number);
+      extra = [(p[0] << 8) | p[1], (p[2] << 8) | p[3]];
+      s = tail4[1].replace(/:$/, "") || ":";
+      if (s === ":") s = "::";
+    }
+    var halves = s.split("::");
+    if (halves.length > 2) return null;
+    var head = halves[0] ? halves[0].split(":") : [];
+    var tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+    var fill = 8 - extra.length - head.length - tail.length;
+    if (halves.length === 1 ? fill !== 0 : fill < 0) return null;
+    var words = head.concat(new Array(halves.length === 2 ? fill : 0).fill("0"), tail);
+    for (var i = 0; i < words.length; i++) {
+      if (!/^[0-9a-f]{1,4}$/i.test(words[i])) return null;
+      words[i] = parseInt(words[i], 16);
+    }
+    return words.concat(extra);
+  }
+
+  function inCidr(words, cidr) {
+    var bits = cidr.bits;
+    for (var i = 0; i < 8 && bits > 0; i++, bits -= 16) {
+      var m = bits >= 16 ? 0xffff : (0xffff << (16 - bits)) & 0xffff;
+      if ((words[i] & m) !== (cidr.words[i] & m)) return false;
+    }
+    return true;
+  }
+
+  function globRegExp(pattern) {
+    return new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\?]/g, "\\$&").replace(/\*/g, ".*") + "$", "i");
+  }
+
+  // Chrome's ProxyBypassRules: [scheme://]host-pattern[:port], ".suffix",
+  // IP literals, a.b.c.d/n and [v6]/n, <local> (names without a dot), and
+  // <-loopback>, which turns off the implicit localhost/127.0.0.0/8/[::1] bypass.
+  function parseBypass(list) {
+    var rules = [], loopback = true;
+    (Array.isArray(list) ? list : []).forEach(function (raw) {
+      var r = String(raw).trim().toLowerCase();
+      if (!r) return;
+      if (r === "<local>") { rules.push({ local: true }); return; }
+      if (r === "<-loopback>") { loopback = false; return; }
+      var slash = /^\[?([0-9a-f:.]+)\]?\/(\d{1,3})$/.exec(r);
+      if (slash && ipWords(slash[1])) {
+        rules.push({ cidr: { words: ipWords(slash[1]), bits: Number(slash[2]) + (isIpv4(slash[1]) ? 96 : 0) } });
+        return;
+      }
+      var scheme = null, port = null;
+      var sm = /^([a-z][a-z0-9+.-]*):\/\//.exec(r);
+      if (sm) { scheme = sm[1]; r = r.slice(sm[0].length); }
+      var pm = /^(\[[^\]]*\]|[^:]*):(\d+)$/.exec(r);
+      if (pm) { r = pm[1]; port = Number(pm[2]); }
+      var ip = ipWords(r);
+      if (ip) { rules.push({ scheme: scheme, port: port, ip: ip }); return; }
+      if (r.charAt(0) === ".") r = "*" + r;
+      rules.push({ scheme: scheme, port: port, host: globRegExp(r) });
+    });
+    return { rules: rules, loopback: loopback };
+  }
+
+  var LOOPBACK = parseBypass(["localhost", "*.localhost", "127.0.0.1/8", "[::1]"]).rules;
+
+  function bypassed(bypass, u) {
+    var host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    var ip = ipWords(host);
+    var scheme = u.protocol.replace(/:$/, "");
+    var port = u.port ? Number(u.port) : ({ http: 80, ws: 80, https: 443, wss: 443, ftp: 21 })[scheme];
+    var rules = bypass.loopback ? LOOPBACK.concat(bypass.rules) : bypass.rules;
+    return rules.some(function (r) {
+      if (r.local) return !ip && host.indexOf(".") < 0;
+      if (r.cidr) return !!ip && inCidr(ip, r.cidr);
+      if (r.scheme && r.scheme !== scheme) return false;
+      if (r.port && r.port !== port) return false;
+      if (r.ip) return !!ip && r.ip.join() === ip.join();
+      return r.host.test(host);
+    });
+  }
+
+  function firefoxProxy(server) {
+    var scheme = server.scheme || "http";
+    var info = { type: scheme === "socks5" ? "socks" : scheme, host: String(server.host).replace(/^\[|\]$/g, ""), port: Number(server.port) || PROXY_PORTS[scheme] };
+    if (scheme === "socks5") info.proxyDNS = true;
+    return info;
+  }
+
+  function fixedServers(rules, u) {
+    if (bypassed(parseBypass(rules.bypassList), u)) return { type: "direct" };
+    var scheme = u.protocol.replace(/:$/, "");
+    var server = rules.singleProxy ||
+      (scheme === "http" || scheme === "ws" ? rules.proxyForHttp : scheme === "https" || scheme === "wss" ? rules.proxyForHttps : scheme === "ftp" ? rules.proxyForFtp : null) ||
+      rules.fallbackProxy;
+    return server ? firefoxProxy(server) : { type: "direct" };
+  }
+
+  // "PROXY a:1; SOCKS5 b:2; DIRECT" as Firefox's failover list.
+  function pacProxies(text) {
+    var out = [];
+    String(text).split(";").forEach(function (entry) {
+      var e = entry.trim();
+      if (/^direct$/i.test(e)) { out.push({ type: "direct" }); return; }
+      var m = /^(proxy|http|https|socks|socks4|socks5)\s+(\[[^\]]+\]|[^:\s]+)(?::(\d+))?$/i.exec(e);
+      if (!m) return;
+      var kind = m[1].toLowerCase();
+      var scheme = kind === "https" ? "https" : kind === "socks5" ? "socks5" : kind === "socks" || kind === "socks4" ? "socks4" : "http";
+      out.push(firefoxProxy({ scheme: scheme, host: m[2], port: m[3] }));
+    });
+    return out.length ? out : [{ type: "direct" }];
+  }
+
+  function validateProxyValue(v) {
+    if (PROXY_MODES.indexOf(v.mode) < 0) throw new Error("Invalid value for proxy config mode: " + v.mode + "; expected one of " + PROXY_MODES.join(", ") + ".");
+    if (v.mode === "fixed_servers") {
+      var r = v.rules;
+      if (!r || typeof r !== "object") throw new Error("fixed_servers requires rules.");
+      ["singleProxy", "proxyForHttp", "proxyForHttps", "proxyForFtp", "fallbackProxy"].forEach(function (k) {
+        var s = r[k];
+        if (s == null) return;
+        if (typeof s !== "object" || typeof s.host !== "string" || !s.host) throw new Error("rules." + k + " needs a host.");
+        var scheme = s.scheme || "http";
+        if (scheme === "quic") throw new Error("rules." + k + ": QUIC proxies have no Firefox equivalent.");
+        if (!PROXY_PORTS[scheme]) throw new Error("rules." + k + ": unknown proxy scheme " + scheme + ".");
+      });
+    }
+    if (v.mode === "pac_script") {
+      var p = v.pacScript;
+      if (!p || (typeof p.data !== "string" && typeof p.url !== "string")) throw new Error("pac_script requires pacScript.url or pacScript.data.");
+    }
+  }
+
+  // A value in Firefox's shape, in Chrome's: mode added, Firefox's members kept
+  // for code written against either.
+  function chromeProxyValue(v) {
+    var out = {};
+    if (v && typeof v === "object") Object.keys(v).forEach(function (k) { out[k] = v[k]; });
+    var t = out.proxyType;
+    var server = function (s, scheme) {
+      var m = /^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/.exec(String(s || ""));
+      return m ? { scheme: scheme, host: m[1], port: m[2] ? Number(m[2]) : PROXY_PORTS[scheme] } : null;
+    };
+    if (t === "none") out.mode = "direct";
+    else if (t === "autoDetect") out.mode = "auto_detect";
+    else if (t === "autoConfig") { out.mode = "pac_script"; out.pacScript = { url: out.autoConfigUrl || "", mandatory: false }; }
+    else if (t === "manual") {
+      out.mode = "fixed_servers";
+      var rules = {};
+      if (out.http && out.httpProxyAll) rules.singleProxy = server(out.http, "http");
+      else {
+        if (out.http) rules.proxyForHttp = server(out.http, "http");
+        if (out.ssl) rules.proxyForHttps = server(out.ssl, "http");
+        if (out.socks) rules.fallbackProxy = server(out.socks, out.socksVersion === 4 ? "socks4" : "socks5");
+      }
+      if (out.passthrough) rules.bypassList = String(out.passthrough).split(/[,\s]+/).filter(Boolean);
+      out.rules = rules;
+    } else out.mode = "system";
+    return out;
+  }
+
+  function proxyEffective(state, incognito) {
+    return incognito ? state.incognito || (state.regularOnly ? null : state.regular) || null : state.regular || null;
+  }
+
+  // Whether the background must route requests itself.
+  function proxyRouting(state) {
+    return [state.regular, state.incognito].some(function (v) {
+      return !!v && (v.mode === "direct" || v.mode === "fixed_servers" || v.mode === "pac_script");
+    });
+  }
+
+  function readProxyState() {
+    var s = readLocal(PROXY_STATE_KEY);
+    return s && typeof s === "object" ? s : {};
+  }
+
+  function installProxySettings() {
+    if (!CONFIG.proxySettings || !isExtensionPage) return;
+    var nativeProxy = null, nativeSettings = null;
+    try { nativeProxy = api.proxy; nativeSettings = nativeProxy && nativeProxy.settings; } catch (e) {}
+    if (!nativeSettings || !localStore) return;
+    var state = readProxyState();
+    var changed = makeEvent();
+    var listening = false;
+    var pacTexts = {};
+
+    function nativeCall(name, details) {
+      try { return Promise.resolve(nativeSettings[name](details || {})); } catch (e) { return Promise.reject(e); }
+    }
+
+    function levelFromFirefox(level) {
+      return level === "controlled_by_other_extensions" ? level : level === "controlled_by_this_extension" ? level : "controllable_by_this_extension";
+    }
+
+    function getDetails(details) {
+      var incognito = !!(details && details.incognito);
+      var v = proxyEffective(state, incognito);
+      if (v && v.mode !== "auto_detect") {
+        var own = { value: JSON.parse(JSON.stringify(v)), levelOfControl: "controlled_by_this_extension" };
+        if (incognito) own.incognitoSpecific = !!state.incognito;
+        return Promise.resolve(own);
+      }
+      return nativeCall("get", {}).then(function (n) {
+        var out = { value: v ? { mode: "auto_detect" } : chromeProxyValue(n && n.value), levelOfControl: v ? "controlled_by_this_extension" : levelFromFirefox(n && n.levelOfControl) };
+        if (incognito) out.incognitoSpecific = !!state.incognito;
+        return out;
+      }, function () {
+        return { value: { mode: v ? "auto_detect" : "system" }, levelOfControl: v ? "controlled_by_this_extension" : "controllable_by_this_extension" };
+      });
+    }
+
+    function announce() {
+      getDetails({}).then(function (d) { changed.dispatch(d); }, noop);
+    }
+
+    function save(next) {
+      state = next;
+      try {
+        if (state.regular || state.incognito) localStore.setItem(PROXY_STATE_KEY, JSON.stringify(state));
+        else localStore.removeItem(PROXY_STATE_KEY);
+      } catch (e) {}
+      if (isBackground) route();
+      else {
+        // A suspended event page reads the config when it wakes; one that runs
+        // hears the storage event.
+        try { var w = api.runtime.getBackgroundPage(); if (w && typeof w.then === "function") w.then(noop, noop); } catch (e) {}
+      }
+      announce();
+    }
+
+    function setDetails(details) {
+      details = details || {};
+      var value = details.value;
+      if (!value || typeof value !== "object" || value.mode === undefined) return nativeCall("set", details);
+      try { validateProxyValue(value); } catch (e) { return Promise.reject(e); }
+      var scope = details.scope || "regular";
+      if (PROXY_SCOPES.indexOf(scope) < 0) return Promise.reject(new Error("Invalid scope: " + scope + "."));
+      var copy = JSON.parse(JSON.stringify(value));
+      var apply = function () {
+        var next = JSON.parse(JSON.stringify(state));
+        if (scope === "regular" || scope === "regular_only") { next.regular = copy; next.regularOnly = scope === "regular_only"; }
+        else next.incognito = copy;
+        save(next);
+      };
+      if (copy.mode !== "auto_detect") { apply(); return Promise.resolve(); }
+      return nativeCall("set", { value: { proxyType: "autoDetect" } }).then(apply, function (e) {
+        throw new Error("proxy mode auto_detect needs Firefox's own proxy settings, which Firefox lets an add-on change only when it may run in private windows (" + errorMessage(e) + ")");
+      });
+    }
+
+    function clearDetails(details) {
+      var scope = (details && details.scope) || "regular";
+      var next = JSON.parse(JSON.stringify(state));
+      var cleared = scope === "regular" || scope === "regular_only" ? next.regular : next.incognito;
+      if (scope === "regular" || scope === "regular_only") { delete next.regular; delete next.regularOnly; }
+      else delete next.incognito;
+      if (cleared) save(next);
+      if (!cleared || cleared.mode === "auto_detect") return nativeCall("clear", {}).then(noop, noop);
+      return Promise.resolve();
+    }
+
+    // ── the background's router ──
+    var pacFrame = null, pacLoaded = null, pacWaiting = {}, pacSeq = 0;
+
+    function pacEval(message) {
+      if (!pacFrame) {
+        pacFrame = document.createElement("iframe");
+        try { pacFrame.style.cssText = "position:absolute;width:0;height:0;border:0;visibility:hidden;"; } catch (e) {}
+        pacLoaded = new Promise(function (resolve) { pacFrame.addEventListener("load", resolve); });
+        pacFrame.src = extensionUrl(CONFIG.pacPage);
+        (document.body || document.documentElement).appendChild(pacFrame);
+        G.addEventListener("message", function (e) {
+          var d = e.data;
+          if (!pacFrame || e.source !== pacFrame.contentWindow || !d || d.__lavaductPac !== true) return;
+          var w = pacWaiting[d.id];
+          if (w) { delete pacWaiting[d.id]; w(d); }
+        });
+      }
+      return pacLoaded.then(function () {
+        return new Promise(function (resolve, reject) {
+          var id = ++pacSeq;
+          var timer = setTimeout(function () { delete pacWaiting[id]; reject(new Error("the PAC script didn't answer within 10 s")); }, 10000);
+          pacWaiting[id] = function (d) { clearTimeout(timer); resolve(d); };
+          message.__lavaductPac = true;
+          message.id = id;
+          pacFrame.contentWindow.postMessage(message, "*");
+        });
+      });
+    }
+
+    function resolveName(name) {
+      try {
+        if (api.dns && typeof api.dns.resolve === "function") {
+          return api.dns.resolve(name).then(function (r) { return (r && r.addresses) || []; }, function () { return []; });
+        }
+      } catch (e) {}
+      return Promise.resolve([]);
+    }
+
+    function pacText(p) {
+      if (typeof p.data === "string") return Promise.resolve(p.data);
+      var cached = pacTexts[p.url];
+      if (!cached) {
+        cached = pacTexts[p.url] = (nativeFetch ? nativeFetch(p.url, { cache: "no-store" }) : Promise.reject(new Error("no fetch"))).then(function (r) {
+          if (!r.ok) throw new Error("PAC file " + p.url + " answered " + r.status);
+          return r.text();
+        });
+        cached.catch(function () { if (pacTexts[p.url] === cached) delete pacTexts[p.url]; });
+      }
+      return cached;
+    }
+
+    function routePac(p, u) {
+      // The PAC file's own download goes direct.
+      if (typeof p.data !== "string" && u.href === p.url) return { type: "direct" };
+      var url = u.href;
+      // Chrome hands PAC scripts only the origin of secure URLs.
+      if (u.protocol === "https:" || u.protocol === "wss:") url = u.protocol + "//" + u.host + "/";
+      var host = u.hostname.replace(/^\[|\]$/g, "");
+      var dns = {};
+      function round(n) {
+        return pacText(p).then(function (script) {
+          return pacEval({ script: script, url: url, host: host, dns: dns });
+        }).then(function (r) {
+          if (r.error) throw new Error(r.error);
+          if (r.needDns == null) return pacProxies(r.result);
+          if (n >= 16) throw new Error("the PAC script asked for more than 16 DNS lookups");
+          return resolveName(r.needDns).then(function (ips) { dns[r.needDns] = ips; return round(n + 1); });
+        });
+      }
+      return round(0).then(null, function (e) {
+        dbg("PAC script failed for", url + ":", errorMessage(e));
+        return p.mandatory ? [{ type: "http", host: "pac-script-failed.invalid", port: 1 }] : { type: "direct" };
+      });
+    }
+
+    function onRequest(info) {
+      var v = proxyEffective(state, !!info.incognito);
+      if (!v) return undefined;
+      var u;
+      try { u = new URL(info.url); } catch (e) { return undefined; }
+      if (v.mode === "direct") return { type: "direct" };
+      if (v.mode === "fixed_servers") return fixedServers(v.rules || {}, u);
+      if (v.mode === "pac_script") return routePac(v.pacScript || {}, u);
+      return undefined;
+    }
+
+    function route() {
+      var want = proxyRouting(state);
+      if (want === listening) return;
+      try {
+        if (want) nativeProxy.onRequest.addListener(onRequest, { urls: ["<all_urls>"] });
+        else nativeProxy.onRequest.removeListener(onRequest);
+        listening = want;
+      } catch (e) { dbg("proxy.onRequest failed:", errorMessage(e)); }
+    }
+
+    if (isBackground && nativeProxy.onRequest) route();
+    // Another page of the add-on changed the config.
+    try {
+      G.addEventListener("storage", function (e) {
+        if (e.key !== PROXY_STATE_KEY && e.key !== null) return;
+        state = readProxyState();
+        if (isBackground) route();
+        announce();
+      });
+    } catch (e) {}
+
+    namespaces.forEach(function (ns) {
+      var p = null;
+      try { p = ns.proxy; } catch (e) {}
+      if (!p || typeof p !== "object") return;
+      replaceMember(p, "settings", {
+        get: function (details, cb) { return respond(ns, getDetails(details), cb); },
+        set: function (details, cb) { return respond(ns, setDetails(details), cb); },
+        clear: function (details, cb) { return respond(ns, clearDetails(details), cb); },
+        onChange: changed.event,
+      });
+    });
+  }
+
   // ── "extraHeaders" in webRequest listeners ──────────────────────────────────
   // Chrome needs "extraHeaders" in a listener's extraInfoSpec to show headers
   // such as Cookie or Referer; Firefox shows every header without it, has no
@@ -2471,6 +3471,48 @@
         });
       });
     });
+  }
+
+  // ── A listener's filter passed as false ────────────────────────────────────
+  // Code built for both browsers passes an event's filter as
+  // `isFirefox && { … }`, which a Chrome build compiles to
+  // addListener(fn, false). Firefox's schemas refuse false, 0 or "" where a
+  // filter object or nothing goes ("Incorrect argument types for
+  // tabs.onUpdated"), and the throw ends the script that registered it. A
+  // trailing argument that is falsy (false, 0, "", null, undefined) is left
+  // out instead: that's what the add-on means by it. The function is passed on
+  // as it is, so removeListener and hasListener still find it. Every event
+  // object the namespaces hold is wrapped once (chrome and browser share them);
+  // a namespace a later permission grant adds isn't. Only emitted for a bundle
+  // that passes addListener a last argument that may be false.
+  function installFalsyListenerArgs() {
+    if (!CONFIG.falsyListenerArgs) return;
+    var wrapped = [];
+    function wrapEvent(ev) {
+      if (wrapped.indexOf(ev) >= 0) return;
+      wrapped.push(ev);
+      var add = ev.addListener;
+      replaceMember(ev, "addListener", function () {
+        var args = Array.prototype.slice.call(arguments);
+        while (args.length > 1 && !args[args.length - 1]) args.length--;
+        return add.apply(ev, args);
+      });
+    }
+    function walk(obj, depth) {
+      var keys;
+      try { keys = Object.keys(obj); } catch (e) { return; }
+      keys.forEach(function (key) {
+        var v = null;
+        try { v = obj[key]; } catch (e) {}
+        if (!v || typeof v !== "object") return;
+        if (/^on[A-Z]/.test(key)) {
+          if (typeof v.addListener === "function") wrapEvent(v);
+        } else if (depth > 0) {
+          walk(v, depth - 1);
+        }
+      });
+    }
+    namespaces.forEach(function (ns) { walk(ns, 2); });
   }
 
   // ── permissions Firefox doesn't know ───────────────────────────────────────
@@ -2644,23 +3686,31 @@
   try { installServiceWorkerRegistration(); } catch (e) { dbg("registration shim failed:", errorMessage(e)); }
   try { installServiceWorkerClients(); } catch (e) { dbg("clients shim failed:", errorMessage(e)); }
   try { installServiceWorkerContainer(); } catch (e) { dbg("navigator.serviceWorker shim failed:", errorMessage(e)); }
+  try { installServiceWorkerLifecycle(); } catch (e) { dbg("worker lifecycle shim failed:", errorMessage(e)); }
   try { installServiceWorkerLocks(); } catch (e) { dbg("Web Locks shim failed:", errorMessage(e)); }
   try { installServiceWorkerManifest(); } catch (e) { dbg("getManifest service_worker shim failed:", errorMessage(e)); }
-  try { installNewTabUrls(); } catch (e) { dbg("new tab URL shim failed:", errorMessage(e)); }
+  try { installChromeUrls(); } catch (e) { dbg("chrome:// URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
   try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
   try { installRuleFilter(); } catch (e) { dbg("declarativeNetRequest rule filter failed:", errorMessage(e)); }
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
+  try { installMenuActionContext(); } catch (e) { dbg("menu action context shim failed:", errorMessage(e)); }
+  try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
+  try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
+  try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
+  try { installDeclarativeContent(); } catch (e) { dbg("declarativeContent shim failed:", errorMessage(e)); }
   try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
+  try { installProxySettings(); } catch (e) { dbg("proxy.settings shim failed:", errorMessage(e)); }
   try { installPromiseOnlyCallbacks(); } catch (e) { dbg("promise-only callback shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();

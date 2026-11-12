@@ -202,7 +202,7 @@ test("a background that was a service worker has the registration its bundle rea
 });
 
 test("the add-on's pages find its worker through navigator.serviceWorker", async () => {
-  const files = { "sw.js": "self.clients.matchAll()", "page.js": "navigator.serviceWorker.ready" };
+  const files = { "sw.js": 'self.clients.matchAll(); self.addEventListener("fetch", serve);', "page.js": "navigator.serviceWorker.ready" };
   const navigator = {};
   const document = { readyState: "complete", addEventListener() {} };
   const ctx = runInContext(buildShim({ serviceWorker: true, serviceWorkerScript: "sw.js" }, files), {
@@ -212,7 +212,7 @@ test("the add-on's pages find its worker through navigator.serviceWorker", async
   });
   const reg = await vm.runInContext("navigator.serviceWorker.ready", ctx);
   assert.equal(reg.active.scriptURL, EXT_ORIGIN + "/sw.js");
-  assert.equal(vm.runInContext("navigator.serviceWorker.controller", ctx), null, "no page is controlled: the event page can't answer its fetches");
+  assert.equal(vm.runInContext("navigator.serviceWorker.controller", ctx), null, "a worker that handles fetch controls no page: the event page can't answer its fetches");
   assert.equal(await vm.runInContext("navigator.serviceWorker.register('/sw.js')", ctx), reg);
   await assert.rejects(vm.runInContext("navigator.serviceWorker.register('/other.js')", ctx));
 });

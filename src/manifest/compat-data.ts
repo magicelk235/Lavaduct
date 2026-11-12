@@ -68,7 +68,7 @@ export const OPTIONAL_ONLY_PERMISSIONS: Record<string, true> = { userScripts: tr
  * Permissions that are removed (Firefox doesn't know them) while the runtime shim keeps
  * the feature working, so the report tags them shimmed instead of lost.
  */
-export const SHIMMED_PERMISSIONS = new Set(["debugger", "favicon", "identity.email", "offscreen", "sidePanel"]);
+export const SHIMMED_PERMISSIONS = new Set(["debugger", "declarativeContent", "favicon", "identity.email", "offscreen", "sidePanel"]);
 
 const CHROMEOS_ONLY = "ChromeOS-only; Firefox has no equivalent.";
 
@@ -86,7 +86,10 @@ const PERMISSION_NOTES: Record<string, string> = {
     "scripting, tabs, webNavigation, webRequest and access to all sites. Input events are synthetic (isTrusted is " +
     "false, no user activation), pages whose CSP forbids eval can't be evaluated in, response bodies aren't " +
     "available, and cross-origin frames are only reached through Firefox's frame IDs.",
-  declarativeContent: "Show the toolbar button per tab with action.enable()/disable() from tabs.onUpdated instead.",
+  declarativeContent:
+    "The shim emulates declarativeContent rules from tabs.onUpdated: ShowAction and ShowPageAction enable the tab's button (or show an MV2 page action), " +
+    "SetIcon sets its icon, RequestContentScript injects the files. pageUrl conditions only see pages the add-on may read the URL of (the tabs " +
+    "permission or access to the site), and css conditions only pages it may script.",
   desktopCapture: "Capture the screen with navigator.mediaDevices.getDisplayMedia() from an extension page.",
   "downloads.ui": "Firefox doesn't let add-ons hide its downloads panel.",
   fontSettings: "Firefox exposes no font settings to add-ons.",
@@ -150,7 +153,7 @@ type ApiNote = {
   since?: string;
 };
 
-const SHIMMED_NAMESPACES: Record<string, true> = { debugger: true, offscreen: true, sidePanel: true };
+const SHIMMED_NAMESPACES: Record<string, true> = { debugger: true, declarativeContent: true, offscreen: true, sidePanel: true };
 
 // Everything the runtime shim defines, keyed like FIREFOX_API_SUPPORT.
 const SHIMMED_APIS: Record<string, { message: string; fix: string }> = {
@@ -161,6 +164,10 @@ const SHIMMED_APIS: Record<string, { message: string; fix: string }> = {
   sidePanel: {
     message: "chrome.sidePanel is emulated on Firefox's sidebar (sidebarAction); the panel's page (side_panel, or the page passed to setOptions) becomes sidebar_action.",
     fix: "Firefox opens the sidebar only in response to a user action, so sidePanel.open() from a timer or a message handler is refused.",
+  },
+  declarativeContent: {
+    message: "chrome.declarativeContent is emulated for an add-on that asks for its permission: rules are matched on tabs.onUpdated, ShowAction and ShowPageAction enable the tab's button, SetIcon and RequestContentScript apply.",
+    fix: "pageUrl conditions only see pages the add-on may read the URL of (the tabs permission or access to the site), and css conditions only pages it may script.",
   },
   offscreen: {
     message: "chrome.offscreen is emulated with a hidden iframe in the background page (createDocument, closeDocument, hasDocument, Reason).",
@@ -293,9 +300,11 @@ const HAND_NOTES: Record<string, ApiNote> = {
     fix: "Register the value of identity.getRedirectURL() in Firefox with the OAuth provider.",
   },
   "chrome.proxy.settings": {
-    severity: "warning",
-    message: "Firefox's proxy.settings takes a different config than Chrome's (proxyType/http/ssl/autoConfigUrl instead of mode/rules/pacScript), so Chrome-style configs are rejected.",
-    fix: "Translate the config, or route requests with proxy.onRequest. Firefox also only allows proxy.settings when the user lets the add-on run in private windows.",
+    severity: "info",
+    message: "chrome.proxy.settings is emulated on proxy.onRequest: Firefox's own proxy.settings takes another config and refuses changes unless the add-on may run in private windows. direct, fixed_servers and pac_script (run in a sandbox page) work without that; auto_detect still needs it.",
+    fix: "No action needed.",
+    shimmed: true,
+    unshimmed: "Firefox's proxy.settings takes a different config than Chrome's (proxyType/http/ssl/autoConfigUrl instead of mode/rules/pacScript), so Chrome-style configs are rejected, and it refuses any change unless the user lets the add-on run in private windows.",
   },
   // Matches the string and runtime.ContextType.OFFSCREEN_DOCUMENT alike; the shim
   // gives Firefox's ContextType the member it lacks.

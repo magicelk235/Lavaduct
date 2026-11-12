@@ -154,7 +154,7 @@ function pageWindow(origin) {
 }
 
 function world(source, globals) {
-  const sandbox = { console, setTimeout, clearTimeout, Promise, JSON, URL, CustomEvent, ...globals };
+  const sandbox = { console, setTimeout, clearTimeout, setInterval, clearInterval, Promise, JSON, URL, CustomEvent, ...globals };
   sandbox.self = sandbox;
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
