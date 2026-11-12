@@ -123,6 +123,10 @@ const PROMISE_ONLY_CALL_RE = /\.\s*(getBadgeTextColor|setBadgeTextColor|isEnable
 // storage.session.setAccessLevel: content scripts get the session area through
 // the background (the shim's installContentSession).
 const SESSION_ACCESS_RE = /\bsetAccessLevel\b/;
+// A cookie store id, which a bundle's Firefox branch passes to tabs.create and
+// the like; Firefox refuses even the default store from an add-on without the
+// cookies permission.
+const COOKIE_STORE_ID_RE = /\bcookieStoreId\b/;
 
 // A listener added with a last argument that can be false: a falsy literal,
 // which is what a Chrome build compiles `isFirefox && { … }` to, or an `&&`
@@ -189,13 +193,14 @@ interface Usage {
   browserAction: boolean;
   promiseOnlyCalls: string[];
   sessionAccess: boolean;
+  cookieStoreId: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false,
+    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
     promiseOnlyCalls: [], sessionAccess: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -238,6 +243,7 @@ function scanUsage(dir: string): Usage {
       }
       if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
       if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
+      if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
     }
   }
   return found;
@@ -307,6 +313,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     browserActionAlias: usage.browserAction,
     promiseOnlyCalls: usage.promiseOnlyCalls.sort(),
     sessionAccess: usage.sessionAccess,
+    defaultCookieStore: usage.cookieStoreId,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
