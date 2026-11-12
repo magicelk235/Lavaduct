@@ -23,7 +23,8 @@
 //   - window.chrome in content scripts, and json() bodies in their own realm;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
-//     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
+//     userScripts grant, Chrome's chrome.runtime in the USER_SCRIPT world, and
+//     relative import() in registered user-script code, against the add-on;
 //   - webpack chunks of a worker bundle, listed ahead of the worker;
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
 //     temporarily again and again;
@@ -2262,6 +2263,63 @@
     return copy;
   }
 
+  // Chrome gives each code entry of a registered user script a URL of its own
+  // inside the extension (chrome-extension://<id>/<random UUID>, in Chromium's
+  // content_script_utils.cc ParseFileSources), so `import('./api.js')` or
+  // `import('/api.js')` in it loads the extension's file. Firefox resolves the
+  // specifier against the page instead (Surfingkeys' snippets asked
+  // example.com for api.js). A string-literal relative or root-relative
+  // specifier in a registered code entry becomes the add-on's absolute URL,
+  // with the original kept beside it in a comment, so getScripts reports the
+  // code as it was registered. Files and non-literal specifiers stay as they
+  // are, and so does userScripts.execute, whose code Chrome gives no URL.
+  var IMPORT_SPECIFIER_RE = /(^|[^\w$.])(import\s*\(\s*)(["'`])((?:\.{1,2}\/|\/(?!\/))[^"'`\\\r\n]*)\3/g;
+  var RESOLVED_IMPORT_MARK = "/*lavaduct-import*/";
+  var RESOLVED_IMPORT_RE = /\/\*lavaduct-import\*\/"[^"\\]*"\/\*([\s\S]*?)\*\//g;
+
+  function extensionImportUrl(spec) {
+    var m = /^([^?#]*)([\s\S]*)$/.exec(spec);
+    var out = [];
+    var segments = m[1].split("/");
+    segments.forEach(function (seg, i) {
+      if (seg === "..") out.pop();
+      else if (seg !== "." && (seg !== "" || i === segments.length - 1)) out.push(seg);
+    });
+    return ORIGIN + "/" + out.join("/") + m[2];
+  }
+
+  function resolveCodeImports(code) {
+    if (typeof code !== "string" || !ORIGIN || code.indexOf("import") < 0) return code;
+    return code.replace(IMPORT_SPECIFIER_RE, function (all, before, call, quote, spec) {
+      if (spec.indexOf("*/") >= 0 || (quote === "`" && spec.indexOf("${") >= 0)) return all;
+      return before + call + RESOLVED_IMPORT_MARK + JSON.stringify(extensionImportUrl(spec)) + "/*" + quote + spec + quote + "*/";
+    });
+  }
+
+  function registeredCodeImports(code) {
+    return typeof code === "string" && code.indexOf(RESOLVED_IMPORT_MARK) >= 0 ? code.replace(RESOLVED_IMPORT_RE, "$1") : code;
+  }
+
+  // The script with fn applied to each of its code entries.
+  function mapScriptCode(script, fn) {
+    if (!script || typeof script !== "object" || !Array.isArray(script.js)) return script;
+    var changed = false;
+    var js = script.js.map(function (entry) {
+      if (!entry || typeof entry.code !== "string") return entry;
+      var code = fn(entry.code);
+      if (code === entry.code) return entry;
+      changed = true;
+      var c = {}; for (var k in entry) c[k] = entry[k]; c.code = code; return c;
+    });
+    if (!changed) return script;
+    var copy = {}; for (var key in script) copy[key] = script[key]; copy.js = js;
+    return copy;
+  }
+
+  function forRegistration(script) {
+    return withPrelude(mapScriptCode(script, resolveCodeImports));
+  }
+
   var wrappedUserScripts = typeof WeakSet === "function" ? new WeakSet() : null;
   function wrapUserScripts(ns) {
     var us;
@@ -2273,7 +2331,7 @@
       if (typeof orig !== "function") return;
       replaceMember(us, name, function (scripts) {
         var args = Array.prototype.slice.call(arguments);
-        if (Array.isArray(scripts)) args[0] = scripts.map(withPrelude);
+        if (Array.isArray(scripts)) args[0] = scripts.map(forRegistration);
         return orig.apply(us, args);
       });
     });
@@ -2285,8 +2343,9 @@
         return exec.apply(us, args);
       });
     }
-    // getScripts reports what was registered, without the prelude, to a
-    // callback too: Firefox would hand the callback its own list.
+    // getScripts reports what was registered, without the prelude or the
+    // resolved imports, to a callback too: Firefox would hand the callback its
+    // own list.
     var get = us.getScripts;
     if (typeof get === "function") {
       replaceMember(us, "getScripts", function () {
@@ -2296,9 +2355,9 @@
         var strip = function (list) {
           return Array.isArray(list) ? list.map(function (s) {
             if (s && Array.isArray(s.js) && s.js.length && s.js[0] && s.js[0].code === userScriptWorldPrelude()) {
-              var c = {}; for (var k in s) c[k] = s[k]; c.js = s.js.slice(1); return c;
+              var c = {}; for (var k in s) c[k] = s[k]; c.js = s.js.slice(1); s = c;
             }
-            return s;
+            return mapScriptCode(s, registeredCodeImports);
           }) : list;
         };
         p = p && typeof p.then === "function" ? p.then(strip) : p;
