@@ -393,6 +393,18 @@ function lacksSandboxCsp(m: Manifest): boolean {
   return typeof sandbox === "object" && sandbox !== null && typeof Reflect.get(sandbox, "content_security_policy") !== "string";
 }
 
+// Chrome's CSP for MV3 extension pages when the manifest sets none (Chromium's
+// kDefaultMV3CSP, with its enforced minimum's object-src 'self'). Firefox's own
+// default adds upgrade-insecure-requests, which sends every http:// request the
+// background and extension pages make to a host other than loopback as https://.
+const CHROME_EXTENSION_PAGES_CSP = "script-src 'self'; object-src 'self';";
+
+function lacksExtensionPagesCsp(m: Manifest): boolean {
+  if ((m.manifest_version ?? 2) < 3) return false;
+  const csp = m.content_security_policy;
+  return csp === undefined || (typeof csp === "object" && csp !== null && typeof csp.extension_pages !== "string");
+}
+
 /** Calls `fn` on every CSP string in the manifest and stores what it returns:
  * each string member of an MV3 content_security_policy (`where` is its key),
  * MV2's string policy ("content_security_policy") and MV2's sandbox policy
@@ -716,6 +728,16 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string; shim?: 
       message: `CSP script-src allows remote origin(s) (${[...remoteSrc].join(", ")}); Firefox refuses remote scripts in Manifest V3, and AMO's policies forbid loading remote code.`,
       file: "manifest.json",
       fix: "Bundle the script into the extension and load it locally.",
+    });
+  }
+
+  if (lacksExtensionPagesCsp(m)) {
+    issues.push({
+      severity: "info",
+      category: "manifest",
+      message: "Without a content_security_policy.extension_pages, Firefox gives MV3 extension pages a CSP with upgrade-insecure-requests, so the background's and pages' http:// requests to other hosts than this machine go out as https://; Chrome's default, which upgrades nothing, is written into the manifest.",
+      file: "manifest.json",
+      autoFixed: true,
     });
   }
 
@@ -1207,6 +1229,11 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     } else {
       out.sandbox = Object.assign({}, out.sandbox, { content_security_policy: CHROME_SANDBOX_CSP });
     }
+  }
+
+  if (lacksExtensionPagesCsp(out)) {
+    const csp = out.content_security_policy;
+    out.content_security_policy = { ...(typeof csp === "object" && csp !== null ? csp : {}), extension_pages: CHROME_EXTENSION_PAGES_CSP };
   }
 
   mapManifestCsps(out, withWildcardHostPorts);
