@@ -13,19 +13,20 @@
 //     extension's pages, and `clients`, `registration` and the `message` event
 //     in the background, over window.postMessage;
 //   - chrome://newtab URLs, which tabs.create and windows.create refuse;
-//   - the add-on's Chrome origin on requests to its own backends;
+//   - the add-on's Chrome origin on its own requests;
 //   - Chrome's enum objects that Firefox's declarativeNetRequest, identity and
 //     storage lack;
 //   - declarativeNetRequest rules added at runtime that Firefox would refuse;
 //   - OFFSCREEN_DOCUMENT in runtime.getContexts, for the offscreen emulation;
 //   - storage.session.setAccessLevel, which code waits on;
-//   - window.chrome in content scripts;
+//   - window.chrome in content scripts, and json() bodies in their own realm;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
 //     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
 //   - webpack chunks of a worker bundle, listed ahead of the worker;
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
-//     temporarily again and again.
+//     temporarily again and again;
+//   - the "browser_action" menu context, which Firefox refuses from MV3.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -1655,19 +1656,22 @@
     });
   }
 
-  // ── The add-on's origin at its own backends ────────────────────────────────
-  // Chrome sends an extension's requests with its chrome-extension://<id> origin,
-  // and some backends allow the extension by that name: a WebSocket handshake
-  // with Firefox's moz-extension://<random uuid> origin is refused outright.
-  // For the hosts the add-on's own content security policy lets it connect to,
-  // a session rule gives its requests (and only its: the initiator is this
-  // add-on) the Chrome origin they have in Chrome.
+  // ── The add-on's Chrome origin on its own requests ─────────────────────────
+  // Chrome sends every request an extension's own pages make with its
+  // chrome-extension://<id> origin, and some backends allow the extension by
+  // that name only: Firefox's moz-extension://<random uuid> origin gets a
+  // WebSocket handshake refused, or a 403 "Not allowed by CORS". A session rule
+  // gives the add-on's own requests (the initiator is this add-on, never a tab
+  // or a content script) the Chrome origin they have in Chrome. Firefox applies
+  // a modifyHeaders rule only to requests the add-on has host access to, and
+  // those are the ones Firefox exempts from CORS, so the origin a server
+  // reflects back never has to match. Requests to other hosts keep Firefox's
+  // origin, and its CORS check passes as before.
   var BACKEND_ORIGIN_RULE_ID = 2147480001;
 
   function installBackendOrigin() {
-    var hosts = Array.isArray(CONFIG.backendHosts) ? CONFIG.backendHosts : [];
     var dnr = api.declarativeNetRequest;
-    if (!isBackground || !hosts.length || !CONFIG.extensionId || !dnr || typeof dnr.updateSessionRules !== "function") return;
+    if (!isBackground || !CONFIG.extensionId || !dnr || typeof dnr.updateSessionRules !== "function") return;
     var rule = {
       id: BACKEND_ORIGIN_RULE_ID,
       priority: 1,
@@ -1675,7 +1679,7 @@
         type: "modifyHeaders",
         requestHeaders: [{ header: "origin", operation: "set", value: "chrome-extension://" + String(CONFIG.extensionId).toLowerCase() }],
       },
-      condition: { requestDomains: hosts, initiatorDomains: [loc.host], resourceTypes: ["websocket", "xmlhttprequest", "other"] },
+      condition: { initiatorDomains: [loc.host], resourceTypes: ["websocket", "xmlhttprequest", "other"] },
     };
     Promise.resolve(dnr.updateSessionRules({ removeRuleIds: [BACKEND_ORIGIN_RULE_ID], addRules: [rule] })).catch(function (e) {
       dbg("backend origin rule failed:", errorMessage(e));
@@ -1972,6 +1976,30 @@
     var ns = api;
     try { if (typeof chrome === "object" && chrome) ns = chrome; } catch (e) {}
     defineMissing(window, "chrome", ns);
+  }
+
+  // ── json() bodies in content scripts ────────────────────────────────────────
+  // A content script's Response and Request are the page's, seen through an
+  // Xray, so json() builds its objects in the page's realm: their prototype is
+  // the page's Object.prototype and arrays fail `instanceof Array`. Chrome's
+  // isolated world gets objects of its own, and code that keeps only objects
+  // whose prototype is Object.prototype drops the rest. json() reads the body
+  // as text and parses it here instead, which is what it does in either
+  // browser: UTF-8, the same SyntaxError, the same TypeError for a body already
+  // read. The method lives on the Xray, so the page never sees it. Only emitted
+  // for a bundle that calls json().
+  function installContentBodyJson() {
+    if (!CONFIG.contentBodyJson || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    ["Response", "Request"].forEach(function (name) {
+      var proto = null;
+      try { proto = G[name] && G[name].prototype; } catch (e) {}
+      if (!proto || typeof proto.json !== "function" || typeof proto.text !== "function") return;
+      var text = proto.text;
+      replaceMember(proto, "json", function json() {
+        var body = this;
+        return new Promise(function (resolve) { resolve(text.call(body)); }).then(function (t) { return JSON.parse(t); });
+      });
+    });
   }
 
   // ── webpack chunks of a worker bundle ──────────────────────────────────────
@@ -2283,6 +2311,50 @@
         wrapSend(ns, tabs, "sendMessage");
         wrapConnect(tabs, "connect");
       }
+    });
+  }
+
+  // ── the "browser_action" menu context in MV3 ────────────────────────────────
+  // Chrome's contextMenus takes "browser_action" from an MV3 extension and
+  // keeps the item for its other contexts. Firefox's menus schema offers it to
+  // MV2 only, so create() and update() throw a TypeError and the whole item is
+  // lost, page and selection contexts included. MV3 calls the toolbar button's
+  // menu "action"; code that still says browser_action means that menu, as a
+  // user-agent sniff that takes a Firefox branch written for MV2 does. The
+  // name is changed for the call, never in the add-on's object. Chrome itself
+  // shows such an item on no toolbar menu in MV3, so Firefox shows one Chrome
+  // doesn't when the code meant it for Chrome too. "page_action" is left as it
+  // is: Firefox's MV3 still has page actions. Only emitted for a bundle that
+  // names browser_action.
+  function installMenuActionContext() {
+    if (!CONFIG.menuActionContext) return;
+    var version = 0;
+    try { version = api.runtime.getManifest().manifest_version; } catch (e) {}
+    if (version !== 3) return;
+    function firefoxContexts(props) {
+      if (!props || typeof props !== "object" || !Array.isArray(props.contexts) || props.contexts.indexOf("browser_action") < 0) return props;
+      var contexts = [];
+      props.contexts.forEach(function (c) {
+        var name = c === "browser_action" ? "action" : c;
+        if (contexts.indexOf(name) < 0) contexts.push(name);
+      });
+      return Object.assign({}, props, { contexts: contexts });
+    }
+    namespaces.forEach(function (ns) {
+      ["menus", "contextMenus"].forEach(function (area) {
+        var menus = null;
+        try { menus = ns[area]; } catch (e) {}
+        if (!menus || typeof menus !== "object") return;
+        [["create", 0], ["update", 1]].forEach(function (m) {
+          var native = menus[m[0]];
+          if (typeof native !== "function") return;
+          replaceMember(menus, m[0], function () {
+            var args = Array.prototype.slice.call(arguments);
+            args[m[1]] = firefoxContexts(args[m[1]]);
+            return native.apply(menus, args);
+          });
+        });
+      });
     });
   }
 
@@ -2786,12 +2858,14 @@
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
+  try { installMenuActionContext(); } catch (e) { dbg("menu action context shim failed:", errorMessage(e)); }
   try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }

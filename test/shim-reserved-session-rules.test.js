@@ -35,7 +35,7 @@ function background(config) {
 const CLEAR_ALL = "(async () => { const r = await chrome.declarativeNetRequest.getSessionRules(); globalThis.seen = r.map((x) => x.id); await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [...seen, 2147480120], addRules: [{ id: 1, priority: 1, action: { type: 'block' }, condition: { urlFilter: 'ads' } }] }); })()";
 
 test("the add-on neither sees nor removes lavaduct's own session rules", async () => {
-  const { ctx, dnr } = background({ extensionId: CHROME_ID, backendHosts: ["api.example.com"] });
+  const { ctx, dnr } = background({ extensionId: CHROME_ID });
   await tick();
   dnr.rules.set(2147480120, { id: 2147480120 }); // a frame grant's rule
   dnr.rules.set(7, { id: 7 });

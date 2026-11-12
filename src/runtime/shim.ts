@@ -36,8 +36,6 @@ export interface ShimConfig {
   serviceWorker?: boolean;
   /** That worker's script, root-relative: the Chrome manifest's background.service_worker. */
   serviceWorkerScript?: string;
-  /** Hosts whose requests from the add-on carry its Chrome origin (see backendHosts). */
-  backendHosts?: string[];
   /** The worker's webpack chunk-loading global, when its chunks load ahead of it (see wireBackground). */
   webpackChunkGlobal?: string;
   /** The Chrome manifest asks for userScripts, which Firefox only grants at runtime. */
@@ -89,6 +87,10 @@ const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
 const SW_MANIFEST_REF_RE = /\bservice_worker\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
+// The MV2 menu context, which Firefox refuses from an MV3 add-on.
+const BROWSER_ACTION_CONTEXT_RE = /["'`]browser_action["'`]/;
+// A body read as JSON, whose objects a Firefox content script gets from the page's realm.
+const BODY_JSON_RE = /\.\s*json\s*\(\s*\)/;
 // The storage areas whose set the clone fallback wraps.
 const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
@@ -153,6 +155,8 @@ interface Usage {
   locks: boolean;
   permissions: boolean;
   extraHeaders: boolean;
+  browserActionContext: boolean;
+  bodyJson: boolean;
   storage: boolean;
   messaging: boolean;
   injectsFiles: boolean;
@@ -164,7 +168,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false,
+    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -189,6 +193,8 @@ function scanUsage(dir: string): Usage {
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
+      if (!found.browserActionContext) found.browserActionContext = BROWSER_ACTION_CONTEXT_RE.test(src);
+      if (!found.bodyJson) found.bodyJson = BODY_JSON_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
       if (!found.injectsFiles) found.injectsFiles = INJECTS_FILES_RE.test(src);
@@ -244,14 +250,15 @@ function shimSource(dir: string, config: ShimConfig): string {
     serviceWorkerSelf: config.serviceWorker === true && (usage.serviceWorkerState || (usage.serviceWorkerRegistration && !usage.pushManager)),
     serviceWorkerLocks: config.serviceWorker === true && usage.locks,
     serviceWorkerManifest: config.serviceWorker === true && usage.serviceWorkerManifest,
-    backendHosts: config.extensionId ? config.backendHosts ?? [] : [],
     // lavaduct adds session rules of its own: the backend Origin rule, and the
     // frame grants' rules.
-    reservedSessionRules: (!!config.extensionId && (config.backendHosts ?? []).length > 0) || config.frameGrants === true,
+    reservedSessionRules: !!config.extensionId || config.frameGrants === true,
     userScriptEvents: config.userScripts === true,
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
     extraHeaders: usage.extraHeaders,
+    menuActionContext: usage.browserActionContext,
+    contentBodyJson: usage.bodyJson,
     storageClone: usage.storage,
     messageJson: usage.messaging,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
@@ -288,28 +295,6 @@ export function usesDebugger(dir: string, manifest: Manifest): boolean {
     }
   }
   return false;
-}
-
-/**
- * The hosts an extension's pages may talk to by its own content security policy
- * (extension_pages connect-src): its backends. Chrome sends them the extension's
- * chrome-extension://<id> origin, which some allow by name; Firefox would send a
- * moz-extension:// origin with a random per-install host. Wildcard hosts give
- * their domain, which covers every subdomain.
- */
-export function backendHosts(manifest: Manifest): string[] {
-  const cspObj = manifest.content_security_policy;
-  const csp = typeof cspObj === "string" ? cspObj : typeof cspObj?.extension_pages === "string" ? cspObj.extension_pages : "";
-  const hosts = new Set<string>();
-  for (const directive of csp.split(";")) {
-    const [name, ...sources] = directive.trim().split(/\s+/);
-    if (name?.toLowerCase() !== "connect-src") continue;
-    for (const source of sources) {
-      const host = /^(?:(?:https?|wss?):\/\/)?(?:\*\.)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(?::\d+)?(?:\/.*)?$/i.exec(source)?.[1];
-      if (host) hosts.add(host.toLowerCase());
-    }
-  }
-  return [...hosts].sort();
 }
 
 /**

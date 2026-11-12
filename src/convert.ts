@@ -22,7 +22,6 @@ import { applyDnr, GUARANTEED_MINIMUM_STATIC_RULES, STATIC_RULES_PREF, CHROME_ST
 import { scanExtension } from "./analyze/analyze.js";
 import { countBlocking, printIssues, summarizeManifestChanges, writeReportFile, type ReportMeta } from "./analyze/report.js";
 import {
-  backendHosts,
   derivePanelPage,
   derivePanelWindowQuery,
   injectShimIntoHtmlPages,
@@ -229,7 +228,6 @@ function buildAddon(
       debuggerEmulation,
       serviceWorker: typeof bg?.service_worker === "string" && !Array.isArray(bg.scripts) && !bg.page,
       serviceWorkerScript: typeof bg?.service_worker === "string" ? bg.service_worker : "",
-      backendHosts: backendHosts(manifest),
       userScripts: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].includes("userScripts"),
       webpackChunkGlobal: workerChunkGlobal(stageDir, manifest),
       declaredPermissions: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].filter((p): p is string => typeof p === "string"),
