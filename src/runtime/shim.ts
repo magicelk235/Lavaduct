@@ -97,6 +97,7 @@ const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onC
 // Content scripts injected at runtime from files (scripting.executeScript,
 // registerContentScripts and updateContentScripts, MV2 tabs.executeScript).
 const INJECTS_FILES_RE = /\b(?:executeScript|registerContentScripts|updateContentScripts)\b/;
+const DECLARATIVE_CONTENT_RE = /\bdeclarativeContent\b/;
 // A worker's own localStorage or sessionStorage, which it doesn't have:
 // `self.localStorage = polyfill`. The event page's are getter-only.
 const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
@@ -156,6 +157,7 @@ interface Usage {
   storage: boolean;
   messaging: boolean;
   injectsFiles: boolean;
+  declarativeContent: boolean;
   storageGlobalsAssigned: string[];
   falsyListenerArg: boolean;
 }
@@ -164,7 +166,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false,
+    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -192,6 +194,7 @@ function scanUsage(dir: string): Usage {
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
       if (!found.injectsFiles) found.injectsFiles = INJECTS_FILES_RE.test(src);
+      if (!found.declarativeContent) found.declarativeContent = DECLARATIVE_CONTENT_RE.test(src);
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
       }
@@ -235,6 +238,8 @@ function shimSource(dir: string, config: ShimConfig): string {
     shortcutsPage: usage.shortcutsPage,
     externalIds: Array.isArray(config.externalIds) ? config.externalIds.filter((id) => typeof id === "string") : null,
     injectShim: usage.injectsFiles ? SHIM_FILENAME : "",
+    // Chrome defines declarativeContent only with the permission.
+    declarativeContent: usage.declarativeContent && (config.declaredPermissions ?? []).includes("declarativeContent"),
     serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
     serviceWorkerScript: config.serviceWorker === true ? (config.serviceWorkerScript ?? "").replace(/^(?:\.?\/)+/, "") : "",
     serviceWorkerClients: config.serviceWorker === true && usage.serviceWorkerClients,
