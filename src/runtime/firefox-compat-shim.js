@@ -18,7 +18,8 @@
 //     storage lack;
 //   - declarativeNetRequest rules added at runtime that Firefox would refuse;
 //   - OFFSCREEN_DOCUMENT in runtime.getContexts, for the offscreen emulation;
-//   - storage.session.setAccessLevel, which code waits on;
+//   - storage.session.setAccessLevel, which code waits on, and the session
+//     area in content scripts once the background opens it to them;
 //   - window.chrome in content scripts;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
@@ -1858,24 +1859,167 @@
     });
   }
 
-  // ── storage.session.setAccessLevel ──────────────────────────────────────────
+  // ── storage.session.setAccessLevel, and the area where Firefox has none ─────
   // Firefox's session area has no setAccessLevel and is never open to content
   // scripts. Code waiting on the call's callback would wait forever, so the call
-  // settles here. Content scripts still get no storage.session, which Chrome code
-  // has to handle anyway where the access level was never raised.
+  // settles here (Grammarly's background hangs without it).
+  //
+  // Code that finds setAccessLevel, though, keeps in the session area what its
+  // content scripts read once it opens the area to them with
+  // TRUSTED_AND_UNTRUSTED_CONTEXTS: Vimium's key mappings. Firefox gives no
+  // session area to the add-on's own pages either when they are framed in a web
+  // page (Vimium's Vomnibar and HUD), which Chrome treats as trusted. So for an
+  // add-on whose code calls setAccessLevel (CONFIG.sessionAccess), a content
+  // script or page without storage.session gets Chrome's as a stand-in whose
+  // calls the background answers over an internal message, and its changes as
+  // storage.session.onChanged and storage.onChanged with areaName "session".
+  // As in Chrome, content scripts are refused until the background raises the
+  // access level, which it does at each start (the level lives in the
+  // background's memory, Chrome's for the browser session); the add-on's pages
+  // never are.
   var ACCESS_LEVELS = ["TRUSTED_AND_UNTRUSTED_CONTEXTS", "TRUSTED_CONTEXTS"];
+  var SESSION_MSG_KEY = "__lavaductSessionArea";
+  var SESSION_OPS = ["get", "getKeys", "getBytesInUse", "set", "remove", "clear"];
+  var SESSION_DENIED = "Access to storage is not allowed from this context.";
+  var sessionLevel = "TRUSTED_CONTEXTS";
+
+  function invalidAccessLevel(level) {
+    return ACCESS_LEVELS.indexOf(level) >= 0 ? null : new Error("Invalid access level: " + level);
+  }
 
   function installSessionAccessLevel() {
+    var backfilled = false;
     namespaces.forEach(function (ns) {
       var session = null;
       try { session = ns.storage && ns.storage.session; } catch (e) {}
       if (!session) return;
-      defineMissing(session, "setAccessLevel", function (details, cb) {
+      if (defineMissing(session, "setAccessLevel", function (details, cb) {
         var level = details && details.accessLevel;
-        var p = ACCESS_LEVELS.indexOf(level) >= 0 ? Promise.resolve() : Promise.reject(new Error("Invalid access level: " + level));
-        return respond(ns, p, cb);
+        var err = invalidAccessLevel(level);
+        if (!err && isBackground) sessionLevel = level;
+        return respond(ns, err ? Promise.reject(err) : Promise.resolve(), cb);
+      })) backfilled = true;
+    });
+    if (!CONFIG.sessionAccess) return;
+    if (isBackground) {
+      if (backfilled) answerSessionCalls();
+      return;
+    }
+    installSessionStandIn();
+  }
+
+  function answerSessionCalls() {
+    var area = api.storage.session;
+    hideInternalMessages(SESSION_MSG_KEY, function (message, sender) {
+      if (!message || message[SESSION_MSG_KEY] !== "call") return undefined;
+      var op = message.op;
+      var args = Array.isArray(message.args) ? message.args : [];
+      var trusted = !!sender && typeof sender.url === "string" && !!ORIGIN && sender.url.indexOf(ORIGIN + "/") === 0;
+      return new Promise(function (resolve) {
+        if (op === "setAccessLevel") {
+          if (!trusted) throw new Error(SESSION_DENIED);
+          var level = args[0] && args[0].accessLevel;
+          var err = invalidAccessLevel(level);
+          if (err) throw err;
+          sessionLevel = level;
+          return resolve(undefined);
+        }
+        if (!trusted && sessionLevel !== "TRUSTED_AND_UNTRUSTED_CONTEXTS") throw new Error(SESSION_DENIED);
+        if (SESSION_OPS.indexOf(op) < 0 || typeof area[op] !== "function") throw new Error("storage.session." + op + " is not available.");
+        resolve(area[op].apply(area, args));
+      }).then(function (value) {
+        return { value: value };
+      }, function (err) {
+        return { error: errorMessage(err) };
       });
     });
+    // The stand-ins hear the area's changes: the add-on's pages always, content
+    // scripts while the area is open to them.
+    var changed = null;
+    try { changed = area.onChanged || null; } catch (e) {}
+    var all = !changed;
+    if (all) try { changed = api.storage.onChanged; } catch (e) {}
+    if (!changed || typeof changed.addListener !== "function") return;
+    changed.addListener(function (changes, areaName) {
+      if (all && areaName !== "session") return;
+      function message(to) {
+        var m = {};
+        m[SESSION_MSG_KEY] = "changed";
+        m.to = to;
+        m.changes = changes;
+        return m;
+      }
+      try { Promise.resolve(api.runtime.sendMessage(message("pages"))).catch(noop); } catch (e) {}
+      if (sessionLevel !== "TRUSTED_AND_UNTRUSTED_CONTEXTS" || !api.tabs) return;
+      var toContent = message("content");
+      Promise.resolve(api.tabs.query({})).then(function (tabs) {
+        (tabs || []).forEach(function (tab) {
+          try { Promise.resolve(api.tabs.sendMessage(tab.id, toContent)).catch(noop); } catch (e) {}
+        });
+      }).catch(noop);
+    });
+  }
+
+  function installSessionStandIn() {
+    var sessionEvent = makeEvent();
+    // storage.onChanged listeners, for the changes Firefox never tells this
+    // context about; the event itself stays Firefox's.
+    var storageListeners = [];
+    var defined = false;
+    namespaces.forEach(function (ns) {
+      var storage = null;
+      try { storage = ns.storage; } catch (e) {}
+      if (!storage) return;
+      function call(op, args) {
+        var message = {};
+        message[SESSION_MSG_KEY] = "call";
+        message.op = op;
+        message.args = args;
+        return Promise.resolve().then(function () { return api.runtime.sendMessage(message); }).then(function (reply) {
+          if (!reply || typeof reply !== "object") throw new Error(SESSION_DENIED);
+          if (reply.error) throw new Error(reply.error);
+          return reply.value;
+        });
+      }
+      var area = {
+        QUOTA_BYTES: 10485760,
+        onChanged: sessionEvent.event,
+        setAccessLevel: function (details, cb) {
+          return respond(ns, isExtensionPage ? call("setAccessLevel", [details]) : Promise.reject(new Error(SESSION_DENIED)), cb);
+        },
+      };
+      SESSION_OPS.forEach(function (op) {
+        area[op] = function () {
+          var args = Array.prototype.slice.call(arguments);
+          var cb = args.length && typeof args[args.length - 1] === "function" ? args.pop() : null;
+          return respond(ns, call(op, args), cb);
+        };
+      });
+      if (!defineMissing(storage, "session", area)) return;
+      defined = true;
+      var ev = null;
+      try { ev = storage.onChanged; } catch (e) {}
+      if (!ev || typeof ev.addListener !== "function") return;
+      var add = ev.addListener, remove = ev.removeListener;
+      replaceMember(ev, "addListener", function (fn) {
+        if (typeof fn === "function" && storageListeners.indexOf(fn) < 0) storageListeners.push(fn);
+        return add.apply(ev, arguments);
+      });
+      if (typeof remove === "function") {
+        replaceMember(ev, "removeListener", function (fn) {
+          var i = storageListeners.indexOf(fn);
+          if (i >= 0) storageListeners.splice(i, 1);
+          return remove.apply(ev, arguments);
+        });
+      }
+    });
+    var audience = isExtensionPage ? "pages" : "content";
+    hideInternalMessages(SESSION_MSG_KEY, defined ? function (message) {
+      if (!message || message[SESSION_MSG_KEY] !== "changed" || message.to !== audience || !message.changes) return undefined;
+      sessionEvent.dispatch(message.changes);
+      storageListeners.slice().forEach(function (fn) { invoke(fn, [message.changes, "session"]); });
+      return undefined;
+    } : null);
   }
 
   // ── window.chrome in content scripts ────────────────────────────────────────

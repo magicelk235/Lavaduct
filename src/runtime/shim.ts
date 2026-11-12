@@ -87,6 +87,9 @@ const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|ses
 // Methods Firefox only promises and Chrome calls back from (the shim's
 // PROMISE_ONLY, userScripts aside), by name.
 const PROMISE_ONLY_CALL_RE = /\.\s*(getBadgeTextColor|setBadgeTextColor|isEnabled|openPopup|setPopup|discard|ungroup)\b/g;
+// storage.session.setAccessLevel: content scripts get the session area through
+// the background (the shim's installContentSession).
+const SESSION_ACCESS_RE = /\bsetAccessLevel\b/;
 
 interface Usage {
   favicon: boolean;
@@ -105,13 +108,14 @@ interface Usage {
   messaging: boolean;
   storageGlobalsAssigned: string[];
   promiseOnlyCalls: string[];
+  sessionAccess: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], promiseOnlyCalls: [],
+    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], promiseOnlyCalls: [], sessionAccess: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -136,6 +140,7 @@ function scanUsage(dir: string): Usage {
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
+      if (!found.sessionAccess) found.sessionAccess = SESSION_ACCESS_RE.test(src);
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
       }
@@ -188,6 +193,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     messageJson: usage.messaging,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     promiseOnlyCalls: usage.promiseOnlyCalls.sort(),
+    sessionAccess: usage.sessionAccess,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
