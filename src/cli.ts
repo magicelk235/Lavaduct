@@ -15,7 +15,7 @@ import { isAmoAddonId } from "./sign/addon-id.js";
 import { checkAmoCredentials, removeSignedCache } from "./sign/amo.js";
 import { resolveAmoCredentials } from "./sign/credentials.js";
 import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firefox/locate.js";
-import { listProfiles, profileInUse, profilesFor, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
+import { listProfiles, profileDowngradeProblem, profileInUse, profilesFor, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
 import { readInstalledAddons } from "./firefox/extensions-json.js";
 import { recordedInstalls, removeInstallRecord } from "./firefox/install.js";
 import { unregisterNativeHosts } from "./firefox/native-hosts.js";
@@ -478,6 +478,12 @@ async function uninstallAddon(query: string, profileSelector: string | undefined
     return 1;
   }
   if (addon.installed) {
+    // --uninstall starts a Firefox on the profile, which one a newer Firefox ran refuses.
+    const downgrade = profileDowngradeProblem(install, profile.path);
+    if (downgrade) {
+      fail(downgrade);
+      return 1;
+    }
     const wasOpen = profileInUse(profile.path);
     if (wasOpen) {
       if (!restart) {

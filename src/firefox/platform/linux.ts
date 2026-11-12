@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { which } from "../../util.js";
 import type { InstallCandidate, Platform, Sandbox } from "./index.js";
-import { symlinkLockHolder } from "./shared.js";
+import { processAgeMs, symlinkLockHolder } from "./shared.js";
 
 const PATH_NAMES = ["firefox", "firefox-esr", "firefox-developer-edition", "firefox-nightly"];
 
@@ -252,6 +252,8 @@ export const linux: Platform = {
   },
 
   quitMinAgeMs: 0,
+
+  processAgeMs,
 
   visibleLaunchArgs() {
     return [];
