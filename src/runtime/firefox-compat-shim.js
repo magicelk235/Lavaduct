@@ -2018,6 +2018,89 @@
     });
   }
 
+  // ── The default cookie store without the cookies permission ────────────────
+  // Firefox refuses any cookieStoreId from an add-on without the cookies
+  // permission, the default store's included: tabs.create, windows.create and
+  // downloads.download reject with "No permission for cookieStoreId:
+  // firefox-default" and open nothing. A bundle that also ships to Firefox picks
+  // its Firefox branch by user agent and passes a tab's saved store there (Tab
+  // Session Manager restored every session as empty windows); its own Firefox
+  // build declares cookies, the Chrome manifest doesn't. Leaving the default
+  // store out lands in the same store, so a refused call is made again without
+  // it, where that holds: not in a private window or download, where Firefox
+  // refuses the default store either way, and not with an opener tab or an
+  // adopted tab from another store, whose container leaving it out inherits.
+  // Other stores keep Firefox's refusal.
+  var DEFAULT_COOKIE_STORE = "firefox-default";
+
+  function installDefaultCookieStore() {
+    if (!CONFIG.defaultCookieStore) return;
+    try {
+      var perms = api.runtime.getManifest().permissions;
+      if (Array.isArray(perms) && perms.indexOf("cookies") >= 0) return;
+    } catch (e) {}
+    var refused = "No permission for cookieStoreId: " + DEFAULT_COOKIE_STORE;
+    function tabInDefault(id) {
+      return Promise.resolve(api.tabs.get(id)).then(function (tab) { return !!tab && tab.cookieStoreId === DEFAULT_COOKIE_STORE; });
+    }
+    function normalWindow(win) {
+      return !!win && win.incognito === false;
+    }
+    // Whether `props` without the store id opens in the default store too.
+    var sameWithout = {
+      "tabs.create": function (props) {
+        if (props.openerTabId != null) return tabInDefault(props.openerTabId);
+        if (props.windowId != null) return Promise.resolve(api.windows.get(props.windowId)).then(normalWindow);
+        // Firefox opens it in the top normal window, never a private one for an
+        // add-on kept out of private windows.
+        var ext = api.extension;
+        var allowed = ext && typeof ext.isAllowedIncognitoAccess === "function" ? ext.isAllowedIncognitoAccess() : true;
+        return Promise.resolve(allowed).then(function (yes) {
+          if (!yes) return true;
+          return Promise.resolve(api.windows.getLastFocused()).then(function (win) { return normalWindow(win) && win.type === "normal"; });
+        });
+      },
+      "windows.create": function (props) {
+        if (props.incognito === true) return false;
+        if (props.tabId != null) return tabInDefault(props.tabId);
+        return true;
+      },
+      "downloads.download": function (props) {
+        return props.incognito !== true;
+      },
+    };
+    var targets = Object.keys(sameWithout).map(function (key) {
+      var parts = key.split(".");
+      var area = null;
+      try { area = api[parts[0]]; } catch (e) {}
+      var fn = area && area[parts[1]];
+      return { key: key, area: parts[0], name: parts[1], self: area, call: typeof fn === "function" ? fn : null };
+    });
+    namespaces.forEach(function (ns) {
+      targets.forEach(function (t) {
+        if (!t.call) return;
+        var obj = null;
+        try { obj = ns[t.area]; } catch (e) {}
+        if (!obj || typeof obj[t.name] !== "function") return;
+        var original = obj[t.name];
+        replaceMember(obj, t.name, function withDefaultCookieStore(props) {
+          if (!props || typeof props !== "object" || props.cookieStoreId !== DEFAULT_COOKIE_STORE) return original.apply(obj, arguments);
+          var cb = typeof arguments[arguments.length - 1] === "function" ? arguments[arguments.length - 1] : null;
+          var p = Promise.resolve(t.call.call(t.self, props)).catch(function (err) {
+            if (errorMessage(err) !== refused) throw err;
+            return Promise.resolve().then(function () { return sameWithout[t.key](props); }).then(function (same) {
+              if (same !== true) throw err;
+              var rest = Object.assign({}, props);
+              delete rest.cookieStoreId;
+              return t.call.call(t.self, rest);
+            }, function () { throw err; });
+          });
+          return respond(ns, p, cb);
+        });
+      });
+    });
+  }
+
   // ── webpack chunks of a worker bundle ──────────────────────────────────────
   // A webpack service worker loads an async chunk with importScripts, which runs
   // it synchronously, so startup code can require the chunk a microtask later.
@@ -3537,6 +3620,7 @@
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
+  try { installDefaultCookieStore(); } catch (e) { dbg("default cookie store shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }

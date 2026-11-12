@@ -114,6 +114,10 @@ const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|ses
 // an MV3 bundle's Firefox branch does; not the name alone, which polyfill
 // metadata and message keys carry.
 const BROWSER_ACTION_MEMBER_RE = /\bbrowserAction\s*(?:\?\.|\.)\s*[A-Za-z_$]/;
+// A cookie store id, which a bundle's Firefox branch passes to tabs.create and
+// the like; Firefox refuses even the default store from an add-on without the
+// cookies permission.
+const COOKIE_STORE_ID_RE = /\bcookieStoreId\b/;
 
 // A listener added with a last argument that can be false: a falsy literal,
 // which is what a Chrome build compiles `isFirefox && { … }` to, or an `&&`
@@ -177,13 +181,14 @@ interface Usage {
   storageGlobalsAssigned: string[];
   falsyListenerArg: boolean;
   browserAction: boolean;
+  cookieStoreId: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false,
+    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -220,6 +225,7 @@ function scanUsage(dir: string): Usage {
       }
       if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
       if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
+      if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
     }
   }
   return found;
@@ -286,6 +292,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,
     browserActionAlias: usage.browserAction,
+    defaultCookieStore: usage.cookieStoreId,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
