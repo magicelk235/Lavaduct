@@ -5,10 +5,11 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { ConvertOptions, ConvertResult, Issue, Manifest, SignRoute } from "./types.js";
 import { ENV_PREFIX, NAME } from "./name.js";
 import { extractExtension } from "./input/extract.js";
-import { applySourceRewrites, matchManifestPathCase, normalizeLocaleCatalogs, removeUnreadableLocales, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
+import { applySourceRewrites, matchManifestPathCase, normalizeLocaleCatalogs, removeUnreadableLocales, rewriteHoistedBackgroundChecks, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import {
   analyzeManifest,
+  CHROME_SANDBOX_CSP,
   collectReferencedPaths,
   DEFAULT_MIN_FIREFOX,
   loadManifest,
@@ -22,22 +23,23 @@ import { applyDnr, GUARANTEED_MINIMUM_STATIC_RULES, STATIC_RULES_PREF, CHROME_ST
 import { scanExtension } from "./analyze/analyze.js";
 import { countBlocking, printIssues, summarizeManifestChanges, writeReportFile, type ReportMeta } from "./analyze/report.js";
 import {
-  backendHosts,
   derivePanelPage,
   derivePanelWindowQuery,
   injectShimIntoHtmlPages,
   usesDebugger,
+  usesProxySettings,
   wireBackground,
   workerChunkGlobal,
+  writePacSandbox,
   writeShim,
 } from "./runtime/shim.js";
-import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
+import { applyOAuthBridge, deriveChromeId, framedSites } from "./runtime/oauth-bridge.js";
 import { deriveAddonId } from "./sign/addon-id.js";
 import { filesTooLargeForAmo, signWithAmo } from "./sign/amo.js";
 import { zipDirectory } from "./zip/write.js";
 import { findFirefoxInstalls, selectFirefox, type FirefoxInstall } from "./firefox/locate.js";
-import { dedicatedProfile, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
-import { openXpiInFirefox, quitFirefoxForProfile } from "./firefox/launch.js";
+import { dedicatedProfile, profileDowngradeProblem, profileInUse, resolveProfile, type FirefoxProfile } from "./firefox/profiles.js";
+import { openXpiInFirefox, otherInstallHolding, quitFirefoxForProfile, startedBeforeUserJs } from "./firefox/launch.js";
 import { BidiSession } from "./firefox/bidi.js";
 import { RdpSession } from "./firefox/rdp.js";
 import {
@@ -206,7 +208,7 @@ function buildAddon(
   if (junk.length > 0) log.ok(`Left out ${junk.join(", ")}: no messages.json Chrome reads, so Chrome skips it, and Firefox would refuse the add-on`);
   const catalogs = normalizeLocaleCatalogs(stageDir);
   if (catalogs.length > 0) log.ok(`Rewrote ${catalogs.length} locale catalog(s) as plain JSON, which Firefox's reader needs: ${catalogs.join(", ")}`);
-  for (const r of applySourceRewrites(stageDir, manifest)) {
+  for (const r of applySourceRewrites(stageDir, manifest, src.chromeId)) {
     if (r.count > 0) log.ok(`${r.name} in ${r.count} file(s)`);
   }
 
@@ -229,10 +231,14 @@ function buildAddon(
       debuggerEmulation,
       serviceWorker: typeof bg?.service_worker === "string" && !Array.isArray(bg.scripts) && !bg.page,
       serviceWorkerScript: typeof bg?.service_worker === "string" ? bg.service_worker : "",
-      backendHosts: backendHosts(manifest),
       userScripts: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].includes("userScripts"),
       webpackChunkGlobal: workerChunkGlobal(stageDir, manifest),
       declaredPermissions: [...(manifest.permissions ?? []), ...(manifest.optional_permissions ?? [])].filter((p): p is string => typeof p === "string"),
+      newTabPage: typeof manifest.chrome_url_overrides?.newtab === "string" ? manifest.chrome_url_overrides.newtab : "",
+      externalIds: manifest.externally_connectable && typeof manifest.externally_connectable === "object"
+        ? (Array.isArray(manifest.externally_connectable.ids) ? manifest.externally_connectable.ids : [])
+        : undefined,
+      frameGrants: settings.oauthBridge !== false && !!src.chromeId && framedSites(stageDir, manifest).length > 0,
     });
     if (settings.debug) {
       log.ok(`Debug build: shim tracing on, kept in storage.local under ${DEBUG_LOG_KEY} (read it with ${NAME} --logs). Don't ship this build.`);
@@ -273,6 +279,11 @@ function buildAddon(
     );
   }
 
+  if (shimFile && usesProxySettings(stageDir)) {
+    writePacSandbox(stageDir, out, CHROME_SANDBOX_CSP);
+    log.ok("chrome.proxy.settings emulated on proxy.onRequest; PAC scripts run in a sandbox page");
+  }
+
   const dnr = applyDnr(stageDir, out);
   notes.push(...dnr.notes);
   if (settings.oauthBridge !== false) {
@@ -281,6 +292,10 @@ function buildAddon(
   const bg = wireBackground(stageDir, out, shimFile);
   if (bg.converted) {
     log.ok(`Service worker → background.scripts${bg.hoisted.length ? `, importScripts hoisted: ${bg.hoisted.join(", ")}` : ""}`);
+    const worker = manifest.background?.service_worker;
+    const loaded = (out.background?.scripts ?? []).filter((s): s is string => typeof s === "string" && s !== shimFile);
+    const checks = typeof worker === "string" ? rewriteHoistedBackgroundChecks(stageDir, worker, loaded) : 0;
+    if (checks > 0) log.ok(`Corrected the worker's background checks in ${checks} background script(s)`);
   }
   const icons = synthesizePlaceholderIcons(stageDir, out, src.name);
   if (icons.length > 0) log.ok(`Synthesized placeholder icons (${icons.join("/")}px); the manifest had none`);
@@ -393,6 +408,10 @@ function planRoute(opts: ConvertOptions, minFirefox: string): Plan {
   // The temporary route turns remote debugging on in a profile of its own, not the user's, unless told otherwise.
   const profile =
     route.route === "temporary" && opts.profile === undefined ? dedicatedProfile(install) : resolveProfile(opts.profile, install);
+  // A Firefox that has the profile open may take the add-on without a restart;
+  // the install routes check again before they start one.
+  const downgrade = profileInUse(profile.path) ? undefined : profileDowngradeProblem(install, profile.path);
+  if (downgrade) throw new Error(downgrade);
   return { route, target: { install, profile } };
 }
 
@@ -449,12 +468,24 @@ async function installTemporarily(
   if (opts.headless) return installHeadless({ install, profile }, stageDir, addonId, staticRules);
   // A Firefox that an earlier temporary install started still has its devtools
   // server: load this add-on next to the others rather than restart it,
-  // which would drop them.
+  // which would drop them. Unless it is another install than the one
+  // --firefox picks: then the add-on would land in a Firefox nobody asked for.
   let session = await RdpSession.attach(profile.path);
+  const other = session && opts.firefox !== undefined ? otherInstallHolding(install, profile.path) : undefined;
+  if (session && other) {
+    session.end();
+    session = undefined;
+    info(`${profile.path} is open in the Firefox at ${other}, not the one --firefox picks.`);
+  }
   if (session) {
     info(`Using the Firefox that already has ${profile.path} open with remote debugging on`);
     if (raiseRuleLimit(profile.path, staticRules)) warn(RULE_LIMIT_RESTART);
   } else {
+    const downgrade = profileDowngradeProblem(install, profile.path);
+    if (downgrade) {
+      fail(downgrade);
+      return "failed";
+    }
     if (profileInUse(profile.path)) {
       if (!opts.firefoxRestart) {
         fail(
@@ -524,21 +555,28 @@ async function installByPrompt(
 ): Promise<InstallOutcome> {
   if (route === "unsigned") {
     const running = profileInUse(profile.path);
-    if (allowUnsignedInProfile(profile.path).changed) {
-      ok(`Turned off signature checks in ${join(profile.path, "user.js")} (xpinstall.signatures.required = false)`);
-      if (running) {
-        if (!opts.firefoxRestart || !opts.launch) {
-          warn(
-            `Firefox has ${profile.path} open and reads that setting only when it starts. ` +
-              `Quit Firefox and start it again, then open ${xpi} in it to install the add-on.`,
-          );
-          return "skipped";
-        }
-        info("Restarting Firefox so the setting takes effect …");
-        if (!(await quitFirefoxForProfile(install, profile.path))) {
-          fail(`Couldn't quit the Firefox that has ${profile.path} open. Quit it yourself, then run this again.`);
-          return "failed";
-        }
+    const changed = allowUnsignedInProfile(profile.path).changed;
+    if (changed) ok(`Turned off signature checks in ${join(profile.path, "user.js")} (xpinstall.signatures.required = false)`);
+    // Also when the pref was already there but this Firefox started before it
+    // was written, e.g. by an earlier run under --no-firefox-restart or --no-launch.
+    if ((changed && running) || startedBeforeUserJs(install, profile.path)) {
+      if (!changed) info(`The Firefox that has ${profile.path} open started before signature checks were turned off in its user.js.`);
+      if (!opts.firefoxRestart || !opts.launch) {
+        warn(
+          `Firefox has ${profile.path} open and reads that setting only when it starts. ` +
+            `Quit Firefox and start it again, then open ${xpi} in it to install the add-on.`,
+        );
+        return "skipped";
+      }
+      const downgrade = profileDowngradeProblem(install, profile.path);
+      if (downgrade) {
+        fail(downgrade);
+        return "failed";
+      }
+      info("Restarting Firefox so the setting takes effect …");
+      if (!(await quitFirefoxForProfile(install, profile.path))) {
+        fail(`Couldn't quit the Firefox that has ${profile.path} open. Quit it yourself, then run this again.`);
+        return "failed";
       }
     }
   }

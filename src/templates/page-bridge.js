@@ -46,6 +46,9 @@
     try { d = JSON.parse(String(ev.detail)); } catch (e) { return; }
     var done = d && pending[d.reqId];
     if (!done) return;
+    // The relay has the request; from here it answers or reports the
+    // background gone, however long the extension takes.
+    if (d.ack === true) { clearTimeout(done.timer); return; }
     delete pending[d.reqId];
     done(d.response, d.error);
   });
@@ -70,8 +73,7 @@
         reject(new Error("Message could not be serialized: " + ((e && e.message) || e)));
         return;
       }
-      // The relay answers within its own timeout; this one only matters if the
-      // relay never got the request.
+      // Only for a request no relay picked up: the relay acknowledges at once.
       var timer = setTimeout(function () {
         if (pending[reqId]) {
           delete pending[reqId];
@@ -83,6 +85,7 @@
         if (error) reject(new Error(error));
         else resolve(response);
       };
+      pending[reqId].timer = timer;
       DBG("[page-bridge] page -> extension", reqId);
       window.dispatchEvent(new CustomEvent(REQUEST_EVENT, { detail: detail }));
     });

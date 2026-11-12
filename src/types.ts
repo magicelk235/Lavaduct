@@ -77,7 +77,7 @@ export interface Manifest {
   devtools_page?: string;
   options_page?: string;
   options_ui?: { page?: string; open_in_tab?: boolean };
-  sandbox?: { pages?: string[] };
+  sandbox?: { pages?: string[]; content_security_policy?: string };
   [key: string]: unknown;
 }
 

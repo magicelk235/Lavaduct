@@ -90,12 +90,21 @@
   // Chrome's contract: a listener answers through sendResponse, keeps the channel
   // open by returning true, or returns a promise. If none will answer, the page
   // gets undefined right away instead of waiting out its timeout.
-  function dispatch(payload, sender) {
+  //
+  // Firefox suspends an event page that has made no extension API call for 30
+  // seconds, the relay's open port notwithstanding (measured on Firefox 160),
+  // and the port closes with it. Chrome keeps the channel for as long as a
+  // listener holds the answer, so while one does, an API call every 20 seconds
+  // keeps the page awake.
+  // The page's port closing (the tab went away) ends the keep-awake too.
+  function dispatch(payload, sender, port) {
     return new Promise(function (resolve) {
       var settled = false;
+      var awake = null;
       var sendResponse = function (value) {
         if (settled) return;
         settled = true;
+        clearInterval(awake);
         resolve(value);
       };
       var willRespond = false;
@@ -115,6 +124,12 @@
         }
       });
       if (!willRespond) sendResponse(undefined);
+      else if (!settled) {
+        awake = setInterval(function () {
+          try { Promise.resolve(api.runtime.getPlatformInfo()).catch(function () {}); } catch (e) {}
+        }, 20000);
+        try { port.onDisconnect.addListener(function () { clearInterval(awake); }); } catch (e) {}
+      }
     });
   }
 
@@ -124,7 +139,7 @@
     port.onMessage.addListener(function (m) {
       if (!m || m.__pageBridgeRequest !== true) return;
       DBG("[page-bridge] page message from", sender.origin, "listeners:", listeners.length);
-      dispatch(m.payload, sender).then(function (response) {
+      dispatch(m.payload, sender, port).then(function (response) {
         // Chrome sends the answer to a web page as JSON: functions and undefined
         // members drop out and toJSON applies. Firefox's structured clone throws
         // on a function instead, and the page would wait out its timeout.
