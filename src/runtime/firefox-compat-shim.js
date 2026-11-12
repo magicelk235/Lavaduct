@@ -23,6 +23,8 @@
 //   - window.chrome in content scripts, and json() bodies in their own realm;
 //   - CustomEvent details a content script hands the page, which Chrome clones
 //     for the page's world;
+//   - selectors holding runtime.id unquoted, which a Chrome ID parses in and
+//     Firefox's gecko ID doesn't;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
 //     userScripts grant, Chrome's chrome.runtime in the USER_SCRIPT world, and
@@ -2193,6 +2195,66 @@
     defineMissing(window, "chrome", ns);
   }
 
+  // ── The add-on's ID in a CSS selector ──────────────────────────────────────
+  // A Chrome ID is 32 letters from a to p, a CSS identifier, so code written for
+  // Chrome puts chrome.runtime.id in selectors unquoted: Hypothesis's boot script
+  // looks for `script.js-hypothesis-config[data-extension-id=<id>]`. Firefox's
+  // runtime.id is the gecko ID (`<chromeId>.<salt>@lavaduct` for a converted
+  // add-on), whose `.` and `@` make such a selector throw a SyntaxError; the
+  // boot script died before injecting the sidebar. When querySelector,
+  // querySelectorAll, matches, closest or webkitMatchesSelector throws one over
+  // a selector holding the ID unquoted, the call is retried with the ID as a
+  // CSS string where it is an attribute value, and escaped after `#` or `.`.
+  // A selector that parses never reaches the retry. In a content script the
+  // methods are defined on its Xrays of the prototypes, which the page never
+  // sees. Emitted for an add-on whose code reads runtime.id and queries
+  // selectors.
+  function installOwnIdSelectors() {
+    if (!CONFIG.ownIdSelectors || typeof window !== "object" || !window) return;
+    var id = "";
+    try { id = String(api.runtime.id || ""); } catch (e) {}
+    if (!id || /^-?[A-Za-z_][\w-]*$/.test(id)) return;
+    var literal = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    var asValue = new RegExp("([~|^$*]?=\\s*)" + literal + "(?=\\s*(?:[iIsS]\\s*)?\\])", "g");
+    var asName = new RegExp("([#.])" + literal + "(?![\\w\\u00A0-\\uFFFF-])", "g");
+    var quoted = '"' + id.replace(/["\\]/g, "\\$&") + '"';
+    var escaped = id.replace(/[^\w\u00A0-\uFFFF-]/g, "\\$&").replace(/^(-?)(\d)/, "$1\\3$2 ");
+    function rewrite(selectors) {
+      return selectors
+        .replace(asValue, function (m, op) { return op + quoted; })
+        .replace(asName, function (m, mark) { return mark + escaped; });
+    }
+    function wrap(proto, name) {
+      var native = null;
+      try { native = proto && proto[name]; } catch (e) {}
+      if (typeof native !== "function") return;
+      var wrapped = function (selectors) {
+        try {
+          return native.apply(this, arguments);
+        } catch (e) {
+          var kind = null;
+          try { kind = e && e.name; } catch (x) {}
+          var fixed = kind === "SyntaxError" && typeof selectors === "string" ? rewrite(selectors) : selectors;
+          if (fixed === selectors) throw e;
+          var args = Array.prototype.slice.call(arguments);
+          args[0] = fixed;
+          try { return native.apply(this, args); } catch (x) { throw e; }
+        }
+      };
+      try { Object.defineProperty(wrapped, "name", { value: name, configurable: true }); } catch (e) {}
+      replaceMember(proto, name, wrapped);
+    }
+    [
+      ["Document", ["querySelector", "querySelectorAll"]],
+      ["DocumentFragment", ["querySelector", "querySelectorAll"]],
+      ["Element", ["querySelector", "querySelectorAll", "matches", "closest", "webkitMatchesSelector"]],
+    ].forEach(function (entry) {
+      var proto = null;
+      try { proto = window[entry[0]] && window[entry[0]].prototype; } catch (e) {}
+      if (proto) entry[1].forEach(function (name) { wrap(proto, name); });
+    });
+  }
+
   // ── CustomEvent detail between a content script and the page ───────────────
   // Chrome structured-clones a CustomEvent's detail for a listener in another
   // world, so an isolated content script hands the page (a world: "MAIN" script
@@ -3990,6 +4052,7 @@
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installOwnIdSelectors(); } catch (e) { dbg("own ID selector shim failed:", errorMessage(e)); }
   try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
