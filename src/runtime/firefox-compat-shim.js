@@ -20,6 +20,8 @@
 //   - OFFSCREEN_DOCUMENT in runtime.getContexts, for the offscreen emulation;
 //   - storage.session.setAccessLevel, which code waits on;
 //   - window.chrome in content scripts;
+//   - CustomEvent details a content script hands the page, which Chrome clones
+//     for the page's world;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
 //     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
@@ -1840,6 +1842,66 @@
     defineMissing(window, "chrome", ns);
   }
 
+  // ── CustomEvent detail between a content script and the page ───────────────
+  // Chrome structured-clones a CustomEvent's detail for a listener in another
+  // world, so an isolated content script hands the page (a world: "MAIN" script
+  // or one it injected) plain objects. In Firefox the page gets the content
+  // script's own object, and every property read throws "Permission denied to
+  // access property". An event this world creates carries a clone in the page's
+  // compartment instead; this world's listeners still read the object it passed,
+  // through a `detail` getter defined on its Xray of CustomEvent.prototype, which
+  // the page never sees. A detail cloneInto refuses (one holding a function) is
+  // passed as before.
+  function installPageEventDetail() {
+    if (!CONFIG.pageEventDetail || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    if (typeof cloneInto !== "function" || typeof WeakMap !== "function") return;
+    var Native = window.CustomEvent;
+    var proto = Native && Native.prototype;
+    var desc = proto && Object.getOwnPropertyDescriptor(proto, "detail");
+    var nativeDetail = desc && desc.get;
+    var nativeInit = proto && proto.initCustomEvent;
+    if (typeof Native !== "function" || typeof nativeDetail !== "function") return;
+    var originals = new WeakMap();
+    function forPage(detail) {
+      if (detail === null || (typeof detail !== "object" && typeof detail !== "function")) return detail;
+      try { return cloneInto(detail, window, { wrapReflectors: true }); } catch (e) { return detail; }
+    }
+    function CustomEvent(type, eventInitDict) {
+      // Without `new`, the native constructor throws its own TypeError.
+      if (!(this instanceof CustomEvent)) return Native.apply(this, arguments);
+      var init = eventInitDict;
+      if (init === null || typeof init !== "object" || !("detail" in init)) return Reflect.construct(Native, arguments);
+      var detail = init.detail;
+      var page = forPage(detail);
+      if (page === detail) return Reflect.construct(Native, arguments);
+      var event = new Native(type, { bubbles: init.bubbles, cancelable: init.cancelable, composed: init.composed, detail: page });
+      originals.set(event, detail);
+      return event;
+    }
+    CustomEvent.prototype = proto;
+    try { Object.setPrototypeOf(CustomEvent, Object.getPrototypeOf(Native)); } catch (e) {}
+    Object.defineProperty(proto, "detail", {
+      configurable: true,
+      enumerable: desc.enumerable,
+      get: function () { return originals.has(this) ? originals.get(this) : nativeDetail.call(this); },
+    });
+    if (typeof nativeInit === "function") {
+      Object.defineProperty(proto, "initCustomEvent", {
+        configurable: true, enumerable: true, writable: true,
+        value: function initCustomEvent(type, bubbles, cancelable, detail) {
+          var page = forPage(detail);
+          var result = nativeInit.call(this, type, bubbles, cancelable, page);
+          if (page !== detail) originals.set(this, detail);
+          else originals.delete(this);
+          return result;
+        },
+      });
+    }
+    try { Object.defineProperty(proto, "constructor", { value: CustomEvent, writable: true, configurable: true }); } catch (e) {}
+    Object.defineProperty(window, "CustomEvent", { value: CustomEvent, writable: true, configurable: true });
+    Object.defineProperty(G, "CustomEvent", { value: CustomEvent, writable: true, configurable: true });
+  }
+
   // ── webpack chunks of a worker bundle ──────────────────────────────────────
   // A webpack service worker loads an async chunk with importScripts, which runs
   // it synchronously, so startup code can require the chunk a microtask later.
@@ -2454,6 +2516,7 @@
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }

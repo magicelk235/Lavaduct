@@ -84,6 +84,9 @@ const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onC
 // A worker's own localStorage or sessionStorage, which it doesn't have:
 // `self.localStorage = polyfill`. The event page's are getter-only.
 const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
+// A CustomEvent the code makes itself, whose detail a content script may hand
+// the page's world.
+const CUSTOM_EVENT_RE = /\bnew\s+(?:[\w$]+\s*\.\s*)?CustomEvent\b|\binitCustomEvent\s*\(/;
 
 interface Usage {
   favicon: boolean;
@@ -100,6 +103,7 @@ interface Usage {
   extraHeaders: boolean;
   storage: boolean;
   messaging: boolean;
+  customEvent: boolean;
   storageGlobalsAssigned: string[];
 }
 
@@ -107,7 +111,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [],
+    extraHeaders: false, storage: false, messaging: false, customEvent: false, storageGlobalsAssigned: [],
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -132,6 +136,7 @@ function scanUsage(dir: string): Usage {
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
+      if (!found.customEvent) found.customEvent = CUSTOM_EVENT_RE.test(src);
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
       }
@@ -179,6 +184,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     extraHeaders: usage.extraHeaders,
     storageClone: usage.storage,
     messageJson: usage.messaging,
+    pageEventDetail: usage.customEvent,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
