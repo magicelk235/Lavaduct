@@ -25,7 +25,8 @@
 //     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
 //   - webpack chunks of a worker bundle, listed ahead of the worker;
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
-//     temporarily again and again.
+//     temporarily again and again;
+//   - Chrome's callback on methods Firefox only gives a promise.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -158,6 +159,55 @@
       withLastError(ns, err, function () { invoke(cb, []); });
     });
     return undefined;
+  }
+
+  // Firefox declares some methods Chrome gives a callback as promise-only
+  // (`"async": true` in its schemas) and refuses a trailing function with
+  // "Incorrect argument types". obj[name] then takes the callback off, calls
+  // Firefox's method, and answers the callback the way Chrome does. A call
+  // without one goes through untouched, and a synchronous throw (Chrome's own
+  // argument errors) still throws.
+  var callbackWrapped = typeof WeakSet === "function" ? new WeakSet() : null;
+  function acceptCallback(ns, obj, name) {
+    var original;
+    try { original = obj && obj[name]; } catch (e) { return; }
+    if (typeof original !== "function" || !callbackWrapped || callbackWrapped.has(original)) return;
+    var wrapper = function () {
+      var args = Array.prototype.slice.call(arguments);
+      if (!args.length || typeof args[args.length - 1] !== "function") return original.apply(obj, args);
+      var cb = args.pop();
+      return respond(ns, Promise.resolve(original.apply(obj, args)), cb);
+    };
+    callbackWrapped.add(wrapper);
+    replaceMember(obj, name, wrapper);
+  }
+
+  // The promise-only methods Chrome calls back from, by namespace (Firefox
+  // 160's schemas). browserAction takes action's. userScripts is wrapped with
+  // the rest of that namespace, when Firefox grants it (wrapUserScripts).
+  var PROMISE_ONLY = {
+    action: ["getBadgeTextColor", "setBadgeTextColor", "isEnabled", "openPopup"],
+    browserAction: ["getBadgeTextColor", "setBadgeTextColor", "isEnabled", "openPopup"],
+    pageAction: ["setPopup"],
+    tabs: ["discard", "ungroup"],
+    userScripts: ["register", "update", "unregister", "configureWorld", "resetWorldConfiguration"],
+  };
+
+  // Only for the methods the bundle names (CONFIG.promiseOnlyCalls).
+  function installPromiseOnlyCallbacks() {
+    var names = CONFIG.promiseOnlyCalls;
+    if (!Array.isArray(names) || !names.length) return;
+    namespaces.forEach(function (ns) {
+      Object.keys(PROMISE_ONLY).forEach(function (area) {
+        if (area === "userScripts") return;
+        var obj = null;
+        try { obj = ns[area]; } catch (e) {}
+        if (!obj || typeof obj !== "object") return;
+        PROMISE_ONLY[area].forEach(function (name) {
+          if (names.indexOf(name) >= 0) acceptCallback(ns, obj, name);
+        });
+      });
+    });
   }
 
   function makeEvent() {
@@ -1913,11 +1963,14 @@
         return exec.apply(us, args);
       });
     }
-    // getScripts reports what was registered, without the prelude.
+    // getScripts reports what was registered, without the prelude, to a
+    // callback too: Firefox would hand the callback its own list.
     var get = us.getScripts;
     if (typeof get === "function") {
       replaceMember(us, "getScripts", function () {
-        var p = get.apply(us, arguments);
+        var args = Array.prototype.slice.call(arguments);
+        var cb = args.length && typeof args[args.length - 1] === "function" ? args.pop() : null;
+        var p = get.apply(us, args);
         var strip = function (list) {
           return Array.isArray(list) ? list.map(function (s) {
             if (s && Array.isArray(s.js) && s.js.length && s.js[0] && s.js[0].code === userScriptWorldPrelude()) {
@@ -1926,9 +1979,11 @@
             return s;
           }) : list;
         };
-        return p && typeof p.then === "function" ? p.then(strip) : p;
+        p = p && typeof p.then === "function" ? p.then(strip) : p;
+        return cb ? respond(ns, Promise.resolve(p), cb) : p;
       });
     }
+    PROMISE_ONLY.userScripts.forEach(function (name) { acceptCallback(ns, us, name); });
   }
 
   // ── runtime.onUserScriptMessage / onUserScriptConnect ──────────────────────
@@ -2462,5 +2517,6 @@
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
+  try { installPromiseOnlyCallbacks(); } catch (e) { dbg("promise-only callback shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
