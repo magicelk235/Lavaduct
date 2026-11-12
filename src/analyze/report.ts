@@ -126,6 +126,10 @@ export function summarizeManifestChanges(before: Manifest, after: Manifest): str
     );
   }
 
+  const commandsBefore = Object.keys(before.commands && typeof before.commands === "object" ? before.commands : {});
+  const commandsDropped = commandsBefore.filter((name) => !(after.commands && typeof after.commands === "object" && name in after.commands));
+  if (commandsDropped.length) out.push(`Removed command(s) ${quoted(commandsDropped)}: reserved names Chrome ignores in this manifest, which Firefox would bind as ordinary commands.`);
+
   const overridesBefore = before.chrome_url_overrides;
   if (overridesBefore && typeof overridesBefore === "object") {
     const kept = after.chrome_url_overrides ?? {};

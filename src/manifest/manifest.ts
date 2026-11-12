@@ -383,6 +383,22 @@ function analyzeCommands(commands: Record<string, unknown>): Issue[] {
   return issues;
 }
 
+// Chrome reserves command names starting with "_": it binds each action command
+// only when the manifest has its action key, and ignores every other reserved name
+// (CommandsHandler::Parse). Firefox binds _execute_action in MV3 and
+// _execute_browser_action in MV2 and treats any other name as an ordinary command,
+// whose shortcut then fires commands.onCommand and can take the action's keys
+// (MetaMask binds Alt+Shift+M to both _execute_browser_action and _execute_action).
+// Firefox's own _execute_sidebar_action, which Chrome ignores, is kept: only an
+// extension written with Firefox in mind declares it.
+const ACTION_COMMAND_KEYS: Record<string, string> = { _execute_action: "action", _execute_browser_action: "browser_action", _execute_page_action: "page_action" };
+function commandsChromeIgnores(m: Manifest): string[] {
+  return Object.keys(m.commands && typeof m.commands === "object" ? m.commands : {}).filter((name) => {
+    if (!name.startsWith("_") || name === "_execute_sidebar_action") return false;
+    return !Object.hasOwn(ACTION_COMMAND_KEYS, name) || !(ACTION_COMMAND_KEYS[name] in m);
+  });
+}
+
 // Chrome's CSP for manifest sandbox pages when the manifest sets none. Firefox
 // applies script-src 'self' to them instead, so eval() and inline scripts fail.
 const CHROME_SANDBOX_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals; script-src 'self' 'unsafe-inline' 'unsafe-eval'; child-src 'self';";
@@ -949,6 +965,16 @@ export function analyzeManifest(m: Manifest, opts: { minFirefox: string }): Mani
   }
 
   if (m.commands && typeof m.commands === "object") issues.push(...analyzeCommands(m.commands));
+  const ignoredCommands = commandsChromeIgnores(m);
+  if (ignoredCommands.length) {
+    issues.push({
+      severity: "info",
+      category: "ui",
+      message: `commands ${ignoredCommands.join(", ")} use reserved names Chrome ignores here (an action command without its action key, or another name starting with "_"); Firefox would make them ordinary commands whose shortcuts fire commands.onCommand and can take the action's keys, so they are removed.`,
+      file: "manifest.json",
+      autoFixed: true,
+    });
+  }
 
   const overrides = m.chrome_url_overrides;
   if (overrides && typeof overrides === "object") {
@@ -1250,6 +1276,9 @@ export function transformManifest(m: Manifest, permissionsToRemove: string[], op
     for (const k of Object.keys(urlOverrides)) if (k !== "newtab") Reflect.deleteProperty(urlOverrides, k);
     if (Object.keys(urlOverrides).length === 0) delete out.chrome_url_overrides;
   }
+
+  for (const name of commandsChromeIgnores(out)) Reflect.deleteProperty(out.commands as object, name);
+  if (out.commands && typeof out.commands === "object" && Object.keys(out.commands).length === 0) delete out.commands;
 
   // A shortcut Firefox can't parse makes it refuse the manifest. Drop just that chord;
   // the command stays, and users can bind it in about:addons.
