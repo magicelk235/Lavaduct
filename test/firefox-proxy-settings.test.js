@@ -52,8 +52,12 @@ test(
   chrome.proxy.settings.set({ scope: "regular", value: { mode: "fixed_servers", rules: {
     singleProxy: { scheme: "http", host: "127.0.0.1", port: ${port} },
     bypassList: ["bypass.test", "*.skip.test"],
-  } } }, () => { chrome.storage.local.set({ set: chrome.runtime.lastError ? chrome.runtime.lastError.message : "ok" }); });
+  } } }, () => {
+    // Tells the test the fixed proxy is in place.
+    chrome.tabs.create({ url: chrome.runtime.getURL("ready.html#" + encodeURIComponent(chrome.runtime.lastError ? chrome.runtime.lastError.message : "ok")) });
+  });
 });`);
+    writeFileSync(join(ext, "ready.html"), `<!doctype html><meta charset="utf-8"><title>ready</title>`);
     const pac = `function FindProxyForURL(url, host) { return dnsDomainIs(host, ".pac.test") ? "PROXY 127.0.0.1:${port}" : "DIRECT"; }`;
     writeFileSync(join(ext, "switch.html"), `<!doctype html><meta charset="utf-8"><script src="switch.js"></script>`);
     writeFileSync(join(ext, "switch.js"), `chrome.proxy.settings.set({ scope: "regular", value: { mode: "pac_script", pacScript: { data: ${JSON.stringify(pac)} } } })
@@ -72,20 +76,42 @@ test(
     const ff = await startPrivilegedFirefox(firefox, profile);
     const titles = {};
     let switchUrl = "";
+    // Waits on Firefox's state, never a fixed time: under load a tab can take
+    // many seconds to commit its page (see firefox-sidebar-tab).
+    const until = async (what, js) => {
+      for (const end = Date.now() + 120_000; Date.now() < end; await sleep(100)) {
+        const v = await ff.chrome(js);
+        if (v) return v;
+      }
+      throw new Error(`timed out waiting for ${what}`);
+    };
     try {
       const id = await ff.installAddon(result.stagedPath);
-      await sleep(2000);
       const uuid = await ff.chrome(`WebExtensionPolicy.getByID(${JSON.stringify(id)}).mozExtensionHostname`);
-      const open = async (url, wait = 4000) => {
+      const ready = await until("the background to set its proxy", `(() => {
+        for (const w of Services.wm.getEnumerator("navigator:browser")) for (const t of w.gBrowser.tabs) {
+          const u = t.linkedBrowser.currentURI.spec;
+          if (u.startsWith("moz-extension://${uuid}/ready.html#")) return decodeURIComponent(u.split("#")[1]);
+        }
+        return "";
+      })()`);
+      assert.equal(ready, "ok", "the background's proxy.settings.set succeeds");
+      // Opens url in a new tab and waits until its page, or Firefox's error page,
+      // has committed and finished loading, and `done` holds for its title.
+      const open = async (url, done = "title !== ''") => {
         await ff.chrome(`(() => { const w = Services.wm.getMostRecentWindow("navigator:browser"); const t = w.gBrowser.addTab(${JSON.stringify(url)}, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() }); w.gBrowser.selectedTab = t; globalThis.__probeTab = t; return 1; })()`);
-        await sleep(wait);
-        titles[url] = await ff.chrome("globalThis.__probeTab.linkedBrowser.contentTitle");
+        titles[url] = await until(`${url} to load`, `(() => {
+          const b = globalThis.__probeTab.linkedBrowser;
+          if (b.currentURI.spec !== ${JSON.stringify(url)} || b.webProgress?.isLoadingDocument) return "";
+          const title = b.contentTitle;
+          return (${done}) ? title : "";
+        })()`);
       };
       await open("http://proxied.test/a");
       await open("http://bypass.test/b");
       await open("http://deep.skip.test/c");
       switchUrl = `moz-extension://${uuid}/switch.html`;
-      await open(switchUrl, 3000);
+      await open(switchUrl, "/^(set|failed) /.test(title)");
       await open("http://www.pac.test/d");
       await open("http://nopac.test/e");
     } finally {
