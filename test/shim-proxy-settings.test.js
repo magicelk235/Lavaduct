@@ -215,3 +215,20 @@ test("on a Firefox that can't compile PAC scripts, the sandbox says so and set()
   framePac(ok, pacContext());
   await vm.runInContext(`chrome.proxy.settings.set({ value: { mode: "pac_script", pacScript: { data: "syntax error here(" } } })`, ok);
 });
+
+// Chrome's set() resolves once the setting is in force. A page's set() used to
+// resolve as soon as the config was saved, and the background heard of it only
+// through a later storage event, so a request made right after could still use
+// the old config.
+test("a page's set() resolves once the running background routes with the new config", async () => {
+  const storage = makeLocalStorage();
+  const bg = load({ localStorage: storage });
+  await vm.runInContext("chrome.proxy.settings.set({ value: { mode: 'fixed_servers', rules: { singleProxy: { host: 'old.test', port: 1 } } } })", bg.ctx);
+  const browser = fakeBrowser({ extra: { proxy: firefoxProxy() } });
+  browser.runtime.getBackgroundPage = () => Promise.resolve(bg.ctx);
+  const page = runInContext(buildShim({}, BUNDLE), { browser, href: EXT_ORIGIN + "/popup.html", globals: { localStorage: storage, addEventListener() {} } });
+  await vm.runInContext("chrome.proxy.settings.set({ value: { mode: 'fixed_servers', rules: { singleProxy: { host: 'new.test', port: 2 } } } })", page);
+  assert.deepEqual(await bg.route("http://example.com/"), { type: "http", host: "new.test", port: 2 });
+  await vm.runInContext("chrome.proxy.settings.clear({})", page);
+  assert.equal(await bg.route("http://example.com/"), undefined, "clear() too");
+});

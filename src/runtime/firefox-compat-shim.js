@@ -3314,6 +3314,7 @@
   // Firefox's own shape (no mode) goes to Firefox's proxy.settings as before.
   // Only emitted for a bundle that names proxy.settings.
   var PROXY_STATE_KEY = "__lavaductProxySettings";
+  var PROXY_REFRESH = "__lavaductProxyRefresh";
   var PROXY_MODES = ["direct", "auto_detect", "pac_script", "fixed_servers", "system"];
   var PROXY_SCOPES = ["regular", "regular_only", "incognito_persistent", "incognito_session_only"];
   var PROXY_PORTS = { http: 80, https: 443, socks4: 1080, socks5: 1080 };
@@ -3550,13 +3551,16 @@
         if (state.regular || state.incognito) localStore.setItem(PROXY_STATE_KEY, JSON.stringify(state));
         else localStore.removeItem(PROXY_STATE_KEY);
       } catch (e) {}
-      if (isBackground) route();
-      else {
-        // A suspended event page reads the config when it wakes; one that runs
-        // hears the storage event.
-        try { var w = api.runtime.getBackgroundPage(); if (w && typeof w.then === "function") w.then(noop, noop); } catch (e) {}
-      }
       announce();
+      if (isBackground) { route(); return Promise.resolve(); }
+      // Chrome's set() resolves once the setting is in force, so the call waits
+      // for the background (woken if suspended) to route with the new config;
+      // its storage event can come later than the page's next request.
+      var bg;
+      try { bg = api.runtime.getBackgroundPage(); } catch (e) { return Promise.resolve(); }
+      return Promise.resolve(bg).then(function (w) {
+        try { if (w && typeof w[PROXY_REFRESH] === "function") w[PROXY_REFRESH](); } catch (e) {}
+      }, noop);
     }
 
     function setDetails(details) {
@@ -3571,15 +3575,15 @@
         var next = JSON.parse(JSON.stringify(state));
         if (scope === "regular" || scope === "regular_only") { next.regular = copy; next.regularOnly = scope === "regular_only"; }
         else next.incognito = copy;
-        save(next);
+        return save(next);
       };
       if (copy.mode === "pac_script") {
         return pacCompiles().then(function (ok) {
           if (!ok) throw new Error("proxy mode pac_script can't work in this Firefox: the PAC script runs in a manifest sandbox page, which Firefox supports from Firefox 154 on; older releases load it as an ordinary extension page, where code can't be compiled.");
-          apply();
+          return apply();
         });
       }
-      if (copy.mode !== "auto_detect") { apply(); return Promise.resolve(); }
+      if (copy.mode !== "auto_detect") return apply();
       return nativeCall("set", { value: { proxyType: "autoDetect" } }).then(apply, function (e) {
         throw new Error("proxy mode auto_detect needs Firefox's own proxy settings, which Firefox lets an add-on change only when it may run in private windows (" + errorMessage(e) + ")");
       });
@@ -3607,9 +3611,9 @@
       var cleared = scope === "regular" || scope === "regular_only" ? next.regular : next.incognito;
       if (scope === "regular" || scope === "regular_only") { delete next.regular; delete next.regularOnly; }
       else delete next.incognito;
-      if (cleared) save(next);
-      if (!cleared || cleared.mode === "auto_detect") return nativeCall("clear", {}).then(noop, noop);
-      return Promise.resolve();
+      var saved = cleared ? save(next) : Promise.resolve();
+      if (!cleared || cleared.mode === "auto_detect") return saved.then(function () { return nativeCall("clear", {}); }).then(noop, noop);
+      return saved;
     }
 
     // ── the background's router ──
@@ -3709,6 +3713,12 @@
     }
 
     if (isBackground && nativeProxy.onRequest) route();
+    // The pages' set() and clear() call this on the background's window.
+    if (isBackground) {
+      try {
+        Object.defineProperty(G, PROXY_REFRESH, { value: function () { state = readProxyState(); route(); }, configurable: true });
+      } catch (e) {}
+    }
     // Another page of the add-on changed the config.
     try {
       G.addEventListener("storage", function (e) {
