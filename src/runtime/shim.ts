@@ -84,6 +84,10 @@ const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onC
 // A worker's own localStorage or sessionStorage, which it doesn't have:
 // `self.localStorage = polyfill`. The event page's are getter-only.
 const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|sessionStorage)\s*=(?!=)/g;
+// A member of MV2's browserAction read (`chrome.browserAction.onClicked`), which
+// an MV3 bundle's Firefox branch does; not the name alone, which polyfill
+// metadata and message keys carry.
+const BROWSER_ACTION_MEMBER_RE = /\bbrowserAction\s*(?:\?\.|\.)\s*[A-Za-z_$]/;
 
 // A listener added with a last argument that can be false: a falsy literal,
 // which is what a Chrome build compiles `isFirefox && { … }` to, or an `&&`
@@ -139,13 +143,14 @@ interface Usage {
   messaging: boolean;
   storageGlobalsAssigned: string[];
   falsyListenerArg: boolean;
+  browserAction: boolean;
 }
 
 function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false,
+    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [], falsyListenerArg: false, browserAction: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -174,6 +179,7 @@ function scanUsage(dir: string): Usage {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
       }
       if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
+      if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
     }
   }
   return found;
@@ -220,6 +226,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     messageJson: usage.messaging,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,
+    browserActionAlias: usage.browserAction,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
