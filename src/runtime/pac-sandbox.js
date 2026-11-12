@@ -240,18 +240,26 @@ function evaluatePac(script, url, host, dns) {
   }
 }
 
+// The reply to one request from the background. compileBlocked: this page may
+// not compile code at all (a Firefox before 154 loads it as an ordinary
+// extension page, whose CSP refuses Function()), as opposed to a script that fails.
+function answer(d) {
+  var reply;
+  try {
+    reply = evaluatePac(String(d.script), String(d.url), String(d.host), d.dns);
+  } catch (err) {
+    reply = { error: String((err && err.message) || err) };
+    if (err instanceof EvalError) reply.compileBlocked = true;
+  }
+  reply.__lavaductPac = true;
+  reply.id = d.id;
+  return reply;
+}
+
 if (typeof addEventListener === "function") {
   addEventListener("message", function (e) {
     var d = e.data;
     if (!d || d.__lavaductPac !== true || !e.source) return;
-    var reply;
-    try {
-      reply = evaluatePac(String(d.script), String(d.url), String(d.host), d.dns);
-    } catch (err) {
-      reply = { error: String((err && err.message) || err) };
-    }
-    reply.__lavaductPac = true;
-    reply.id = d.id;
-    e.source.postMessage(reply, "*");
+    e.source.postMessage(answer(d), "*");
   });
 }

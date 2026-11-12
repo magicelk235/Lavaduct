@@ -3102,10 +3102,32 @@
         else next.incognito = copy;
         save(next);
       };
+      if (copy.mode === "pac_script") {
+        return pacCompiles().then(function (ok) {
+          if (!ok) throw new Error("proxy mode pac_script can't work in this Firefox: the PAC script runs in a manifest sandbox page, which Firefox supports from Firefox 154 on; older releases load it as an ordinary extension page, where code can't be compiled.");
+          apply();
+        });
+      }
       if (copy.mode !== "auto_detect") { apply(); return Promise.resolve(); }
       return nativeCall("set", { value: { proxyType: "autoDetect" } }).then(apply, function (e) {
         throw new Error("proxy mode auto_detect needs Firefox's own proxy settings, which Firefox lets an add-on change only when it may run in private windows (" + errorMessage(e) + ")");
       });
+    }
+
+    // Whether the sandbox page may compile code. Firefox before 154 has no
+    // manifest sandbox pages and loads it as an ordinary page, whose CSP
+    // refuses Function(); a pac_script config would then send everything
+    // direct without a word, so set() is refused instead. Checked once per page.
+    var pacCheck = null;
+    function pacCompiles() {
+      var canFrame = false;
+      try { canFrame = typeof document !== "undefined" && !!document && typeof document.createElement === "function"; } catch (e) {}
+      if (!canFrame) return Promise.resolve(true);
+      if (!pacCheck) {
+        pacCheck = pacEval({ script: "function FindProxyForURL() { return 'DIRECT'; }", url: "http://pac-check.invalid/", host: "pac-check.invalid", dns: {} })
+          .then(function (r) { return !(r && r.compileBlocked); }, function () { return false; });
+      }
+      return pacCheck;
     }
 
     function clearDetails(details) {
