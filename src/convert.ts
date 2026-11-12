@@ -9,6 +9,7 @@ import { applySourceRewrites, matchManifestPathCase, normalizeLocaleCatalogs, re
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import {
   analyzeManifest,
+  CHROME_SANDBOX_CSP,
   collectReferencedPaths,
   DEFAULT_MIN_FIREFOX,
   loadManifest,
@@ -27,8 +28,10 @@ import {
   derivePanelWindowQuery,
   injectShimIntoHtmlPages,
   usesDebugger,
+  usesProxySettings,
   wireBackground,
   workerChunkGlobal,
+  writePacSandbox,
   writeShim,
 } from "./runtime/shim.js";
 import { applyOAuthBridge, deriveChromeId } from "./runtime/oauth-bridge.js";
@@ -271,6 +274,11 @@ function buildAddon(
         ? `Sidebar page opens with ?${panelQuery.replace(/^\?/, "")} (--panel-query)`
         : `Sidebar page opens with ?${panelQuery}, the query the extension uses for the page's own window mode`,
     );
+  }
+
+  if (shimFile && usesProxySettings(stageDir)) {
+    writePacSandbox(stageDir, out, CHROME_SANDBOX_CSP);
+    log.ok("chrome.proxy.settings emulated on proxy.onRequest; PAC scripts run in a sandbox page");
   }
 
   const dnr = applyDnr(stageDir, out);

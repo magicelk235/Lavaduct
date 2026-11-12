@@ -14,6 +14,11 @@ const SHIM_TEMPLATE = "firefox-compat-shim.js";
 const DEBUG_RING_FILENAME = "debug-ring.js";
 /** Spliced into the shim for add-ons that use chrome.debugger; never staged on its own. */
 const DEBUGGER_FILENAME = "cdp-emulation.js";
+/** The sandbox page that runs Chrome pac_script configs for the proxy.settings emulation. */
+export const PAC_PAGE = `${NAME}-pac.html`;
+/** Its script, copied from src/runtime/pac-sandbox.js. */
+const PAC_SCRIPT = `${NAME}-pac.js`;
+const PAC_TEMPLATE = "pac-sandbox.js";
 
 /** Build-time settings baked into the shim. */
 export interface ShimConfig {
@@ -78,6 +83,8 @@ const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|get
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
 // The storage areas whose set the clone fallback wraps.
 const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
+// Chrome's proxy settings, which the shim emulates on proxy.onRequest.
+const PROXY_SETTINGS_RE = /\bproxy\s*\.\s*settings\b/;
 // Extension messaging, whose JSON fallback wraps sendMessage, ports and the
 // message listeners.
 const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onConnectExternal)\b|\b(?:runtime|tabs)\s*\.\s*connect\s*\(/;
@@ -99,6 +106,7 @@ interface Usage {
   permissions: boolean;
   extraHeaders: boolean;
   storage: boolean;
+  proxySettings: boolean;
   messaging: boolean;
   storageGlobalsAssigned: string[];
 }
@@ -107,7 +115,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, locks: false, permissions: false,
-    extraHeaders: false, storage: false, messaging: false, storageGlobalsAssigned: [],
+    extraHeaders: false, storage: false, proxySettings: false, messaging: false, storageGlobalsAssigned: [],
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -131,6 +139,7 @@ function scanUsage(dir: string): Usage {
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
+      if (!found.proxySettings) found.proxySettings = PROXY_SETTINGS_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
         if (!found.storageGlobalsAssigned.includes(m[1])) found.storageGlobalsAssigned.push(m[1]);
@@ -178,6 +187,8 @@ function shimSource(dir: string, config: ShimConfig): string {
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
     extraHeaders: usage.extraHeaders,
     storageClone: usage.storage,
+    proxySettings: usage.proxySettings,
+    pacPage: usage.proxySettings ? PAC_PAGE : "",
     messageJson: usage.messaging,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
@@ -193,6 +204,36 @@ function shimSource(dir: string, config: ShimConfig): string {
     src = src.split("  // __SHIM_DEBUGGER__\n").join(readFileSync(join(RUNTIME_DIR, DEBUGGER_FILENAME), "utf-8"));
   }
   return src.split("__SHIM_CONFIG_JSON__").join(json);
+}
+
+/** Whether the add-on's code uses Chrome's proxy.settings, which the shim emulates. */
+export function usesProxySettings(dir: string): boolean {
+  return scanUsage(dir).proxySettings;
+}
+
+/**
+ * Stage the sandbox page the proxy.settings emulation runs PAC scripts in, and
+ * declare it. A PAC script is code, and Firefox lets an add-on compile code only
+ * in a manifest sandbox page whose CSP allows eval: Chrome's default sandbox CSP
+ * is written when the manifest has no sandbox policy. An add-on's own sandbox
+ * policy is kept as it is; if it forbids eval, PAC scripts fail and requests go
+ * direct (or nowhere, with pacScript.mandatory), with the reason in the debug log.
+ */
+export function writePacSandbox(dir: string, manifest: Manifest, sandboxCsp: string): void {
+  writeFileSync(join(dir, PAC_SCRIPT), readFileSync(join(RUNTIME_DIR, PAC_TEMPLATE), "utf-8"));
+  writeFileSync(join(dir, PAC_PAGE), `<!doctype html>\n<meta charset="utf-8">\n<script src="${PAC_SCRIPT}"></script>\n`);
+  const sandbox: { pages?: string[]; content_security_policy?: string } = { ...(manifest.sandbox ?? {}) };
+  const pages = Array.isArray(sandbox.pages) ? sandbox.pages.filter((p): p is string => typeof p === "string") : [];
+  if (!pages.includes(PAC_PAGE)) pages.push(PAC_PAGE);
+  sandbox.pages = pages;
+  if ((manifest.manifest_version ?? 2) >= 3) {
+    const csp = manifest.content_security_policy;
+    const policy = typeof csp === "object" && csp !== null ? csp : {};
+    if (typeof policy.sandbox !== "string") manifest.content_security_policy = { ...policy, sandbox: sandboxCsp };
+  } else if (typeof sandbox.content_security_policy !== "string") {
+    sandbox.content_security_policy = sandboxCsp;
+  }
+  manifest.sandbox = sandbox;
 }
 
 // chrome.debugger calls, and the debugger permission, mean the add-on drives tabs

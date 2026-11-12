@@ -293,9 +293,11 @@ const HAND_NOTES: Record<string, ApiNote> = {
     fix: "Register the value of identity.getRedirectURL() in Firefox with the OAuth provider.",
   },
   "chrome.proxy.settings": {
-    severity: "warning",
-    message: "Firefox's proxy.settings takes a different config than Chrome's (proxyType/http/ssl/autoConfigUrl instead of mode/rules/pacScript), so Chrome-style configs are rejected.",
-    fix: "Translate the config, or route requests with proxy.onRequest. Firefox also only allows proxy.settings when the user lets the add-on run in private windows.",
+    severity: "info",
+    message: "chrome.proxy.settings is emulated on proxy.onRequest: Firefox's own proxy.settings takes another config and refuses changes unless the add-on may run in private windows. direct, fixed_servers and pac_script (run in a sandbox page) work without that; auto_detect still needs it.",
+    fix: "No action needed.",
+    shimmed: true,
+    unshimmed: "Firefox's proxy.settings takes a different config than Chrome's (proxyType/http/ssl/autoConfigUrl instead of mode/rules/pacScript), so Chrome-style configs are rejected, and it refuses any change unless the user lets the add-on run in private windows.",
   },
   // Matches the string and runtime.ContextType.OFFSCREEN_DOCUMENT alike; the shim
   // gives Firefox's ContextType the member it lacks.
