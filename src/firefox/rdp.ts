@@ -250,14 +250,34 @@ export class RdpSession {
     const deadline = Date.now() + START_TIMEOUT_MS;
     let lastError = "its devtools server never came up";
     while (!failure && Date.now() < deadline) {
+      let session: RdpSession;
       try {
-        return await RdpSession.connect(address);
+        session = await RdpSession.connect(address);
       } catch (err) {
         lastError = (err as Error).message;
+        await sleep(100);
+        continue;
       }
-      await sleep(100);
+      await session.waitForBrowserWindow(deadline);
+      return session;
     }
     throw new Error(`Couldn't reach the devtools server of ${install.binary}: ${failure ?? lastError}`);
+  }
+
+  /**
+   * Wait until Firefox has a browser window, or until `deadline`. Firefox
+   * starts its devtools server before it opens its first window, and under load
+   * an add-on installed in between starts with no window: a tabs.create in its
+   * background, the usual welcome page, fails with "Not allowed to create tabs
+   * on the target window" and no tab opens. A window with a tab is what the
+   * devtools server lists as tabs.
+   */
+  async waitForBrowserWindow(deadline: number): Promise<void> {
+    while (Date.now() < deadline) {
+      const reply = await this.request("root", "listTabs").catch(() => undefined);
+      if (reply && Array.isArray(reply.tabs) && reply.tabs.length > 0) return;
+      await sleep(50);
+    }
   }
 
   /**

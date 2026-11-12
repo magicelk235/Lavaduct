@@ -209,17 +209,23 @@ export function pickLockHolder(
   return browser && { pid: browser.pid, exe: browser.exe };
 }
 
-function listFirefoxProcesses(): WinProcess[] {
-  const script =
-    "Get-CimInstance -ClassName Win32_Process -Filter \"Name = 'firefox.exe'\" | " +
-    "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress";
+/** Run a PowerShell script; its stdout, or undefined when it failed. */
+function powershell(script: string): string | undefined {
   const res = run("powershell.exe", [
     "-NoProfile",
     "-NonInteractive",
     "-EncodedCommand",
     Buffer.from(script, "utf16le").toString("base64"),
   ]);
-  return res.code === 0 ? parseProcessJson(res.stdout) : [];
+  return res.code === 0 ? res.stdout : undefined;
+}
+
+function listFirefoxProcesses(): WinProcess[] {
+  const out = powershell(
+    "Get-CimInstance -ClassName Win32_Process -Filter \"Name = 'firefox.exe'\" | " +
+      "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress",
+  );
+  return out === undefined ? [] : parseProcessJson(out);
 }
 
 export const win32: Platform = {
@@ -278,6 +284,15 @@ export const win32: Platform = {
   },
 
   quitMinAgeMs: 0,
+
+  processAgeMs(pid) {
+    // CreationDate is a local DateTime; "o" prints it with its UTC offset.
+    const out = powershell(
+      `(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = ${Math.trunc(pid)}").CreationDate.ToString("o")`,
+    );
+    const started = out === undefined ? NaN : Date.parse(out.trim());
+    return Number.isFinite(started) ? Math.max(0, Date.now() - started) : undefined;
+  },
 
   visibleLaunchArgs() {
     return [];
