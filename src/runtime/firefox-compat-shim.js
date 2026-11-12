@@ -88,6 +88,12 @@
   var isTopFrame = true;
   try { isTopFrame = typeof window === "undefined" || window.top === window; } catch (e) { isTopFrame = false; }
   var isBackground = isExtensionPage && isTopFrame && detectBackground();
+  // A converted worker's chunks are loaded by its pages too, so their "am I the
+  // worker?" checks were rewritten to `check || globalThis.__lavaductBackground
+  // === true` (src/input/stage.ts rewriteHoistedBackgroundChecks): true here only.
+  if (isBackground) {
+    try { Object.defineProperty(G, "__lavaductBackground", { value: true, configurable: true }); } catch (e) {}
+  }
 
   var ORIGIN = "";
   try { ORIGIN = String(api.runtime.getURL("/")).replace(/\/+$/, ""); } catch (e) {}

@@ -839,15 +839,107 @@ function rewriteBackgroundContextChecks(stageDir: string, manifest: Manifest): n
   return modified;
 }
 
+// What the background's shim sets on its global, and nothing else does: lets a
+// check in a file that pages load too say yes in the background only.
+export const BACKGROUND_FLAG = "globalThis.__lavaductBackground===true";
+
+const regexEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** `typeof document === "undefined"` and its spellings, as WINDOW_IS_UNDEFINED has them for window. */
+const DOCUMENT_IS_UNDEFINED = WINDOW_IS_UNDEFINED.split("window").join("document");
+
+// A function named for the question, whose body has no nested braces:
+// `static isBackground() { return … "undefined" == typeof document }`,
+// `isServiceWorker: () => typeof window === "undefined"`.
+const BG_PREDICATE_RE =
+  /(\bis_?(?:bg|background\w*|service_?worker\w*|sw)\s*(?:\(\s*\)\s*\{|[:=]\s*(?:function\s*)?\(\s*\)\s*(?:=>\s*)?\{))([^{}]*)\}|(\bis_?(?:bg|background\w*|service_?worker\w*|sw)\s*[:=]\s*\(\s*\)\s*=>)([^{};,]*)/gi;
+const UNDEFINED_GLOBAL_RE = new RegExp(`${WINDOW_IS_UNDEFINED}|${DOCUMENT_IS_UNDEFINED}`, "g");
+
+/**
+ * The worker's "am I the worker?" checks in every script the background loads,
+ * once the worker's importScripts targets and chunks are known (wireBackground):
+ *   - the background-literal checks rewriteBackgroundContextChecks fixes in the
+ *     manifest's scripts, now in the hoisted files too;
+ *   - `location.pathname == "/<worker script>"` (Hola's is_bg);
+ *   - a worker test inside an is…Background()/isServiceWorker() body (Total
+ *     Adblock's `"undefined" == typeof document`).
+ * The worker's own script only runs as the background, so its checks become
+ * true. The other files are chunks the add-on's pages may load too, so there
+ * the check gains `|| BACKGROUND_FLAG` and keeps its answer in the pages.
+ */
+export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: string, loaded: string[]): number {
+  const worker = workerScript.replace(/^\.?\//, "");
+  if (!worker) return 0;
+  const pathCheck = String.raw`(?:(?:self|globalThis|window)\.)?location\.pathname\s*===?\s*(["'])\/?${regexEscape(worker)}\1`;
+  const pathRe = new RegExp(`${pathCheck}|(["'])\\/?${regexEscape(worker)}\\2\\s*===?\\s*(?:(?:self|globalThis|window)\\.)?location\\.pathname`, "g");
+  let modified = 0;
+  for (const rel of loaded) {
+    const name = rel.replace(/^\.?\//, "");
+    const file = join(stageDir, name);
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    const isWorker = name === worker;
+    const yes = (check: string) => (isWorker ? "true" : `(${check}||${BACKGROUND_FLAG})`);
+    let next = content.replace(pathRe, (check) => yes(check));
+    next = next.replace(BG_PREDICATE_RE, (whole, head?: string, body?: string, arrowHead?: string, arrowBody?: string) =>
+      head !== undefined
+        ? `${head}${(body ?? "").replace(UNDEFINED_GLOBAL_RE, yes)}}`
+        : `${arrowHead}${(arrowBody ?? "").replace(UNDEFINED_GLOBAL_RE, yes)}`);
+    if (!isWorker) {
+      next = next
+        .replace(BG_CHECK_RETURN_RE, (whole, pre: string, post: string) => pre + yes(whole.slice(pre.length, whole.length - post.length)) + post)
+        .replace(BG_CHECK_TERNARY_RE, (whole, post: string) => yes(whole.slice(0, whole.length - post.length)) + post);
+    }
+    if (next !== content) {
+      writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
 // A worker gives itself a window with `self.window = self`. In the event page that
 // replaces it, window is a getter-only accessor, and the assignment throws in
 // strict code, ending the script there. window already is the global in a page.
 const WINDOW_SELF_ALIAS_RE = /(^|[^.\w$])(?:self|globalThis)\s*\.\s*window\s*=\s*(self|globalThis)\b(?!\s*[.[(=])/g;
 
+// `import "./x.js"`, `import { a } from "../y.js"`, `export * from "./z.mjs"`:
+// relative static imports, the only ones resolvable without running the code.
+const STATIC_IMPORT_RE = /(?:^|[;\s}])(?:import|export)\s*(?:[\w$*{}\s,]+?\s*from\s*)?(["'])(\.{1,2}\/[^"'\n]+)\1/g;
+
+/** The background's scripts plus, for a module worker, every module they import statically. */
+function backgroundModuleClosure(stageDir: string, manifest: Manifest): string[] {
+  const files = backgroundScriptPaths(stageDir, manifest);
+  if (manifest.background?.type !== "module") return files;
+  const root = resolve(stageDir);
+  const seen = new Set(files);
+  for (let i = 0; i < files.length; i++) {
+    let content: string;
+    try {
+      content = readFileSync(files[i], "utf-8");
+    } catch {
+      continue;
+    }
+    for (const m of content.matchAll(STATIC_IMPORT_RE)) {
+      const target = resolve(dirname(files[i]), m[2].split(/[?#]/)[0]);
+      if (!target.startsWith(root + sep) || seen.has(target) || !existsSync(target)) continue;
+      seen.add(target);
+      files.push(target);
+    }
+  }
+  return files;
+}
+
 function rewriteWorkerWindowAlias(stageDir: string, manifest: Manifest): number {
   if (typeof manifest.background?.service_worker !== "string") return 0;
   let modified = 0;
-  for (const file of backgroundScriptPaths(stageDir, manifest)) {
+  // An imported module may be the pages' too; in a page window already is the
+  // global, so dropping the alias changes nothing there.
+  for (const file of backgroundModuleClosure(stageDir, manifest)) {
     let content: string;
     try {
       content = readFileSync(file, "utf-8");
