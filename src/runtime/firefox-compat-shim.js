@@ -19,7 +19,7 @@
 //   - declarativeNetRequest rules added at runtime that Firefox would refuse;
 //   - OFFSCREEN_DOCUMENT in runtime.getContexts, for the offscreen emulation;
 //   - storage.session.setAccessLevel, which code waits on;
-//   - window.chrome in content scripts;
+//   - window.chrome in content scripts, and json() bodies in their own realm;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
 //     userScripts grant, and Chrome's chrome.runtime in the USER_SCRIPT world;
@@ -1780,6 +1780,30 @@
     defineMissing(window, "chrome", ns);
   }
 
+  // ── json() bodies in content scripts ────────────────────────────────────────
+  // A content script's Response and Request are the page's, seen through an
+  // Xray, so json() builds its objects in the page's realm: their prototype is
+  // the page's Object.prototype and arrays fail `instanceof Array`. Chrome's
+  // isolated world gets objects of its own, and code that keeps only objects
+  // whose prototype is Object.prototype drops the rest. json() reads the body
+  // as text and parses it here instead, which is what it does in either
+  // browser: UTF-8, the same SyntaxError, the same TypeError for a body already
+  // read. The method lives on the Xray, so the page never sees it. Only emitted
+  // for a bundle that calls json().
+  function installContentBodyJson() {
+    if (!CONFIG.contentBodyJson || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    ["Response", "Request"].forEach(function (name) {
+      var proto = null;
+      try { proto = G[name] && G[name].prototype; } catch (e) {}
+      if (!proto || typeof proto.json !== "function" || typeof proto.text !== "function") return;
+      var text = proto.text;
+      replaceMember(proto, "json", function json() {
+        var body = this;
+        return new Promise(function (resolve) { resolve(text.call(body)); }).then(function (t) { return JSON.parse(t); });
+      });
+    });
+  }
+
   // ── webpack chunks of a worker bundle ──────────────────────────────────────
   // A webpack service worker loads an async chunk with importScripts, which runs
   // it synchronously, so startup code can require the chunk a microtask later.
@@ -2349,6 +2373,7 @@
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }
