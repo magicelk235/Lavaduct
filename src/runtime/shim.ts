@@ -35,6 +35,8 @@ export interface ShimConfig {
   panelQuery?: string;
   /** The extension's Chrome ID, so hardcoded chrome-extension://<id>/_favicon/ URLs are recognised. */
   extensionId?: string;
+  /** Chrome's homepageUrl for this add-on: its Web Store page when it came from the store and declares no homepage_url. */
+  webStoreHomepage?: string;
   /** Emulate chrome.debugger (see usesDebugger). */
   debuggerEmulation?: boolean;
   /** The Chrome background was a service worker; it now runs as an event page. */
@@ -138,6 +140,9 @@ const SESSION_ACCESS_RE = /\bsetAccessLevel\b/;
 // the like; Firefox refuses even the default store from an add-on without the
 // cookies permission.
 const COOKIE_STORE_ID_RE = /\bcookieStoreId\b/;
+// management's homepageUrl read, which Firefox leaves out where Chrome gives a
+// Web Store add-on its store page.
+const HOMEPAGE_URL_RE = /\bhomepageUrl\b/;
 // Chrome's frozen condition, which Firefox's tabs.query refuses.
 const FROZEN_KEY_RE = /\bfrozen\s*:|["'`]frozen["'`]/;
 // console's methods replaced, or console handed to code that may replace them
@@ -224,6 +229,7 @@ interface Usage {
   windowMethodTaken: boolean;
   /** The add-on's Chrome ID is written into its code. */
   chromeIdLiteral: boolean;
+  homepageUrl: boolean;
 }
 
 function scanUsage(dir: string, chromeId = ""): Usage {
@@ -231,7 +237,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false, windowMethodTaken: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false, windowMethodTaken: false, homepageUrl: false,
   };
   const ownId = chromeId.toLowerCase();
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -284,6 +290,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
       if (!found.windowMethodTaken) found.windowMethodTaken = WINDOW_METHOD_TAKEN_RE.test(src);
       // The page bridge lavaduct writes holds the ID too; it isn't the add-on's code.
       if (!found.chromeIdLiteral && ownId) found.chromeIdLiteral = src.includes(ownId) && !basename(file).startsWith(`${NAME}-`);
+      if (!found.homepageUrl) found.homepageUrl = HOMEPAGE_URL_RE.test(src);
     }
   }
   return found;
@@ -384,6 +391,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     messageJson: usage.messaging,
     pageEventDetail: usage.customEvent,
     windowMethodReceivers: usage.windowMethodTaken,
+    webStoreHomepage: usage.homepageUrl ? (config.webStoreHomepage ?? "") : "",
     ownIdSelectors: usage.runtimeId && usage.selectorCall,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,

@@ -228,6 +228,11 @@ function buildAddon(
       noDefaultPanel: panelPage !== "",
       panelQuery,
       extensionId: src.chromeId,
+      // Chrome's ManifestURL::GetHomepageURL: an add-on updated from the Web Store
+      // and without a homepage_url has the store's detail page as its homepage.
+      webStoreHomepage: src.chromeId && !manifest.homepage_url && typeof manifest.update_url === "string" && /^https?:\/\/clients2\.google\.com\/service\/update2\/crx\b/.test(manifest.update_url)
+        ? `https://chromewebstore.google.com/detail/${src.chromeId}`
+        : "",
       debuggerEmulation,
       serviceWorker: typeof bg?.service_worker === "string" && !Array.isArray(bg.scripts) && !bg.page,
       serviceWorkerScript: typeof bg?.service_worker === "string" ? bg.service_worker : "",
