@@ -2868,11 +2868,32 @@
   // frame, it returns at once. Injections of a function are left alone, and
   // getRegisteredContentScripts leaves the shim out. Only emitted for a
   // bundle that injects files.
+  //
+  // Firefox also resolves a relative path in these calls, and in insertCSS and
+  // removeCSS, against the page making the call, where Chrome resolves it from
+  // the extension root. Measured on Firefox 160 from moz-extension://<uuid>/html/
+  // page.html: executeScript({ files: ["inject.js"] }) ran html/inject.js,
+  // insertCSS and removeCSS with "s.css" failed with "An unexpected error
+  // occurred", registerContentScripts stored "html/reg.js" and nothing loaded,
+  // and MV2 tabs.executeScript and insertCSS with { file } did the same. Background
+  // scripts resolve from the root, because their generated page sits there. Loom
+  // injects from its html/ pages, and the shim put first there failed as
+  // html/lavaduct-compat-shim.js ("Unable to load script"). So a relative path
+  // gets a leading "/"; absolute paths and full URLs are left as they are.
+  // Emitted for a bundle that injects files or stylesheets.
+  function rootPath(p) {
+    return typeof p === "string" && p !== "" && p.charAt(0) !== "/" && !/^[a-z][a-z\d+.-]*:/i.test(p) ? "/" + p : p;
+  }
+
+  function rootPaths(list) {
+    return Array.isArray(list) ? list.map(rootPath) : list;
+  }
+
   function withShimFirst(files) {
     var shim = CONFIG.injectShim;
     if (!Array.isArray(files) || !files.length) return files;
     var first = String(files[0]).replace(/^\/+/, "");
-    return first === shim ? files : [shim].concat(files);
+    return first === shim ? files : ["/" + shim].concat(files);
   }
 
   function withoutShim(files) {
@@ -2881,7 +2902,9 @@
   }
 
   function installInjectedScriptShim() {
-    if (typeof CONFIG.injectShim !== "string" || !CONFIG.injectShim || !isExtensionPage) return;
+    var shimFirst = typeof CONFIG.injectShim === "string" && CONFIG.injectShim !== "";
+    var root = CONFIG.rootInjectedPaths === true;
+    if (!isExtensionPage || !(shimFirst || root)) return;
     function copyWith(obj, key, value) {
       var c = {};
       for (var k in obj) c[k] = obj[k];
@@ -2889,6 +2912,12 @@
       return c;
     }
     function isolated(o) { return o && typeof o === "object" && o.world !== "MAIN"; }
+    function isDetails(o) { return !!o && typeof o === "object"; }
+    // A file list as Chrome reads it, with the shim first when it belongs there.
+    function fileList(list, inIsolatedWorld) {
+      var out = root ? rootPaths(list) : list;
+      return shimFirst && inIsolatedWorld ? withShimFirst(out) : out;
+    }
     namespaces.forEach(function (ns) {
       var scripting = null, tabs = null;
       try { scripting = ns.scripting; } catch (e) {}
@@ -2897,22 +2926,37 @@
         var exec = scripting.executeScript;
         replaceMember(scripting, "executeScript", function (details) {
           var args = Array.prototype.slice.call(arguments);
-          if (isolated(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", withShimFirst(details.files));
+          if (isDetails(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", fileList(details.files, isolated(details)));
           return exec.apply(scripting, args);
         });
       }
+      ["insertCSS", "removeCSS"].forEach(function (name) {
+        if (!root || !scripting || typeof scripting[name] !== "function") return;
+        var native = scripting[name];
+        replaceMember(scripting, name, function (details) {
+          var args = Array.prototype.slice.call(arguments);
+          if (isDetails(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", rootPaths(details.files));
+          return native.apply(scripting, args);
+        });
+      });
       ["registerContentScripts", "updateContentScripts"].forEach(function (name) {
         if (!scripting || typeof scripting[name] !== "function") return;
         var native = scripting[name];
         replaceMember(scripting, name, function (scripts) {
           var args = Array.prototype.slice.call(arguments);
           if (Array.isArray(scripts)) {
-            args[0] = scripts.map(function (s) { return isolated(s) && Array.isArray(s.js) ? copyWith(s, "js", withShimFirst(s.js)) : s; });
+            args[0] = scripts.map(function (s) {
+              if (!isDetails(s)) return s;
+              var c = s;
+              if (Array.isArray(s.js)) c = copyWith(c, "js", fileList(s.js, isolated(s)));
+              if (root && Array.isArray(s.css)) c = copyWith(c, "css", rootPaths(s.css));
+              return c;
+            });
           }
           return native.apply(scripting, args);
         });
       });
-      if (scripting && typeof scripting.getRegisteredContentScripts === "function") {
+      if (shimFirst && scripting && typeof scripting.getRegisteredContentScripts === "function") {
         var getRegistered = scripting.getRegisteredContentScripts;
         replaceMember(scripting, "getRegisteredContentScripts", function () {
           var args = Array.prototype.slice.call(arguments);
@@ -2928,9 +2972,11 @@
         var tabsExec = tabs.executeScript;
         replaceMember(tabs, "executeScript", function () {
           var args = Array.prototype.slice.call(arguments);
-          var at = typeof args[0] === "object" && args[0] !== null ? 0 : 1;
+          var at = isDetails(args[0]) ? 0 : 1;
           var details = args[at];
-          if (!details || typeof details.file !== "string" || String(details.file).replace(/^\/+/, "") === CONFIG.injectShim) return tabsExec.apply(tabs, args);
+          if (!isDetails(details) || typeof details.file !== "string") return tabsExec.apply(tabs, args);
+          if (root) args[at] = details = copyWith(details, "file", rootPath(details.file));
+          if (!shimFirst || String(details.file).replace(/^\/+/, "") === CONFIG.injectShim) return tabsExec.apply(tabs, args);
           var shimDetails = { file: "/" + CONFIG.injectShim };
           ["allFrames", "frameId", "matchAboutBlank", "runAt"].forEach(function (k) { if (details[k] !== undefined) shimDetails[k] = details[k]; });
           var shimArgs = at === 1 ? [args[0], shimDetails] : [shimDetails];
@@ -2943,6 +2989,16 @@
           return respond(ns, p, cb);
         });
       }
+      ["insertCSS", "removeCSS"].forEach(function (name) {
+        if (!root || !tabs || typeof tabs[name] !== "function") return;
+        var native = tabs[name];
+        replaceMember(tabs, name, function () {
+          var args = Array.prototype.slice.call(arguments);
+          var at = isDetails(args[0]) ? 0 : 1;
+          if (isDetails(args[at]) && typeof args[at].file === "string") args[at] = copyWith(args[at], "file", rootPath(args[at].file));
+          return native.apply(tabs, args);
+        });
+      });
     });
   }
 

@@ -106,6 +106,8 @@ const MESSAGING_RE = /\b(?:sendMessage|onMessage|onMessageExternal|onConnect|onC
 // Content scripts injected at runtime from files (scripting.executeScript,
 // registerContentScripts and updateContentScripts, MV2 tabs.executeScript).
 const INJECTS_FILES_RE = /\b(?:executeScript|registerContentScripts|updateContentScripts)\b/;
+// Stylesheets inserted or removed at runtime (scripting and MV2 tabs).
+const INJECTS_CSS_RE = /\b(?:insertCSS|removeCSS)\b/;
 const DECLARATIVE_CONTENT_RE = /\bdeclarativeContent\b/;
 // A worker's own localStorage or sessionStorage, which it doesn't have:
 // `self.localStorage = polyfill`. The event page's are getter-only.
@@ -191,6 +193,7 @@ interface Usage {
   messaging: boolean;
   customEvent: boolean;
   injectsFiles: boolean;
+  injectsCss: boolean;
   declarativeContent: boolean;
   storageGlobalsAssigned: string[];
   falsyListenerArg: boolean;
@@ -206,7 +209,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
+    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
     promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -239,6 +242,7 @@ function scanUsage(dir: string): Usage {
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
       if (!found.customEvent) found.customEvent = CUSTOM_EVENT_RE.test(src);
       if (!found.injectsFiles) found.injectsFiles = INJECTS_FILES_RE.test(src);
+      if (!found.injectsCss) found.injectsCss = INJECTS_CSS_RE.test(src);
       if (!found.declarativeContent) found.declarativeContent = DECLARATIVE_CONTENT_RE.test(src);
       if (!found.sessionAccess) found.sessionAccess = SESSION_ACCESS_RE.test(src);
       for (const m of src.matchAll(STORAGE_GLOBAL_ASSIGN_RE)) {
@@ -291,6 +295,9 @@ function shimSource(dir: string, config: ShimConfig): string {
     shortcutsPage: usage.shortcutsPage,
     externalIds: Array.isArray(config.externalIds) ? config.externalIds.filter((id) => typeof id === "string") : null,
     injectShim: usage.injectsFiles ? SHIM_FILENAME : "",
+    // Relative paths in those calls and in insertCSS/removeCSS, which Firefox
+    // resolves against the calling page and Chrome from the extension root.
+    rootInjectedPaths: usage.injectsFiles || usage.injectsCss,
     // Chrome defines declarativeContent only with the permission.
     declarativeContent: usage.declarativeContent && (config.declaredPermissions ?? []).includes("declarativeContent"),
     serviceWorkerScope: config.serviceWorker === true && usage.serviceWorkerScope,
