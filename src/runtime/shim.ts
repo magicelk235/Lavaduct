@@ -1265,10 +1265,14 @@ function importsFromLiteralList(src: string, callAt: number, arg: string): strin
 
 // A pure webpack async chunk is a single statement:
 //   (globalThis.webpackChunkNAME = globalThis.webpackChunkNAME || []).push([[ids], {modules}]);
-// optionally preceded by a license banner / "use strict" and followed only by a
-// sourcemap pragma. Anything else before/after is real top-level code — that's an
-// entry script, not a registration, and must not be loaded into the background.
-const CHUNK_PREFIX_RE = /^(?:\uFEFF|\s|;|["']use strict["'];?|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*$/;
+// optionally preceded by a license banner / "use strict" / Sentry's debug-ID
+// snippet (its bundler plugin tops every emitted file with
+// `!function(){try{…e._sentryDebugIds[n]="<id>"…}catch(e){}}();`) and followed
+// only by a sourcemap or debugId pragma. Anything else before/after is real
+// top-level code — that's an entry script, not a registration, and must not be
+// loaded into the background.
+const SENTRY_DEBUG_ID_SNIPPET = String.raw`!function\(\)\{try\{(?:(?!\}catch\()[\s\S]){0,1000}?_sentryDebugIds(?:(?!\}catch\()[\s\S]){0,1000}?\}catch\([\w$]+\)\{\}\}\(\);?`;
+const CHUNK_PREFIX_RE = new RegExp(String.raw`^(?:\uFEFF|\s|;|["']use strict["'];?|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|${SENTRY_DEBUG_ID_SNIPPET})*$`);
 const CHUNK_SUFFIX_RE = /^(?:\s|;|\/\/[#@][^\n]*(?:\n|$)|\/\*[#@][\s\S]*?\*\/)*$/;
 
 /**
