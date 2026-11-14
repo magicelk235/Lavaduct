@@ -1272,10 +1272,14 @@ function importsFromLiteralList(src: string, callAt: number, arg: string): strin
 
 // A pure webpack async chunk is a single statement:
 //   (globalThis.webpackChunkNAME = globalThis.webpackChunkNAME || []).push([[ids], {modules}]);
-// optionally preceded by a license banner / "use strict" and followed only by a
-// sourcemap pragma. Anything else before/after is real top-level code — that's an
-// entry script, not a registration, and must not be loaded into the background.
-const CHUNK_PREFIX_RE = /^(?:\uFEFF|\s|;|["']use strict["'];?|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*$/;
+// optionally preceded by a license banner / "use strict" / Sentry's debug-ID
+// snippet (its bundler plugin tops every emitted file with
+// `!function(){try{…e._sentryDebugIds[n]="<id>"…}catch(e){}}();`) and followed
+// only by a sourcemap or debugId pragma. Anything else before/after is real
+// top-level code — that's an entry script, not a registration, and must not be
+// loaded into the background.
+const SENTRY_DEBUG_ID_SNIPPET = String.raw`!function\(\)\{try\{(?:(?!\}catch\()[\s\S]){0,1000}?_sentryDebugIds(?:(?!\}catch\()[\s\S]){0,1000}?\}catch\([\w$]+\)\{\}\}\(\);?`;
+const CHUNK_PREFIX_RE = new RegExp(String.raw`^(?:\uFEFF|\s|;|["']use strict["'];?|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|${SENTRY_DEBUG_ID_SNIPPET})*$`);
 const CHUNK_SUFFIX_RE = /^(?:\s|;|\/\/[#@][^\n]*(?:\n|$)|\/\*[#@][\s\S]*?\*\/)*$/;
 
 /**
@@ -1330,22 +1334,55 @@ function collectWebpackChunks(dir: string, swPath: string, hoisted: Set<string>)
   // own folder (webpack's automatic publicPath). The pages' build may share the
   // chunk global, and its chunks must stay out of the background.
   const base = posix.dirname(swPath);
-  return chunks
-    .filter((rel) => {
-      const fromWorker = base === "." ? rel : posix.relative(base, rel);
-      return !fromWorker.startsWith("../") && fromWorker.startsWith(named.prefix) && fromWorker.endsWith(named.suffix);
-    })
-    .sort();
+  const allowed = chunks.filter((rel) => {
+    const fromWorker = base === "." ? rel : posix.relative(base, rel);
+    return !fromWorker.startsWith("../") && fromWorker.startsWith(named.prefix) && fromWorker.endsWith(named.suffix);
+  });
+  // When the file name is the chunk id between fixed strings, the pages' build
+  // can share the pattern as well as the global (Bardeen: `id + ".js"` for
+  // both), and only the chunks the worker can reach are its own.
+  const reachable = named.byId ? reachableChunks(dir, base, swSrc, named) : null;
+  return (reachable ? allowed.filter((rel) => reachable.has(rel)) : allowed).sort();
+}
+
+// A chunk loaded by id: `__webpack_require__.e(123)`, or a named id in a
+// development build.
+const CHUNK_LOAD_RE = /(?<![\w$])[\w$]+\.e\(\s*(\d+|"[^"\\\n]*"|'[^'\\\n]*')\s*\)/g;
+
+/**
+ * The chunk files a worker can load: the ids its own code passes to
+ * `__webpack_require__.e`, and those the chunks it loads pass on. Null when the
+ * worker names no chunk id itself (an id built at runtime), where nothing can
+ * be ruled out.
+ */
+function reachableChunks(dir: string, base: string, swSrc: string, named: { prefix: string; suffix: string }): Set<string> | null {
+  const pending = [...swSrc.matchAll(CHUNK_LOAD_RE)].map((m) => m[1]);
+  if (!pending.length) return null;
+  const files = new Set<string>();
+  while (pending.length) {
+    const rel = posix.join(base, named.prefix + pending.pop()!.replace(/^["']|["']$/g, "") + named.suffix);
+    if (files.has(rel)) continue;
+    files.add(rel);
+    let src: string;
+    try {
+      src = readFileSync(join(dir, rel), "utf-8");
+    } catch {
+      continue; // a chunk id with no file of its own
+    }
+    for (const m of src.matchAll(CHUNK_LOAD_RE)) pending.push(m[1]);
+  }
+  return files;
 }
 
 /**
  * The fixed start and end of the file names a webpack worker's chunk filename
  * function returns, read from its text without running it:
  *   __webpack_require__.u = chunkId => "bg." + ({96: "vendors"}[chunkId] || chunkId) + ".bundle.js"
- * gives { prefix: "bg.", suffix: ".bundle.js" }. Null when there is no such
- * function or it isn't a plain concatenation.
+ * gives { prefix: "bg.", suffix: ".bundle.js", byId: false }; `t => "" + t + ".js"`
+ * gives byId: true, the name being the chunk id itself between the two. Null
+ * when there is no such function or it isn't a plain concatenation.
  */
-function chunkFileTemplate(swSrc: string): { prefix: string; suffix: string } | null {
+function chunkFileTemplate(swSrc: string): { prefix: string; suffix: string; byId: boolean } | null {
   const m = /(?:^|[^\w$.])[\w$]+\.u\s*=\s*(?:function\s*\(\s*[\w$]+\s*\)\s*\{\s*return\s+|\(?\s*[\w$]+\s*\)?\s*=>\s*)/.exec(swSrc);
   if (!m) return null;
   // The body runs to the first `;`, `,` or closing bracket outside brackets and strings.
@@ -1369,7 +1406,8 @@ function chunkFileTemplate(swSrc: string): { prefix: string; suffix: string } | 
   const lit = String.raw`(["'])([^"'\\]*)\1`;
   const head = new RegExp(`^${lit}\\s*\\+`).exec(body);
   const tail = new RegExp(`\\+\\s*${lit}$`).exec(body);
-  return { prefix: head ? head[2] : "", suffix: tail ? tail[2] : "" };
+  const middle = body.slice(head ? head[0].length : 0, tail ? body.length - tail[0].length : body.length).trim();
+  return { prefix: head ? head[2] : "", suffix: tail ? tail[2] : "", byId: /^[\w$]+$/.test(middle) };
 }
 
 // The chunk-loading global a webpack bundle declares, dot or bracket form:
