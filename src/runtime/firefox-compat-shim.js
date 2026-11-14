@@ -3157,11 +3157,32 @@
   // frame, it returns at once. Injections of a function are left alone, and
   // getRegisteredContentScripts leaves the shim out. Only emitted for a
   // bundle that injects files.
+  //
+  // Firefox also resolves a relative path in these calls, and in insertCSS and
+  // removeCSS, against the page making the call, where Chrome resolves it from
+  // the extension root. Measured on Firefox 160 from moz-extension://<uuid>/html/
+  // page.html: executeScript({ files: ["inject.js"] }) ran html/inject.js,
+  // insertCSS and removeCSS with "s.css" failed with "An unexpected error
+  // occurred", registerContentScripts stored "html/reg.js" and nothing loaded,
+  // and MV2 tabs.executeScript and insertCSS with { file } did the same. Background
+  // scripts resolve from the root, because their generated page sits there. Loom
+  // injects from its html/ pages, and the shim put first there failed as
+  // html/lavaduct-compat-shim.js ("Unable to load script"). So a relative path
+  // gets a leading "/"; absolute paths and full URLs are left as they are.
+  // Emitted for a bundle that injects files or stylesheets.
+  function rootPath(p) {
+    return typeof p === "string" && p !== "" && p.charAt(0) !== "/" && !/^[a-z][a-z\d+.-]*:/i.test(p) ? "/" + p : p;
+  }
+
+  function rootPaths(list) {
+    return Array.isArray(list) ? list.map(rootPath) : list;
+  }
+
   function withShimFirst(files) {
     var shim = CONFIG.injectShim;
     if (!Array.isArray(files) || !files.length) return files;
     var first = String(files[0]).replace(/^\/+/, "");
-    return first === shim ? files : [shim].concat(files);
+    return first === shim ? files : ["/" + shim].concat(files);
   }
 
   function withoutShim(files) {
@@ -3170,7 +3191,9 @@
   }
 
   function installInjectedScriptShim() {
-    if (typeof CONFIG.injectShim !== "string" || !CONFIG.injectShim || !isExtensionPage) return;
+    var shimFirst = typeof CONFIG.injectShim === "string" && CONFIG.injectShim !== "";
+    var root = CONFIG.rootInjectedPaths === true;
+    if (!isExtensionPage || !(shimFirst || root)) return;
     function copyWith(obj, key, value) {
       var c = {};
       for (var k in obj) c[k] = obj[k];
@@ -3178,6 +3201,12 @@
       return c;
     }
     function isolated(o) { return o && typeof o === "object" && o.world !== "MAIN"; }
+    function isDetails(o) { return !!o && typeof o === "object"; }
+    // A file list as Chrome reads it, with the shim first when it belongs there.
+    function fileList(list, inIsolatedWorld) {
+      var out = root ? rootPaths(list) : list;
+      return shimFirst && inIsolatedWorld ? withShimFirst(out) : out;
+    }
     namespaces.forEach(function (ns) {
       var scripting = null, tabs = null;
       try { scripting = ns.scripting; } catch (e) {}
@@ -3186,22 +3215,37 @@
         var exec = scripting.executeScript;
         replaceMember(scripting, "executeScript", function (details) {
           var args = Array.prototype.slice.call(arguments);
-          if (isolated(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", withShimFirst(details.files));
+          if (isDetails(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", fileList(details.files, isolated(details)));
           return exec.apply(scripting, args);
         });
       }
+      ["insertCSS", "removeCSS"].forEach(function (name) {
+        if (!root || !scripting || typeof scripting[name] !== "function") return;
+        var native = scripting[name];
+        replaceMember(scripting, name, function (details) {
+          var args = Array.prototype.slice.call(arguments);
+          if (isDetails(details) && Array.isArray(details.files)) args[0] = copyWith(details, "files", rootPaths(details.files));
+          return native.apply(scripting, args);
+        });
+      });
       ["registerContentScripts", "updateContentScripts"].forEach(function (name) {
         if (!scripting || typeof scripting[name] !== "function") return;
         var native = scripting[name];
         replaceMember(scripting, name, function (scripts) {
           var args = Array.prototype.slice.call(arguments);
           if (Array.isArray(scripts)) {
-            args[0] = scripts.map(function (s) { return isolated(s) && Array.isArray(s.js) ? copyWith(s, "js", withShimFirst(s.js)) : s; });
+            args[0] = scripts.map(function (s) {
+              if (!isDetails(s)) return s;
+              var c = s;
+              if (Array.isArray(s.js)) c = copyWith(c, "js", fileList(s.js, isolated(s)));
+              if (root && Array.isArray(s.css)) c = copyWith(c, "css", rootPaths(s.css));
+              return c;
+            });
           }
           return native.apply(scripting, args);
         });
       });
-      if (scripting && typeof scripting.getRegisteredContentScripts === "function") {
+      if (shimFirst && scripting && typeof scripting.getRegisteredContentScripts === "function") {
         var getRegistered = scripting.getRegisteredContentScripts;
         replaceMember(scripting, "getRegisteredContentScripts", function () {
           var args = Array.prototype.slice.call(arguments);
@@ -3217,9 +3261,11 @@
         var tabsExec = tabs.executeScript;
         replaceMember(tabs, "executeScript", function () {
           var args = Array.prototype.slice.call(arguments);
-          var at = typeof args[0] === "object" && args[0] !== null ? 0 : 1;
+          var at = isDetails(args[0]) ? 0 : 1;
           var details = args[at];
-          if (!details || typeof details.file !== "string" || String(details.file).replace(/^\/+/, "") === CONFIG.injectShim) return tabsExec.apply(tabs, args);
+          if (!isDetails(details) || typeof details.file !== "string") return tabsExec.apply(tabs, args);
+          if (root) args[at] = details = copyWith(details, "file", rootPath(details.file));
+          if (!shimFirst || String(details.file).replace(/^\/+/, "") === CONFIG.injectShim) return tabsExec.apply(tabs, args);
           var shimDetails = { file: "/" + CONFIG.injectShim };
           ["allFrames", "frameId", "matchAboutBlank", "runAt"].forEach(function (k) { if (details[k] !== undefined) shimDetails[k] = details[k]; });
           var shimArgs = at === 1 ? [args[0], shimDetails] : [shimDetails];
@@ -3232,6 +3278,16 @@
           return respond(ns, p, cb);
         });
       }
+      ["insertCSS", "removeCSS"].forEach(function (name) {
+        if (!root || !tabs || typeof tabs[name] !== "function") return;
+        var native = tabs[name];
+        replaceMember(tabs, name, function () {
+          var args = Array.prototype.slice.call(arguments);
+          var at = isDetails(args[0]) ? 0 : 1;
+          if (isDetails(args[at]) && typeof args[at].file === "string") args[at] = copyWith(args[at], "file", rootPath(args[at].file));
+          return native.apply(tabs, args);
+        });
+      });
     });
   }
 
@@ -4128,6 +4184,100 @@
     });
   }
 
+  // ── Chrome's error names in webRequest.onErrorOccurred ─────────────────────
+  // Chrome names a failed request's error net::ERR_*, Firefox NS_*. Blockers
+  // tell what was blocked by comparing it with Chrome's name: a request an
+  // extension blocked (a DNR block rule, a webRequest listener's cancel) is
+  // "net::ERR_BLOCKED_BY_CLIENT", and Ghostery's tracker count and AdGuard's
+  // filtering log count only those. Firefox ends both with NS_ERROR_ABORT
+  // (ExtensionDNR's applyBlock, WebRequest's cancel). The aborts Chrome names
+  // "net::ERR_ABORTED" (navigating away, closing the tab, stop, an aborted fetch
+  // or XHR, a removed frame) are NS_BINDING_ABORTED in Firefox. Measured in
+  // Firefox 160. Those two names are translated in the details the add-on's
+  // onErrorOccurred listeners get; any other error keeps Firefox's name, since
+  // its Chrome name isn't certain. One other NS_ERROR_ABORT was found:
+  // identity.launchWebAuthFlow stops its window's navigation to the redirect URL
+  // with it (this add-on's flow or another's), and that is no block, so a
+  // request to a Firefox identity redirect URL (https://<hash>.<redirect
+  // domain>/, or the loopback http://127.0.0.1/mozoauth2/<hash>) keeps
+  // Firefox's name. Downloads, completed or cancelled, and requests a redirect
+  // replaced report no NS_ERROR_ABORT. The add-on's function is wrapped once,
+  // keyed by itself, so removeListener and hasListener still find it. Only
+  // emitted for a bundle that compares against one of the two Chrome names.
+  function installWebRequestErrorNames() {
+    if (!CONFIG.webRequestErrorNames || typeof WeakMap !== "function") return;
+    var CHROME_NAMES = { NS_ERROR_ABORT: "net::ERR_BLOCKED_BY_CLIENT", NS_BINDING_ABORTED: "net::ERR_ABORTED" };
+    var LOOPBACK_REDIRECT = "http://127.0.0.1/mozoauth2/";
+    var redirectDomain = null;
+    // The domain of Firefox's identity redirect URLs: the pref
+    // extensions.webextensions.identity.redirectDomain, read off this add-on's
+    // own redirect URL where it may call identity, else Firefox's default.
+    function identityRedirectDomain() {
+      if (redirectDomain !== null) return redirectDomain;
+      redirectDomain = "extensions.allizom.org";
+      namespaces.some(function (ns) {
+        try {
+          var own = new URL(ns.identity.getRedirectURL()).hostname;
+          redirectDomain = own.slice(own.indexOf(".") + 1);
+          return true;
+        } catch (e) { return false; }
+      });
+      return redirectDomain;
+    }
+    function isIdentityRedirect(url) {
+      if (typeof url !== "string") return false;
+      if (url.indexOf(LOOPBACK_REDIRECT) === 0) return true;
+      var host = "";
+      try { host = new URL(url).hostname; } catch (e) { return false; }
+      var suffix = "." + identityRedirectDomain();
+      return url.indexOf("https:") === 0 && host.length > suffix.length && host.slice(-suffix.length) === suffix;
+    }
+    function translate(details) {
+      var error = details && typeof details === "object" ? details.error : undefined;
+      if (typeof error !== "string" || !Object.prototype.hasOwnProperty.call(CHROME_NAMES, error)) return details;
+      if (error === "NS_ERROR_ABORT" && isIdentityRedirect(details.url)) return details;
+      var out = {};
+      Object.keys(details).forEach(function (k) { out[k] = details[k]; });
+      out.error = CHROME_NAMES[error];
+      return out;
+    }
+    namespaces.forEach(function (ns) {
+      var ev = null;
+      try { ev = ns.webRequest && ns.webRequest.onErrorOccurred; } catch (e) {}
+      if (!ev || typeof ev.addListener !== "function" || ev.__viaductErrorNames) return;
+      var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+      var wrappers = new WeakMap();
+      function wrapperOf(fn) {
+        var w = wrappers.get(fn);
+        if (!w) {
+          w = function (details) {
+            var args = Array.prototype.slice.call(arguments);
+            args[0] = translate(details);
+            return fn.apply(this, args);
+          };
+          wrappers.set(fn, w);
+        }
+        return w;
+      }
+      replaceMember(ev, "addListener", function (fn) {
+        var args = Array.prototype.slice.call(arguments);
+        if (typeof fn === "function") args[0] = wrapperOf(fn);
+        return add.apply(ev, args);
+      });
+      if (typeof remove === "function") {
+        replaceMember(ev, "removeListener", function (fn) {
+          return remove.call(ev, (typeof fn === "function" && wrappers.get(fn)) || fn);
+        });
+      }
+      if (typeof has === "function") {
+        replaceMember(ev, "hasListener", function (fn) {
+          return has.call(ev, (typeof fn === "function" && wrappers.get(fn)) || fn);
+        });
+      }
+      replaceMember(ev, "__viaductErrorNames", true);
+    });
+  }
+
   // ── A listener's filter passed as false ────────────────────────────────────
   // Code built for both browsers passes an event's filter as
   // `isFirefox && { … }`, which a Chrome build compiles to
@@ -4362,6 +4512,7 @@
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
+  try { installWebRequestErrorNames(); } catch (e) { dbg("webRequest error name shim failed:", errorMessage(e)); }
   try { installMenuActionContext(); } catch (e) { dbg("menu action context shim failed:", errorMessage(e)); }
   try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }

@@ -31,15 +31,16 @@ test("files injected into the isolated world get the shim first", async () => {
   await vm.runInContext('chrome.scripting.executeScript({ target: { tabId: 1 }, files: ["/lavaduct-compat-shim.js", "b.js"] })', ctx);
   await vm.runInContext('chrome.scripting.executeScript({ target: { tabId: 1 }, files: ["page.js"], world: "MAIN" })', ctx);
   await vm.runInContext("chrome.scripting.executeScript({ target: { tabId: 1 }, func: () => 1 })", ctx);
-  assert.deepEqual(plain(calls.map((c) => c[1].files ?? "func")), [[SHIM, "inject.js"], ["/lavaduct-compat-shim.js", "b.js"], ["page.js"], "func"]);
+  // Relative paths are rooted, as Chrome resolves them (shim-injected-paths-from-root).
+  assert.deepEqual(plain(calls.map((c) => c[1].files ?? "func")), [["/" + SHIM, "/inject.js"], ["/lavaduct-compat-shim.js", "/b.js"], ["/page.js"], "func"]);
 });
 
 test("registered content scripts get it too, and getRegisteredContentScripts leaves it out", async () => {
   const { ctx, calls } = background({ "bg.js": "chrome.scripting.registerContentScripts(s)" });
   await vm.runInContext('chrome.scripting.registerContentScripts([{ id: "a", js: ["a.js"], matches: ["<all_urls>"] }, { id: "m", js: ["m.js"], world: "MAIN", matches: ["<all_urls>"] }, { id: "c", css: ["c.css"], matches: ["<all_urls>"] }])', ctx);
   await vm.runInContext('chrome.scripting.updateContentScripts([{ id: "a", js: ["a2.js"] }])', ctx);
-  assert.deepEqual(Array.from(calls[0][1], (s) => (s.js ? [...s.js] : s.js)), [[SHIM, "a.js"], ["m.js"], undefined]);
-  assert.deepEqual(plain(calls[1][1][0].js), [SHIM, "a2.js"]);
+  assert.deepEqual(Array.from(calls[0][1], (s) => (s.js ? [...s.js] : s.js)), [["/" + SHIM, "/a.js"], ["/m.js"], undefined]);
+  assert.deepEqual(plain(calls[1][1][0].js), ["/" + SHIM, "/a2.js"]);
   const listed = plain(await vm.runInContext("chrome.scripting.getRegisteredContentScripts()", ctx));
   assert.deepEqual(listed.map((s) => s.js), [["a.js"], ["m.js"]]);
   vm.runInContext("chrome.scripting.getRegisteredContentScripts((l) => { globalThis.cbList = l; })", ctx);
@@ -54,7 +55,7 @@ test("MV2 tabs.executeScript injects the shim in a call of its own first", async
   const ctx = runInContext(buildShim({}, { "bg.js": 'chrome.tabs.executeScript(1, { file: "x.js" })' }), { browser });
   const res = await vm.runInContext('chrome.tabs.executeScript(1, { file: "x.js", allFrames: true })', ctx);
   assert.deepEqual(plain(res), ["r"]);
-  assert.deepEqual(order, [[1, { file: "/" + SHIM, allFrames: true }], [1, { file: "x.js", allFrames: true }]]);
+  assert.deepEqual(order, [[1, { file: "/" + SHIM, allFrames: true }], [1, { file: "/x.js", allFrames: true }]]);
 });
 
 test("a bundle that injects nothing keeps Firefox's methods", () => {
