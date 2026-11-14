@@ -92,19 +92,22 @@ test(
     const ff = await startPrivilegedFirefox(firefox, profile);
     try {
       await ff.installAddon(result.stagedPath);
-      for (let attempt = 0; attempt < 5 && reports.length < 2; attempt++) {
+      const both = () => new Set(reports.map((r) => r.name)).size === 2;
+      for (let attempt = 0; attempt < 5 && !both(); attempt++) {
         reports.length = 0;
         await ff.chrome(`(() => {
           const w = Services.wm.getMostRecentWindow("navigator:browser");
           w.gBrowser.selectedTab = w.gBrowser.addTab(${JSON.stringify(page)}, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
           return 1;
         })()`);
-        for (let i = 0; i < 100 && reports.length < 2; i++) await sleep(100);
+        for (let i = 0; i < 100 && !both(); i++) await sleep(100);
       }
     } finally {
       await ff.close();
     }
-    assert.equal(reports.length, 2, JSON.stringify(reports));
+    // A tab from an earlier attempt can still report after the retry opened
+    // another, so each content script may report more than once.
+    assert.deepEqual([...new Set(reports.map((r) => r.name))].sort(), ["a", "b"], JSON.stringify(reports));
     for (const r of reports.sort((x, y) => x.name.localeCompare(y.name))) {
       const { calls, ...rest } = r;
       assert.deepEqual(rest, {
