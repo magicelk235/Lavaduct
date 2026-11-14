@@ -241,6 +241,7 @@ function buildAddon(
         ? (Array.isArray(manifest.externally_connectable.ids) ? manifest.externally_connectable.ids : [])
         : undefined,
       frameGrants: settings.oauthBridge !== false && !!src.chromeId && framedSites(stageDir, manifest).length > 0,
+      contentScripts: (manifest.content_scripts ?? []).filter((cs) => cs.world !== "MAIN").flatMap((cs) => cs.js ?? []),
     });
     if (settings.debug) {
       log.ok(`Debug build: shim tracing on, kept in storage.local under ${DEBUG_LOG_KEY} (read it with ${NAME} --logs). Don't ship this build.`);

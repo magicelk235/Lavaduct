@@ -3,7 +3,7 @@ import { isAbsolute, join, relative, sep } from "node:path";
 import type { Issue, Manifest } from "../types.js";
 import { parseJsonc, resolveI18nStringStrict } from "../manifest/manifest.js";
 import { UNSUPPORTED_APIS, compareFirefoxVersions } from "../manifest/compat-data.js";
-import { matchBalancedParen, rootLiteralsFromGetURL, importScriptsTargets } from "../runtime/shim.js";
+import { importScriptsCalls } from "../runtime/shim.js";
 
 /**
  * Recursive file finder. Dirent-based so each entry costs no extra stat (only
@@ -205,28 +205,17 @@ function scanJsContent(
   // ones (webpack/Workbox workers often do a static precache import first, then a
   // dynamic chunk-loader call).
   // Static means every arg is a string literal (runtime.getURL("x") counts as
-  // "/x"), or a loop over a literal list of names; importScriptsTargets() hoists
-  // both. Anything else — a variable, a concat (base + "a.js") — warns.
+  // "/x"), or a loop over a literal list of names; a call through `.call` or
+  // `.apply` with such a list, or through a function forwarding its arguments to
+  // importScripts with one literal per URL (Closure's safe importScripts, Google
+  // Dictionary), is static too. importScriptsCalls() classifies every form the
+  // converter hoists. Anything else — a variable, a concat (base + "a.js") — warns.
   // Only the manifest-declared worker is converted; importScripts in any other file
   // is a genuine web worker and keeps working. Module workers can't call
   // importScripts at all, so they're skipped.
-  // Args are extracted with the same balanced-paren scan the converter uses
-  // (matchBalancedParen); a [^)]* regex truncates at the first ")" inside an
-  // argument (webpack's `importScripts(o.p+o.u(t))`) and misclassifies.
-  const IS_OPEN_RE = /\bimportScripts\s*\(/g;
-  let isFirstAt = -1;
-  let isDynamicAt = -1;
-  if (isClassicServiceWorker) for (let m; (m = IS_OPEN_RE.exec(content)); ) {
-    if (isFirstAt === -1) isFirstAt = m.index;
-    const end = matchBalancedParen(content, m.index + m[0].length - 1);
-    if (end < 0) break;
-    const argList = rootLiteralsFromGetURL(content.slice(m.index + m[0].length, end - 1));
-    IS_OPEN_RE.lastIndex = end;
-    if (argList.trim() !== "" && importScriptsTargets(content, m.index, argList).dynamic) {
-      isDynamicAt = m.index;
-      break;
-    }
-  }
+  const isCalls = isClassicServiceWorker ? importScriptsCalls(content) : [];
+  const isFirstAt = isCalls.length ? isCalls[0].start : -1;
+  const isDynamicAt = isCalls.find((c) => c.dynamic)?.start ?? -1;
   // A dynamic call that is webpack's worker chunk loader is handled: the converter
   // lists the bundle's async chunks in background.scripts (matching the
   // webpackChunk global), so r.e() finds them loaded and never calls importScripts.
@@ -254,18 +243,17 @@ function scanJsContent(
       line: lineAt(isFirstAt),
     });
   }
-  // importScripts reached as a value instead of called by name: Closure's safe
-  // importScripts (`a.importScripts.apply(a, urls)`, Google Dictionary), a bound or
-  // aliased copy, or a bracketed lookup. The converter only finds `importScripts(` calls,
-  // so these targets are never hoisted, and the event page has no importScripts to
-  // call: the code they load (Google Dictionary's mustache.js) never runs.
-  const IS_INDIRECT_RE = /\bimportScripts\s*\.\s*(?:apply|call|bind)\s*\(|\[\s*["'`]importScripts["'`]\s*\]|=\s*(?:self|globalThis)\s*\.\s*importScripts\b(?!\s*\()/;
+  // importScripts reached as a value instead of called: a bound or aliased copy, or
+  // a bracketed lookup. The converter only finds calls (by name, through call or
+  // apply, or through a forwarding function), so these targets are never hoisted,
+  // and the event page has no importScripts to call: the code they load never runs.
+  const IS_INDIRECT_RE = /\bimportScripts\s*\.\s*bind\s*\(|\[\s*["'`]importScripts["'`]\s*\]|=\s*(?:self|globalThis)\s*\.\s*importScripts\b(?!\s*\()/;
   const indirect = isClassicServiceWorker ? IS_INDIRECT_RE.exec(content) : null;
   if (indirect) {
     issues.push({
       severity: "warning",
       category: "background",
-      message: "importScripts is called indirectly (through apply, call, bind, an alias or a bracketed name), so its targets can't be found or hoisted; the scripts it loads won't run in Firefox's background scripts.",
+      message: "importScripts is reached indirectly (through bind, an alias or a bracketed name), so its targets can't be found or hoisted; the scripts it loads won't run in Firefox's background scripts.",
       file: rel,
       line: lineAt(indirect.index),
       fix: "List the imported scripts in background.scripts ahead of the worker, or load them with a literal importScripts(\"a.js\").",
