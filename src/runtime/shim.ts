@@ -191,6 +191,46 @@ const FROZEN_KEY_RE = /\bfrozen\s*:|["'`]frozen["'`]/;
 // (`Object.assign(console, …)`, `(function (c) { … })(console)`): in a content
 // script the page's console only lets each be replaced once.
 const CONSOLE_PATCH_RE = /\bconsole\s*(?:\.\s*[\w$]+|\[[^\]\n]{1,40}\])\s*=(?!=)|\b(?:assign|defineProperty|defineProperties)\s*\(\s*console\b|\(\s*console\s*\)/;
+// Members a bundle replaces on objects a content script sees through an Xray,
+// which in Firefox only lets each be replaced once (see collectPatchedMembers).
+// `Interface.prototype.member = …`, the interface named the way DOM interfaces
+// are (a capital and two more characters; a minifier's `G.prototype.x = …` is a
+// class of its own, which the shim would skip anyway).
+const PROTO_MEMBER_ASSIGN_RE = /(?<![\w$.])([A-Z][\w$]{2,})\.prototype\.([A-Za-z_$][\w$]*)\s*=(?![=>])/g;
+// A helper that replaces `obj[name]` for its caller: Sentry's fill(source, name,
+// factory), minified `function ln(r,o,u){if(!(o in r))return;…r[o]=l}`, or in
+// newer releases `…try{e[t]=o}catch{…}`. The head; the body is brace-matched.
+const FILL_HELPER_HEAD_RE = /(?:\bfunction\s+([A-Za-z_$][\w$]*)|(?<![\w$.])([A-Za-z_$][\w$]*)\s*=\s*function)\s*\(\s*([A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$]*)\s*(?:,[^()]*)?\)\s*\{/g;
+// A helper is a few statements; a longer body is some other function.
+const FILL_HELPER_MAX_BODY = 1000;
+
+/**
+ * The members a script replaces in a way that, in a Firefox content script, works
+ * only the first time: `Interface.prototype.member = …`, and the literal names a
+ * fill helper is called with (`fill(XMLHttpRequest.prototype, "open", …)`,
+ * `fill(proto, "addEventListener", …)`). A name whose object is an interface's
+ * prototype goes under that interface; one on any other object under "".
+ */
+function collectPatchedMembers(src: string, into: Map<string, Set<string>>): void {
+  const add = (owner: string, name: string) => {
+    let set = into.get(owner);
+    if (!set) into.set(owner, (set = new Set()));
+    set.add(name);
+  };
+  for (const m of src.matchAll(PROTO_MEMBER_ASSIGN_RE)) add(m[1], m[2]);
+  for (const m of src.matchAll(FILL_HELPER_HEAD_RE)) {
+    const name = m[1] ?? m[2], obj = m[3], key = m[4];
+    const brace = m.index + m[0].length - 1;
+    const end = matchBalanced(src, brace);
+    if (end < 0 || end - brace > FILL_HELPER_MAX_BODY) continue;
+    if (!new RegExp(`(?<![\\w$.])${identPattern(obj)}\\s*\\[\\s*${identPattern(key)}\\s*\\]\\s*=(?![=>])`).test(src.slice(brace, end))) continue;
+    const callRe = new RegExp(`(?<![\\w$.])${identPattern(name)}\\s*\\(\\s*([^,()]{1,120}?)\\s*,\\s*(["'])([A-Za-z_$][\\w$]*)\\2`, "g");
+    for (const c of src.matchAll(callRe)) {
+      const proto = /(?:^|\.)([A-Z][\w$]{2,})\.prototype$/.exec(c[1].trim());
+      add(proto ? proto[1] : "", c[3]);
+    }
+  }
+}
 // The add-on's own ID read, and selector calls it can end up in unquoted: a
 // Chrome ID is a CSS identifier, Firefox's gecko ID isn't.
 const RUNTIME_ID_RE = /\bruntime\s*(?:\?\.|\.)\s*id\b/;
@@ -269,6 +309,7 @@ interface Usage {
   cookieStoreId: boolean;
   frozenKey: boolean;
   consolePatch: boolean;
+  patchedMembers: Map<string, Set<string>>;
   runtimeId: boolean;
   selectorCall: boolean;
   windowMethodTaken: boolean;
@@ -282,7 +323,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, builtinAliasWrite: false, firefoxAware: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false, windowMethodTaken: false, homepageUrl: false, hasListenersCall: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false, windowMethodTaken: false, homepageUrl: false, hasListenersCall: false, patchedMembers: new Map(),
   };
   const ownId = chromeId.toLowerCase();
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -333,6 +374,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
       if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
       if (!found.frozenKey) found.frozenKey = FROZEN_KEY_RE.test(src);
       if (!found.consolePatch) found.consolePatch = CONSOLE_PATCH_RE.test(src);
+      collectPatchedMembers(src, found.patchedMembers);
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
       if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
       if (!found.windowMethodTaken) found.windowMethodTaken = WINDOW_METHOD_TAKEN_RE.test(src);
@@ -455,6 +497,9 @@ function shimSource(dir: string, config: ShimConfig): string {
     ownIdMessages: usage.chromeIdLiteral,
     tabsQueryFrozen: usage.frozenKey,
     contentConsole: usage.consolePatch,
+    contentPatchedMembers: usage.patchedMembers.size
+      ? Object.fromEntries([...usage.patchedMembers].sort(([a], [b]) => (a < b ? -1 : 1)).map(([owner, names]) => [owner, [...names].sort()]))
+      : null,
     contentGlobals: contentGlobalNames(dir, config.contentScripts ?? []),
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
