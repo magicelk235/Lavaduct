@@ -2447,6 +2447,60 @@
     });
   }
 
+  // ── downloads.onDeterminingFilename ────────────────────────────────────────
+  // Firefox has no such event: it takes the filename in downloads.download()
+  // up front, before the download has an id, so Chrome's order (the callback
+  // gets the id, then listeners suggest a name for it) can't be emulated. Code
+  // that adds or checks a listener threw instead, and Image Downloader's whole
+  // batch with it. The event exists and never fires, so downloads keep
+  // Firefox's own filenames, as they would in Chrome with no suggestion.
+  function installDeterminingFilename() {
+    namespaces.forEach(function (ns) {
+      var downloads = null;
+      try { downloads = ns.downloads; } catch (e) {}
+      if (downloads && typeof downloads === "object") defineMissing(downloads, "onDeterminingFilename", makeEvent().event);
+    });
+  }
+
+  // ── management's homepageUrl for an add-on from the Web Store ──────────────
+  // Chrome gives an extension installed from the Web Store, without a
+  // homepage_url of its own, the store's detail page as homepageUrl. Firefox
+  // leaves the member out, and BlockSite's install analytics read
+  // getSelf().homepageUrl.length and threw. getSelf() and get() fill it in for
+  // the add-on itself, only when Firefox gives none. Emitted for a converted
+  // Web Store add-on whose code reads homepageUrl.
+  function installHomepageUrl() {
+    var url = CONFIG.webStoreHomepage;
+    if (typeof url !== "string" || !url) return;
+    namespaces.forEach(function (ns) {
+      var management = null;
+      try { management = ns.management; } catch (e) {}
+      if (!management || typeof management !== "object") return;
+      var ownId = "";
+      try { ownId = ns.runtime.id; } catch (e) {}
+      function fill(info) {
+        if (info && typeof info === "object" && info.id === ownId && info.homepageUrl == null) {
+          try { info.homepageUrl = url; } catch (e) {}
+        }
+        return info;
+      }
+      ["getSelf", "get"].forEach(function (name) {
+        var native = management[name];
+        if (typeof native !== "function") return;
+        replaceMember(management, name, function () {
+          var args = Array.prototype.slice.call(arguments);
+          var cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+          if (cb) {
+            args.push(function (info) { return cb.apply(this, [fill(info)].concat(Array.prototype.slice.call(arguments, 1))); });
+            return native.apply(management, args);
+          }
+          var p = native.apply(management, args);
+          return p && typeof p.then === "function" ? p.then(fill) : p;
+        });
+      });
+    });
+  }
+
   // ── browserAction in an MV3 add-on ──────────────────────────────────────────
   // Firefox gives an MV3 add-on `action` and no `browserAction`, as Chrome does.
   // A bundle that also ships to Firefox as MV2 picks its Firefox branch by user
@@ -4669,6 +4723,8 @@
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installContentConsole(); } catch (e) { dbg("content console shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
+  try { installDeterminingFilename(); } catch (e) { dbg("downloads.onDeterminingFilename shim failed:", errorMessage(e)); }
+  try { installHomepageUrl(); } catch (e) { dbg("management homepageUrl shim failed:", errorMessage(e)); }
   try { installDefaultCookieStore(); } catch (e) { dbg("default cookie store shim failed:", errorMessage(e)); }
   try { installTabsQueryFrozen(); } catch (e) { dbg("tabs.query frozen shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
