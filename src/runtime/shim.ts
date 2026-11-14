@@ -122,6 +122,9 @@ const CUSTOM_EVENT_RE = /\bnew\s+(?:[\w$]+\s*\.\s*)?CustomEvent\b|\binitCustomEv
 // an MV3 bundle's Firefox branch does; not the name alone, which polyfill
 // metadata and message keys carry.
 const BROWSER_ACTION_MEMBER_RE = /\bbrowserAction\s*(?:\?\.|\.)\s*[A-Za-z_$]/;
+// Chrome's event.hasListeners(), which takes no argument (an emitter's
+// hasListeners("name") isn't it).
+const HAS_LISTENERS_CALL_RE = /\.\s*hasListeners\s*\(\s*\)/;
 // Methods Firefox only promises and Chrome calls back from (the shim's
 // PROMISE_ONLY, userScripts aside), by name.
 const PROMISE_ONLY_CALL_RE = /\.\s*(getBadgeTextColor|setBadgeTextColor|isEnabled|openPopup|setPopup|discard|ungroup)\b/g;
@@ -201,6 +204,7 @@ interface Usage {
   declarativeContent: boolean;
   storageGlobalsAssigned: string[];
   falsyListenerArg: boolean;
+  hasListenersCall: boolean;
   browserAction: boolean;
   promiseOnlyCalls: string[];
   sessionAccess: boolean;
@@ -214,7 +218,7 @@ function scanUsage(dir: string): Usage {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, hasListenersCall: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -257,6 +261,7 @@ function scanUsage(dir: string): Usage {
         if (!found.promiseOnlyCalls.includes(m[1])) found.promiseOnlyCalls.push(m[1]);
       }
       if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
+      if (!found.hasListenersCall) found.hasListenersCall = HAS_LISTENERS_CALL_RE.test(src);
       if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
       if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
@@ -332,6 +337,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     ownIdSelectors: usage.runtimeId && usage.selectorCall,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,
+    eventHasListeners: usage.hasListenersCall,
     browserActionAlias: usage.browserAction,
     promiseOnlyCalls: usage.promiseOnlyCalls.sort(),
     sessionAccess: usage.sessionAccess,

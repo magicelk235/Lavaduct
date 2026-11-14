@@ -33,7 +33,8 @@
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
 //     temporarily again and again;
 //   - the "browser_action" menu context, which Firefox refuses from MV3;
-//   - Chrome's callback on methods Firefox only gives a promise.
+//   - Chrome's callback on methods Firefox only gives a promise;
+//   - hasListeners() on events, which Firefox's lack.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -3989,6 +3990,31 @@
     });
   }
 
+  // Calls visit(ev) once for every event object (an `on…` member with
+  // addListener) the namespaces hold at most three levels down
+  // (chrome.devtools.network.onNavigated); chrome and browser share them.
+  function forEachNamespaceEvent(visit) {
+    var seen = [];
+    function walk(obj, depth) {
+      var keys;
+      try { keys = Object.keys(obj); } catch (e) { return; }
+      keys.forEach(function (key) {
+        var v = null;
+        try { v = obj[key]; } catch (e) {}
+        if (!v || typeof v !== "object") return;
+        if (/^on[A-Z]/.test(key)) {
+          if (typeof v.addListener === "function" && seen.indexOf(v) < 0) {
+            seen.push(v);
+            visit(v);
+          }
+        } else if (depth > 0) {
+          walk(v, depth - 1);
+        }
+      });
+    }
+    namespaces.forEach(function (ns) { walk(ns, 2); });
+  }
+
   // ── A listener's filter passed as false ────────────────────────────────────
   // Code built for both browsers passes an event's filter as
   // `isFirefox && { … }`, which a Chrome build compiles to
@@ -3998,37 +4024,56 @@
   // trailing argument that is falsy (false, 0, "", null, undefined) is left
   // out instead: that's what the add-on means by it. The function is passed on
   // as it is, so removeListener and hasListener still find it. Every event
-  // object the namespaces hold is wrapped once (chrome and browser share them);
-  // a namespace a later permission grant adds isn't. Only emitted for a bundle
-  // that passes addListener a last argument that may be false.
+  // object the namespaces hold is wrapped once; a namespace a later permission
+  // grant adds isn't. Only emitted for a bundle that passes addListener a last
+  // argument that may be false.
   function installFalsyListenerArgs() {
     if (!CONFIG.falsyListenerArgs) return;
-    var wrapped = [];
-    function wrapEvent(ev) {
-      if (wrapped.indexOf(ev) >= 0) return;
-      wrapped.push(ev);
+    forEachNamespaceEvent(function (ev) {
       var add = ev.addListener;
       replaceMember(ev, "addListener", function () {
         var args = Array.prototype.slice.call(arguments);
         while (args.length > 1 && !args[args.length - 1]) args.length--;
         return add.apply(ev, args);
       });
-    }
-    function walk(obj, depth) {
-      var keys;
-      try { keys = Object.keys(obj); } catch (e) { return; }
-      keys.forEach(function (key) {
-        var v = null;
-        try { v = obj[key]; } catch (e) {}
-        if (!v || typeof v !== "object") return;
-        if (/^on[A-Z]/.test(key)) {
-          if (typeof v.addListener === "function") wrapEvent(v);
-        } else if (depth > 0) {
-          walk(v, depth - 1);
-        }
+    });
+  }
+
+  // ── event.hasListeners() ───────────────────────────────────────────────────
+  // Chrome's events have hasListeners(), true when the event has any listener
+  // in this context; Firefox's have hasListener(fn) only. Code calls it at top
+  // level (Brisk's Datadog content script: runtime.onMessage.hasListeners()) or
+  // before removing a listener (Norton's and Avira's password managers:
+  // windows.onRemoved, history.onVisited), and the TypeError ends the script.
+  // Each event without one gets it: addListener and removeListener keep the
+  // functions passed through them, unchanged, and hasListeners() asks the
+  // event's own hasListener about each, so a listener removed some other way
+  // doesn't count. Listeners added before the shim ran (none of the add-on's)
+  // aren't seen. Only emitted for a bundle that calls hasListeners().
+  function installEventHasListeners() {
+    if (!CONFIG.eventHasListeners) return;
+    forEachNamespaceEvent(function (ev) {
+      var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+      if (typeof ev.hasListeners === "function" || typeof remove !== "function" || typeof has !== "function") return;
+      var added = new Set();
+      replaceMember(ev, "addListener", function (fn) {
+        var r = add.apply(ev, arguments);
+        if (typeof fn === "function") added.add(fn);
+        return r;
       });
-    }
-    namespaces.forEach(function (ns) { walk(ns, 2); });
+      replaceMember(ev, "removeListener", function (fn) {
+        added.delete(fn);
+        return remove.apply(ev, arguments);
+      });
+      replaceMember(ev, "hasListeners", function () {
+        var any = false;
+        added.forEach(function (fn) {
+          if (any) return;
+          try { any = !!has.call(ev, fn); } catch (e) {}
+        });
+        return any;
+      });
+    });
   }
 
   // ── permissions Firefox doesn't know ───────────────────────────────────────
@@ -4233,5 +4278,6 @@
   try { installStorageCloneFallback(); } catch (e) { dbg("storage clone fallback failed:", errorMessage(e)); }
   try { installProxySettings(); } catch (e) { dbg("proxy.settings shim failed:", errorMessage(e)); }
   try { installPromiseOnlyCallbacks(); } catch (e) { dbg("promise-only callback shim failed:", errorMessage(e)); }
+  try { installEventHasListeners(); } catch (e) { dbg("event hasListeners shim failed:", errorMessage(e)); }
   // __SHIM_DEBUGGER__
 })();
