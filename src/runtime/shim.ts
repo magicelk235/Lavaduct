@@ -117,6 +117,10 @@ const CUSTOM_EVENT_RE = /\bnew\s+(?:[\w$]+\s*\.\s*)?CustomEvent\b|\binitCustomEv
 // `console.log = f`, or console as an object held elsewhere (`g.console`,
 // handed to Sentry's fill()), any of which may replace its methods.
 const CONSOLE_ASSIGN_RE = /\bconsole\s*\[|\bconsole\s*\.\s*[A-Za-z_$][\w$]*\s*=(?![=>])|\.\s*console\b/;
+// A window method taken off the window rather than called on it: by name
+// (`["setTimeout", "setInterval"].forEach((k) => wrap(window, k))`, Bugsnag) or
+// read without a call (`var raf = window.requestAnimationFrame`).
+const WINDOW_METHOD_TAKEN_RE = /["'`](?:setTimeout|setInterval|requestAnimationFrame|requestIdleCallback|addEventListener)["'`]|\b(?:window|self)\s*\.\s*(?:setTimeout|setInterval|clearTimeout|clearInterval|requestAnimationFrame|cancelAnimationFrame|requestIdleCallback|cancelIdleCallback|queueMicrotask|fetch|getComputedStyle|matchMedia)\b(?!\s*\()/;
 // A member of MV2's browserAction read (`chrome.browserAction.onClicked`), which
 // an MV3 bundle's Firefox branch does; not the name alone, which polyfill
 // metadata and message keys carry.
@@ -205,6 +209,7 @@ interface Usage {
   runtimeId: boolean;
   selectorCall: boolean;
   consoleAssign: boolean;
+  windowMethodTaken: boolean;
 }
 
 function scanUsage(dir: string): Usage {
@@ -212,7 +217,7 @@ function scanUsage(dir: string): Usage {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, consoleAssign: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, consoleAssign: false, windowMethodTaken: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -258,6 +263,7 @@ function scanUsage(dir: string): Usage {
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
       if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
       if (!found.consoleAssign) found.consoleAssign = CONSOLE_ASSIGN_RE.test(src);
+      if (!found.windowMethodTaken) found.windowMethodTaken = WINDOW_METHOD_TAKEN_RE.test(src);
     }
   }
   return found;
@@ -323,6 +329,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     messageJson: usage.messaging,
     pageEventDetail: usage.customEvent,
     consoleAssign: usage.consoleAssign,
+    windowMethodReceivers: usage.windowMethodTaken,
     ownIdSelectors: usage.runtimeId && usage.selectorCall,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,
