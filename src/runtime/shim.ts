@@ -96,6 +96,9 @@ const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
 const BROWSER_ACTION_CONTEXT_RE = /["'`]browser_action["'`]/;
 // A body read as JSON, whose objects a Firefox content script gets from the page's realm.
 const BODY_JSON_RE = /\.\s*json\s*\(\s*\)/;
+// A global looked up through self or window, which in a Firefox content script
+// is the page's window, whose built-ins are the page's.
+const WINDOW_GLOBAL_LOOKUP_RE = /\btypeof\s+(?:self|window)\b|\b(?:self|window)\s*\.\s*(?:Object|Array|Reflect|Symbol|Promise|Map|Set|Math|JSON|Proxy|Intl|Date|RegExp|Error|ArrayBuffer|Uint8Array)\b/;
 // The storage areas whose set the clone fallback wraps.
 const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
 // Chrome's proxy settings, which the shim emulates on proxy.onRequest.
@@ -186,6 +189,7 @@ interface Usage {
   extraHeaders: boolean;
   browserActionContext: boolean;
   bodyJson: boolean;
+  windowGlobalLookup: boolean;
   storage: boolean;
   proxySettings: boolean;
   messaging: boolean;
@@ -206,7 +210,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
+    extraHeaders: false, browserActionContext: false, bodyJson: false, windowGlobalLookup: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
     promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -234,6 +238,7 @@ function scanUsage(dir: string): Usage {
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
       if (!found.browserActionContext) found.browserActionContext = BROWSER_ACTION_CONTEXT_RE.test(src);
       if (!found.bodyJson) found.bodyJson = BODY_JSON_RE.test(src);
+      if (!found.windowGlobalLookup) found.windowGlobalLookup = WINDOW_GLOBAL_LOOKUP_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.proxySettings) found.proxySettings = PROXY_SETTINGS_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
@@ -311,6 +316,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     extraHeaders: usage.extraHeaders,
     menuActionContext: usage.browserActionContext,
     contentBodyJson: usage.bodyJson,
+    contentWindowBuiltins: usage.windowGlobalLookup,
     storageClone: usage.storage,
     proxySettings: usage.proxySettings,
     pacPage: usage.proxySettings ? PAC_PAGE : "",

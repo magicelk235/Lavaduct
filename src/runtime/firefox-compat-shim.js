@@ -2195,6 +2195,36 @@
     defineMissing(window, "chrome", ns);
   }
 
+  // ── The script's own built-ins on window in content scripts ────────────────
+  // The same Xray makes `window.Reflect` and `self.Reflect` the page's Reflect
+  // (`self.Object !== Object`), where Chrome's isolated world has
+  // `window.Reflect === Reflect`. Defining a function on a page object through
+  // the Xray throws "Not allowed to define cross-origin object as property on
+  // [Object] or [Array] XrayWrapper": reflect-metadata (tsyringe, inversify)
+  // takes `self` as its global and defines its functions on root.Reflect, and
+  // Avast Online Security's content script died on that line on every page.
+  // The ECMAScript built-ins are set on the Xray to the script's own, which only
+  // this add-on's content scripts see. Function stays the page's, so code it
+  // builds keeps running under the page's CSP, and so do the window's web APIs.
+  // Emitted for a bundle that looks the global up through self or window.
+  var OWN_BUILTINS = ["Object", "Array", "Boolean", "Number", "String", "Symbol", "BigInt", "Math", "JSON", "Reflect", "Proxy",
+    "Promise", "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "Date", "RegExp", "Intl", "Atomics", "Iterator",
+    "Error", "AggregateError", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
+    "ArrayBuffer", "SharedArrayBuffer", "DataView", "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+    "Int32Array", "Uint32Array", "Float16Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array"];
+  function installContentWindowBuiltins() {
+    if (!CONFIG.contentWindowBuiltins || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    OWN_BUILTINS.forEach(function (name) {
+      var own;
+      try { own = G[name]; } catch (e) { return; }
+      if (own == null) return;
+      try {
+        if (window[name] === own) return;
+        Object.defineProperty(window, name, { value: own, writable: true, configurable: true, enumerable: false });
+      } catch (e) {}
+    });
+  }
+
   // ── The add-on's ID in a CSS selector ──────────────────────────────────────
   // A Chrome ID is 32 letters from a to p, a CSS identifier, so code written for
   // Chrome puts chrome.runtime.id in selectors unquoted: Hypothesis's boot script
@@ -4062,6 +4092,7 @@
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installContentWindowBuiltins(); } catch (e) { dbg("content window built-ins shim failed:", errorMessage(e)); }
   try { installOwnIdSelectors(); } catch (e) { dbg("own ID selector shim failed:", errorMessage(e)); }
   try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
