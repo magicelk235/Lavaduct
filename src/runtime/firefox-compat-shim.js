@@ -2443,6 +2443,21 @@
     });
   }
 
+  // ── downloads.onDeterminingFilename ────────────────────────────────────────
+  // Firefox has no such event: it takes the filename in downloads.download()
+  // up front, before the download has an id, so Chrome's order (the callback
+  // gets the id, then listeners suggest a name for it) can't be emulated. Code
+  // that adds or checks a listener threw instead, and Image Downloader's whole
+  // batch with it. The event exists and never fires, so downloads keep
+  // Firefox's own filenames, as they would in Chrome with no suggestion.
+  function installDeterminingFilename() {
+    namespaces.forEach(function (ns) {
+      var downloads = null;
+      try { downloads = ns.downloads; } catch (e) {}
+      if (downloads && typeof downloads === "object") defineMissing(downloads, "onDeterminingFilename", makeEvent().event);
+    });
+  }
+
   // ── browserAction in an MV3 add-on ──────────────────────────────────────────
   // Firefox gives an MV3 add-on `action` and no `browserAction`, as Chrome does.
   // A bundle that also ships to Firefox as MV2 picks its Firefox branch by user
@@ -4665,6 +4680,7 @@
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installContentConsole(); } catch (e) { dbg("content console shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
+  try { installDeterminingFilename(); } catch (e) { dbg("downloads.onDeterminingFilename shim failed:", errorMessage(e)); }
   try { installDefaultCookieStore(); } catch (e) { dbg("default cookie store shim failed:", errorMessage(e)); }
   try { installTabsQueryFrozen(); } catch (e) { dbg("tabs.query frozen shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
