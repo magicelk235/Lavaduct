@@ -3839,6 +3839,68 @@
     });
   }
 
+  // ── Chrome's error names in webRequest.onErrorOccurred ─────────────────────
+  // Chrome names a failed request's error net::ERR_*, Firefox NS_*. Blockers
+  // tell what was blocked by comparing it with Chrome's name: a request an
+  // extension blocked (a DNR block rule, a webRequest listener's cancel) is
+  // "net::ERR_BLOCKED_BY_CLIENT", and Ghostery's tracker count and AdGuard's
+  // filtering log count only those. Firefox ends both with NS_ERROR_ABORT
+  // (ExtensionDNR's applyBlock, WebRequest's cancel). The aborts Chrome names
+  // "net::ERR_ABORTED" (navigating away, closing the tab, stop, an aborted fetch
+  // or XHR, a removed frame) are NS_BINDING_ABORTED in Firefox. Measured in
+  // Firefox 160. Those two names are translated in the details the add-on's
+  // onErrorOccurred listeners get; any other error keeps Firefox's name, since
+  // its Chrome name isn't certain. The add-on's function is wrapped once, keyed
+  // by itself, so removeListener and hasListener still find it. Only emitted for
+  // a bundle that compares against one of the two Chrome names.
+  function installWebRequestErrorNames() {
+    if (!CONFIG.webRequestErrorNames || typeof WeakMap !== "function") return;
+    var CHROME_NAMES = { NS_ERROR_ABORT: "net::ERR_BLOCKED_BY_CLIENT", NS_BINDING_ABORTED: "net::ERR_ABORTED" };
+    function translate(details) {
+      var error = details && typeof details === "object" ? details.error : undefined;
+      if (typeof error !== "string" || !Object.prototype.hasOwnProperty.call(CHROME_NAMES, error)) return details;
+      var out = {};
+      Object.keys(details).forEach(function (k) { out[k] = details[k]; });
+      out.error = CHROME_NAMES[error];
+      return out;
+    }
+    namespaces.forEach(function (ns) {
+      var ev = null;
+      try { ev = ns.webRequest && ns.webRequest.onErrorOccurred; } catch (e) {}
+      if (!ev || typeof ev.addListener !== "function" || ev.__viaductErrorNames) return;
+      var add = ev.addListener, remove = ev.removeListener, has = ev.hasListener;
+      var wrappers = new WeakMap();
+      function wrapperOf(fn) {
+        var w = wrappers.get(fn);
+        if (!w) {
+          w = function (details) {
+            var args = Array.prototype.slice.call(arguments);
+            args[0] = translate(details);
+            return fn.apply(this, args);
+          };
+          wrappers.set(fn, w);
+        }
+        return w;
+      }
+      replaceMember(ev, "addListener", function (fn) {
+        var args = Array.prototype.slice.call(arguments);
+        if (typeof fn === "function") args[0] = wrapperOf(fn);
+        return add.apply(ev, args);
+      });
+      if (typeof remove === "function") {
+        replaceMember(ev, "removeListener", function (fn) {
+          return remove.call(ev, (typeof fn === "function" && wrappers.get(fn)) || fn);
+        });
+      }
+      if (typeof has === "function") {
+        replaceMember(ev, "hasListener", function (fn) {
+          return has.call(ev, (typeof fn === "function" && wrappers.get(fn)) || fn);
+        });
+      }
+      replaceMember(ev, "__viaductErrorNames", true);
+    });
+  }
+
   // ── A listener's filter passed as false ────────────────────────────────────
   // Code built for both browsers passes an event's filter as
   // `isFirefox && { … }`, which a Chrome build compiles to
@@ -4073,6 +4135,7 @@
   try { installWorkerChunks(); } catch (e) { dbg("worker chunk shim failed:", errorMessage(e)); }
   try { installPermissions(); } catch (e) { dbg("permissions shim failed:", errorMessage(e)); }
   try { installWebRequestExtraHeaders(); } catch (e) { dbg("webRequest extraHeaders shim failed:", errorMessage(e)); }
+  try { installWebRequestErrorNames(); } catch (e) { dbg("webRequest error name shim failed:", errorMessage(e)); }
   try { installMenuActionContext(); } catch (e) { dbg("menu action context shim failed:", errorMessage(e)); }
   try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
