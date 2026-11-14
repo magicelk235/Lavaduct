@@ -27,8 +27,10 @@
 //     Firefox's gecko ID doesn't;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
-//     userScripts grant, Chrome's chrome.runtime in the USER_SCRIPT world, and
-//     relative import() in registered user-script code, against the add-on;
+//     userScripts grant; Chrome's USER_SCRIPT world (chrome.runtime, CustomEvent
+//     details cloned into the reading world, no cloneInto/exportFunction);
+//     tabs.sendMessage reaching that world's onMessage; and relative import()
+//     in registered user-script code, against the add-on;
 //   - webpack chunks of a worker bundle, listed ahead of the worker;
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
 //     temporarily again and again;
@@ -2557,20 +2559,171 @@
   }
 
   // ── USER_SCRIPT world ──────────────────────────────────────────────────────
-  // With messaging on, Chrome's USER_SCRIPT world gets chrome.runtime with id
-  // (a template property on every runtime object), lastError, sendMessage,
+  // Every USER_SCRIPT registration gets a first code entry that makes the world
+  // look like Chrome's to the add-on's code. It runs in the same world ahead of
+  // the scripts, as source text, so it closes over nothing in this file.
+  //
+  // runtime: with messaging on, Chrome's world gets chrome.runtime with id (a
+  // template property on every runtime object), lastError, sendMessage,
   // connect, onMessage and onConnect. Firefox gives it sendMessage and connect
-  // only, so a script reading chrome.runtime.id gets undefined and one adding an
-  // onMessage listener throws. Every USER_SCRIPT registration gets a first code
-  // entry that fills in id and inert onMessage/onConnect events (Firefox never
-  // delivers tabs.sendMessage to that world). It runs in the same world ahead of
-  // the scripts, and changes nothing where messaging is off (no chrome.runtime).
+  // only, so a script reading chrome.runtime.id gets undefined and one adding
+  // an onMessage listener throws. id, lastError and the events are filled in;
+  // nothing changes where messaging is off (no chrome.runtime). onMessage
+  // hears what the add-on's pages send the tab (deliverToUserScripts below);
+  // onConnect stays inert: no tabs.connect port reaches this world.
+  //
+  // CustomEvent details: Chrome structured-clones a detail into the world that
+  // reads it (blink's WorldSafeV8Reference), so a user script reads a plain
+  // object of its own from the page or a content script, and they read its
+  // details. Firefox hands the user-script world the page's object through an
+  // Xray, which refuses an object of this world as a property value ("Not
+  // allowed to define cross-origin object as property on [Object] or [Array]
+  // XrayWrapper"), and a content script's object, whose every property read
+  // throws "Permission denied to access property"; the page can't read this
+  // world's objects either. Here a detail from another world reads as a clone
+  // in this one, and an event this world creates carries a clone in the page's
+  // compartment while this world keeps reading its own object, as in the
+  // content-script shim. A detail cloneInto refuses (one holding a function)
+  // reads as before.
+  //
+  // cloneInto, exportFunction and createObjectIn: Firefox defines them in the
+  // user-script world, Chrome doesn't. A Chrome build that feature-detects them
+  // takes its Firefox code path, compiled for Firefox's content scripts and cut
+  // down in the Chrome build (Violentmonkey's GM_xmlhttpRequest clones a
+  // request into the page and then sets a property on it, which its Firefox
+  // build copies back first). With the details cloned as Chrome clones them,
+  // the three are taken out of the world, so the add-on takes its Chrome path.
+  function userScriptWorld(id) {
+    var G = globalThis;
+    // The world outlives one registration's injection: what it keeps lives
+    // under one key, and is set up once.
+    var mark = typeof Symbol === "function" && Symbol.for("lavaduct.userScriptWorld");
+    if (!mark) return;
+    var world = G[mark];
+    var first = !world;
+    if (first) {
+      world = { messageListeners: [] };
+      try { Object.defineProperty(G, mark, { value: world }); } catch (e) { return; }
+    }
+    try {
+      var c = typeof chrome === "object" && chrome || typeof browser === "object" && browser;
+      var r = c && c.runtime;
+      if (r) {
+        if (r.id == null) Object.defineProperty(r, "id", { value: id, enumerable: true, configurable: true });
+        var ev = function (l) {
+          return {
+            addListener: function (f) { if (typeof f === "function" && l.indexOf(f) < 0) l.push(f); },
+            removeListener: function (f) { var i = l.indexOf(f); if (i >= 0) l.splice(i, 1); },
+            hasListener: function (f) { return l.indexOf(f) >= 0; },
+            hasListeners: function () { return l.length > 0; },
+          };
+        };
+        if (r.onMessage == null) r.onMessage = ev(world.messageListeners);
+        if (r.onConnect == null) r.onConnect = ev([]);
+        if (!("lastError" in r)) r.lastError = undefined;
+      }
+    } catch (e) {}
+    if (!first) return;
+    // A message for this world's onMessage listeners, as JSON (Chrome's
+    // serialization), answered as JSON: {v} for a response, {e} for a
+    // listener's rejected promise, "u" when listeners gave none, "n" when
+    // there are none.
+    world.deliver = function (json, sender) {
+      var listeners = world.messageListeners.slice();
+      if (!listeners.length) return "n";
+      var message = JSON.parse(json);
+      return new Promise(function (resolve) {
+        var done = false;
+        var waiting = false;
+        var answer = function (v) {
+          if (done) return;
+          done = true;
+          var s;
+          try { s = JSON.stringify({ v: v }); } catch (e) { s = "{}"; }
+          resolve(s);
+        };
+        var fail = function (e) {
+          if (done) return;
+          done = true;
+          resolve(JSON.stringify({ e: String((e && e.message) || e) }));
+        };
+        listeners.forEach(function (f) {
+          var ret;
+          try { ret = f(message, sender, answer); } catch (e) { setTimeout(function () { throw e; }, 0); return; }
+          if (ret === true) waiting = true;
+          else if (ret && typeof ret.then === "function") { waiting = true; ret.then(answer, fail); }
+        });
+        if (!waiting && !done) { done = true; resolve("u"); }
+      });
+    };
+    try {
+      var clone = G.cloneInto;
+      var page = typeof window === "object" && window;
+      var Native = page && page.CustomEvent;
+      var proto = Native && Native.prototype;
+      var desc = proto && Object.getOwnPropertyDescriptor(proto, "detail");
+      var nativeDetail = desc && desc.get;
+      var nativeInit = proto && proto.initCustomEvent;
+      if (typeof clone !== "function" || typeof Native !== "function" || typeof nativeDetail !== "function" || typeof WeakMap !== "function") return;
+      var isObject = function (v) { return v !== null && (typeof v === "object" || typeof v === "function"); };
+      // Events this world made, with the object it passed.
+      var own = new WeakMap();
+      // Events from other worlds, with the detail they carry and its clone here.
+      var read = new WeakMap();
+      var into = function (v, scope) {
+        try { return clone(v, scope, { wrapReflectors: true }); } catch (e) { return v; }
+      };
+      var CustomEvent = function CustomEvent(type, eventInitDict) {
+        // Without `new`, the native constructor throws its own TypeError.
+        if (!(this instanceof CustomEvent)) return Native.apply(this, arguments);
+        var init = eventInitDict;
+        if (init === null || typeof init !== "object" || !("detail" in init) || !isObject(init.detail)) return Reflect.construct(Native, arguments);
+        var detail = init.detail;
+        var event = new Native(type, { bubbles: init.bubbles, cancelable: init.cancelable, composed: init.composed, detail: into(detail, page) });
+        own.set(event, detail);
+        return event;
+      };
+      CustomEvent.prototype = proto;
+      try { Object.setPrototypeOf(CustomEvent, Object.getPrototypeOf(Native)); } catch (e) {}
+      Object.defineProperty(proto, "detail", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: function () {
+          if (own.has(this)) return own.get(this);
+          var detail = nativeDetail.call(this);
+          if (!isObject(detail)) return detail;
+          var seen = read.get(this);
+          if (seen && seen.from === detail) return seen.copy;
+          var copy = into(detail, G);
+          read.set(this, { from: detail, copy: copy });
+          return copy;
+        },
+      });
+      if (typeof nativeInit === "function") {
+        Object.defineProperty(proto, "initCustomEvent", {
+          configurable: true, enumerable: true, writable: true,
+          value: function initCustomEvent(type, bubbles, cancelable, detail) {
+            if (!isObject(detail)) {
+              own.delete(this);
+              return nativeInit.apply(this, arguments);
+            }
+            var result = nativeInit.call(this, type, bubbles, cancelable, into(detail, page));
+            own.set(this, detail);
+            return result;
+          },
+        });
+      }
+      try { Object.defineProperty(proto, "constructor", { value: CustomEvent, writable: true, configurable: true }); } catch (e) {}
+      Object.defineProperty(page, "CustomEvent", { value: CustomEvent, writable: true, configurable: true });
+      Object.defineProperty(G, "CustomEvent", { value: CustomEvent, writable: true, configurable: true });
+      ["cloneInto", "exportFunction", "createObjectIn"].forEach(function (name) {
+        try { delete G[name]; } catch (e) {}
+      });
+    } catch (e) {}
+  }
+
   function userScriptWorldPrelude() {
-    var id = JSON.stringify(String(api.runtime.id));
-    return "(function(){try{var c=typeof chrome==='object'&&chrome||typeof browser==='object'&&browser;var r=c&&c.runtime;if(!r)return;" +
-      "if(r.id==null)Object.defineProperty(r,'id',{value:" + id + ",enumerable:true,configurable:true});" +
-      "var ev=function(){var l=[];return{addListener:function(f){if(l.indexOf(f)<0)l.push(f)},removeListener:function(f){var i=l.indexOf(f);if(i>=0)l.splice(i,1)},hasListener:function(f){return l.indexOf(f)>=0},hasListeners:function(){return l.length>0}}};" +
-      "if(r.onMessage==null)r.onMessage=ev();if(r.onConnect==null)r.onConnect=ev();if(!('lastError' in r))r.lastError=undefined;}catch(e){}})();";
+    return "(" + userScriptWorld + ")(" + JSON.stringify(String(api.runtime.id)) + ");";
   }
 
   function withPrelude(script) {
@@ -2639,11 +2792,16 @@
   }
 
   var wrappedUserScripts = typeof WeakSet === "function" ? new WeakSet() : null;
+  // Firefox's own execute and getScripts, by userScripts object, for the
+  // shim's calls (deliverToUserScripts), which need neither the prelude nor
+  // the restored registrations.
+  var rawUserScripts = typeof WeakMap === "function" ? new WeakMap() : null;
   function wrapUserScripts(ns) {
     var us;
     try { us = ns.userScripts; } catch (e) { return; }
-    if (!us || !wrappedUserScripts || wrappedUserScripts.has(us)) return;
+    if (!us || !wrappedUserScripts || !rawUserScripts || wrappedUserScripts.has(us)) return;
     wrappedUserScripts.add(us);
+    rawUserScripts.set(us, { execute: us.execute, getScripts: us.getScripts });
     ["register", "update"].forEach(function (name) {
       var orig = us[name];
       if (typeof orig !== "function") return;
@@ -2735,6 +2893,137 @@
         if (!adopt()) setTimeout(function () { namespaces.forEach(wrapUserScripts); adopt(); }, 0);
       });
     } catch (e) {}
+  }
+
+  // ── tabs.sendMessage to the USER_SCRIPT world ──────────────────────────────
+  // Chrome delivers a message sent to a tab to every context of the add-on in
+  // the tab's frames that has a listener, a USER_SCRIPT world with messaging
+  // included (Chromium's NativeRendererMessagingService). Firefox delivers it
+  // to content scripts only, and rejects "Receiving end does not exist" where
+  // only a user script listens: Violentmonkey's scripts got no answer from
+  // GM_xmlhttpRequest, whose responses its background sends to the tab. When
+  // user scripts are registered, the message also goes, as JSON, to the
+  // onMessage listeners the world's prelude keeps, through userScripts.execute
+  // in each USER_SCRIPT world of the targeted frames. The first answer from
+  // either side is the answer; with none, the call settles as Firefox's did.
+  var NO_USER_SCRIPT_LISTENER = { none: true };
+  var USER_SCRIPT_SILENT = { silent: true };
+
+  function deliverToUserScripts(us, tabId, message, options) {
+    var raw = (rawUserScripts && rawUserScripts.get(us)) || us;
+    if (typeof raw.execute !== "function" || typeof raw.getScripts !== "function") return Promise.resolve(NO_USER_SCRIPT_LISTENER);
+    var json;
+    try { json = JSON.stringify(message === undefined ? null : message); } catch (e) { return Promise.resolve(NO_USER_SCRIPT_LISTENER); }
+    if (json === undefined) json = "null";
+    var sender = { id: api.runtime.id, origin: ORIGIN };
+    try { sender.url = String(location.href); } catch (e) {}
+    var code = "(function(w){return w&&typeof w.deliver==='function'?w.deliver(" + JSON.stringify(json) + "," + JSON.stringify(sender) +
+      "):'n'})(globalThis[Symbol.for('lavaduct.userScriptWorld')])";
+    var target = { tabId: tabId };
+    if (options && options.frameId != null) target.frameIds = [options.frameId];
+    else if (options && options.documentId != null) target.documentIds = [options.documentId];
+    else target.allFrames = true;
+    return Promise.resolve().then(function () { return raw.getScripts.call(us); }).then(function (scripts) {
+      var worlds = [];
+      (Array.isArray(scripts) ? scripts : []).forEach(function (s) {
+        if (!s || s.world === "MAIN") return;
+        var w = typeof s.worldId === "string" ? s.worldId : "";
+        if (worlds.indexOf(w) < 0) worlds.push(w);
+      });
+      return Promise.all(worlds.map(function (w) {
+        var injection = { target: target, js: [{ code: code }], injectImmediately: true };
+        if (w) injection.worldId = w;
+        return Promise.resolve().then(function () { return raw.execute.call(us, injection); }).catch(function () { return []; });
+      }));
+    }).then(function (perWorld) {
+      var answer = null;
+      var silent = false;
+      perWorld.forEach(function (frames) {
+        (Array.isArray(frames) ? frames : []).forEach(function (f) {
+          var r = f && f.result;
+          if (r === "u") silent = true;
+          else if (!answer && typeof r === "string" && r.charAt(0) === "{") {
+            try { answer = JSON.parse(r); } catch (e) {}
+          }
+        });
+      });
+      return answer ? { answer: answer } : silent ? USER_SCRIPT_SILENT : NO_USER_SCRIPT_LISTENER;
+    }, function () { return NO_USER_SCRIPT_LISTENER; });
+  }
+
+  // Firefox's answer from content scripts and the user scripts' answer, first
+  // one wins. Without one: undefined where a content script listened, as
+  // Firefox answers; USER_SCRIPT_NO_RESPONSE where only user scripts did; else
+  // Firefox's rejection.
+  var USER_SCRIPT_NO_RESPONSE = { noResponse: true };
+
+  function firstAnswer(content, userScripts) {
+    return new Promise(function (resolve, reject) {
+      var left = 2;
+      var contentHeard = false;
+      var userScriptHeard = false;
+      var error = null;
+      var settled = false;
+      function finish() {
+        if (--left || settled) return;
+        settled = true;
+        if (contentHeard) resolve(undefined);
+        else if (userScriptHeard) resolve(USER_SCRIPT_NO_RESPONSE);
+        else reject(error);
+      }
+      content.then(function (value) {
+        if (settled) return;
+        if (value !== undefined) { settled = true; resolve(value); return; }
+        contentHeard = true;
+        finish();
+      }, function (err) {
+        error = err;
+        finish();
+      });
+      userScripts.then(function (r) {
+        if (settled) return;
+        if (r.answer) {
+          settled = true;
+          if ("e" in r.answer) reject(new Error(r.answer.e));
+          else resolve(r.answer.v);
+          return;
+        }
+        if (r === USER_SCRIPT_SILENT) userScriptHeard = true;
+        finish();
+      });
+    });
+  }
+
+  function installUserScriptTabMessages() {
+    if (!CONFIG.userScriptEvents || !isExtensionPage) return;
+    namespaces.forEach(function (ns) {
+      var tabs = null;
+      try { tabs = ns.tabs; } catch (e) {}
+      var original = tabs && tabs.sendMessage;
+      if (typeof original !== "function") return;
+      replaceMember(tabs, "sendMessage", function (tabId, message) {
+        var us = null;
+        try { us = api.userScripts; } catch (e) {}
+        var internal = false;
+        try { internal = !!message && typeof message === "object" && Object.prototype.hasOwnProperty.call(message, SESSION_MSG_KEY); } catch (e) {}
+        if (!us || internal) return original.apply(tabs, arguments);
+        var args = Array.prototype.slice.call(arguments);
+        var cb = args.length > 2 && typeof args[args.length - 1] === "function" ? args.pop() : null;
+        var opts = args.length > 2 && args[2] && typeof args[2] === "object" ? args[2] : null;
+        var content = Promise.resolve().then(function () { return original.apply(tabs, args); });
+        var p = firstAnswer(content, deliverToUserScripts(us, tabId, message, opts));
+        // Chrome resolves a promise-based call nobody answered with undefined,
+        // and calls a callback back with lastError.
+        if (!cb) return p.then(function (v) { return v === USER_SCRIPT_NO_RESPONSE ? undefined : v; });
+        p.then(function (v) {
+          if (v !== USER_SCRIPT_NO_RESPONSE) { invoke(cb, [v]); return; }
+          withLastError(ns, "The message port closed before a response was received.", function () { invoke(cb, []); });
+        }, function (err) {
+          withLastError(ns, err, function () { invoke(cb, []); });
+        });
+        return undefined;
+      });
+    });
   }
 
   // ── Messages Chrome would send as JSON ─────────────────────────────────────
@@ -4352,6 +4641,7 @@
   try { installMenuActionContext(); } catch (e) { dbg("menu action context shim failed:", errorMessage(e)); }
   try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
+  try { installUserScriptTabMessages(); } catch (e) { dbg("user script tab messages shim failed:", errorMessage(e)); }
   try { installOwnChromeIdMessages(); } catch (e) { dbg("own Chrome ID message shim failed:", errorMessage(e)); }
   try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
   try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
