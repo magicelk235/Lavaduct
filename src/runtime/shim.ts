@@ -113,6 +113,10 @@ const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|ses
 // A CustomEvent the code makes itself, whose detail a content script may hand
 // the page's world.
 const CUSTOM_EVENT_RE = /\bnew\s+(?:[\w$]+\s*\.\s*)?CustomEvent\b|\binitCustomEvent\s*\(/;
+// console reached for other than a call: `console[level] = wrapped` (Bugsnag),
+// `console.log = f`, or console as an object held elsewhere (`g.console`,
+// handed to Sentry's fill()), any of which may replace its methods.
+const CONSOLE_ASSIGN_RE = /\bconsole\s*\[|\bconsole\s*\.\s*[A-Za-z_$][\w$]*\s*=(?![=>])|\.\s*console\b/;
 // A member of MV2's browserAction read (`chrome.browserAction.onClicked`), which
 // an MV3 bundle's Firefox branch does; not the name alone, which polyfill
 // metadata and message keys carry.
@@ -200,6 +204,7 @@ interface Usage {
   cookieStoreId: boolean;
   runtimeId: boolean;
   selectorCall: boolean;
+  consoleAssign: boolean;
 }
 
 function scanUsage(dir: string): Usage {
@@ -207,7 +212,7 @@ function scanUsage(dir: string): Usage {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, consoleAssign: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
@@ -252,6 +257,7 @@ function scanUsage(dir: string): Usage {
       if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
       if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
+      if (!found.consoleAssign) found.consoleAssign = CONSOLE_ASSIGN_RE.test(src);
     }
   }
   return found;
@@ -316,6 +322,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     pacPage: usage.proxySettings ? PAC_PAGE : "",
     messageJson: usage.messaging,
     pageEventDetail: usage.customEvent,
+    consoleAssign: usage.consoleAssign,
     ownIdSelectors: usage.runtimeId && usage.selectorCall,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,

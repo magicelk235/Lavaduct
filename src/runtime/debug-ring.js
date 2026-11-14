@@ -132,7 +132,9 @@ var __SHIM_DEBUG_WRITE__ = (function () {
     // those too. The shim's own traces go to console.log, which stays untouched.
     // The console object is held here, not looked up per call: LavaMoat's
     // scuttling (MetaMask) turns globalThis.console into a throwing getter after
-    // startup while the bundle keeps logging through its own reference.
+    // startup while the bundle keeps logging through its own reference. The tee
+    // is defined, not assigned: in a content script an assigned console method
+    // turns read-only, and the bundle's own wrapping of it would throw.
     try {
       if (typeof console !== "undefined") {
         var con = console;
@@ -144,7 +146,12 @@ var __SHIM_DEBUG_WRITE__ = (function () {
             return orig.apply(con, arguments);
           };
           teed.__debugRingTee = true;
-          con[level] = teed;
+          var desc = Object.getOwnPropertyDescriptor(con, level);
+          try {
+            Object.defineProperty(con, level, { value: teed, writable: true, configurable: true, enumerable: !desc || desc.enumerable === true });
+          } catch (e) {
+            con[level] = teed;
+          }
         });
       }
     } catch (e) {}

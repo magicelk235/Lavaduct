@@ -21,6 +21,8 @@
 //   - storage.session.setAccessLevel, which code waits on, and the session
 //     area where Firefox has none (content scripts, pages framed in a site);
 //   - window.chrome in content scripts, and json() bodies in their own realm;
+//   - console methods a content script replaces more than once, which a
+//     Firefox content script's console allows only once;
 //   - CustomEvent details a content script hands the page, which Chrome clones
 //     for the page's world;
 //   - selectors holding runtime.id unquoted, which a Chrome ID parses in and
@@ -2315,6 +2317,30 @@
     Object.defineProperty(G, "CustomEvent", { value: CustomEvent, writable: true, configurable: true });
   }
 
+  // ── console's methods in content scripts ────────────────────────────────────
+  // A content script's console is an Xray, and assigning one of its methods
+  // leaves an expando that is neither writable nor configurable: the first
+  // `console.log = wrapped` works, every later one throws "log is read-only" in
+  // strict code. Every content_scripts entry shares one sandbox, so with an
+  // error reporter that wraps console in each bundle (Bugsnag), every bundle
+  // after the first died at load. A method defined as a writable, configurable
+  // data property stays one through later assignments, so each becomes that,
+  // holding Firefox's own function. Only for a bundle that reaches for console
+  // other than to call it.
+  function installAssignableConsole() {
+    if (!CONFIG.consoleAssign || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    var con = null;
+    try { con = G.console; } catch (e) {}
+    if (!con || typeof con !== "object") return;
+    Object.getOwnPropertyNames(con).forEach(function (name) {
+      var desc = Object.getOwnPropertyDescriptor(con, name);
+      if (!desc || !desc.configurable || !("value" in desc) || typeof desc.value !== "function") return;
+      try {
+        Object.defineProperty(con, name, { value: desc.value, writable: true, configurable: true, enumerable: desc.enumerable === true });
+      } catch (e) { dbg("can't make console." + name + " assignable:", errorMessage(e)); }
+    });
+  }
+
   // ── json() bodies in content scripts ────────────────────────────────────────
   // A content script's Response and Request are the page's, seen through an
   // Xray, so json() builds its objects in the page's realm: their prototype is
@@ -4064,6 +4090,7 @@
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
   try { installOwnIdSelectors(); } catch (e) { dbg("own ID selector shim failed:", errorMessage(e)); }
   try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
+  try { installAssignableConsole(); } catch (e) { dbg("assignable console shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
   try { installDefaultCookieStore(); } catch (e) { dbg("default cookie store shim failed:", errorMessage(e)); }
