@@ -50,6 +50,31 @@ test("an extension's block and an abort reach the listener under Chrome's names;
   assert.equal(firefoxDetails.error, "NS_ERROR_ABORT", "Firefox's details object isn't changed");
 });
 
+// identity.launchWebAuthFlow stops its window's navigation to the redirect URL
+// with NS_ERROR_ABORT too (ext-identity.js), for this add-on's flow or any other
+// add-on's; that is no block.
+test("a stopped navigation to a Firefox identity redirect URL keeps Firefox's name", () => {
+  const { browser, ctx } = setup(BUNDLE);
+  const ev = browser.webRequest.onErrorOccurred;
+  ev.fire({ url: "https://450e20de1877d628ea46684533fe69073b6bdb9d.extensions.allizom.org/?code=1", type: "main_frame", error: "NS_ERROR_ABORT" });
+  ev.fire({ url: "http://127.0.0.1/mozoauth2/450e20de1877d628ea46684533fe69073b6bdb9d?code=1", type: "main_frame", error: "NS_ERROR_ABORT" });
+  ev.fire({ url: "https://extensions.allizom.org.tracker.example/p.gif", type: "image", error: "NS_ERROR_ABORT" });
+  ev.fire({ url: "http://127.0.0.1:8080/mozoauth2/x", type: "image", error: "NS_ERROR_ABORT" });
+  ev.fire({ url: "https://abc.extensions.allizom.org/", type: "main_frame", error: "NS_BINDING_ABORTED" });
+  assert.deepEqual([...ctx.seen], ["NS_ERROR_ABORT", "NS_ERROR_ABORT", "net::ERR_BLOCKED_BY_CLIENT", "net::ERR_BLOCKED_BY_CLIENT", "net::ERR_ABORTED"]);
+});
+
+test("the identity redirect domain is read off the add-on's own redirect URL where it has one", () => {
+  const browser = fakeBrowser();
+  browser.webRequest = { onErrorOccurred: firefoxErrorEvent() };
+  browser.identity = { getRedirectURL: () => "https://0123abcd.redirect.example/", launchWebAuthFlow: () => Promise.resolve("") };
+  const ctx = runInContext(buildShim({}, { "bg.js": BUNDLE }), { browser });
+  vm.runInContext("globalThis.seen = []; chrome.webRequest.onErrorOccurred.addListener((d) => seen.push(d.error), { urls: ['<all_urls>'] });", ctx);
+  browser.webRequest.onErrorOccurred.fire({ url: "https://ffff0000.redirect.example/?code=1", error: "NS_ERROR_ABORT" });
+  browser.webRequest.onErrorOccurred.fire({ url: "https://ffff0000.extensions.allizom.org/?code=1", error: "NS_ERROR_ABORT" });
+  assert.deepEqual([...ctx.seen], ["NS_ERROR_ABORT", "net::ERR_BLOCKED_BY_CLIENT"]);
+});
+
 test("the listener keeps every other detail, and stays removable by the add-on's function", () => {
   const { browser, ctx } = setup(BUNDLE);
   vm.runInContext("globalThis.all = []; globalThis.keep = (d) => all.push(d); chrome.webRequest.onErrorOccurred.addListener(keep, { urls: ['<all_urls>'] });", ctx);

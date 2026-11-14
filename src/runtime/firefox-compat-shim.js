@@ -3850,15 +3850,47 @@
   // or XHR, a removed frame) are NS_BINDING_ABORTED in Firefox. Measured in
   // Firefox 160. Those two names are translated in the details the add-on's
   // onErrorOccurred listeners get; any other error keeps Firefox's name, since
-  // its Chrome name isn't certain. The add-on's function is wrapped once, keyed
-  // by itself, so removeListener and hasListener still find it. Only emitted for
-  // a bundle that compares against one of the two Chrome names.
+  // its Chrome name isn't certain. One other NS_ERROR_ABORT was found:
+  // identity.launchWebAuthFlow stops its window's navigation to the redirect URL
+  // with it (this add-on's flow or another's), and that is no block, so a
+  // request to a Firefox identity redirect URL (https://<hash>.<redirect
+  // domain>/, or the loopback http://127.0.0.1/mozoauth2/<hash>) keeps
+  // Firefox's name. Downloads, completed or cancelled, and requests a redirect
+  // replaced report no NS_ERROR_ABORT. The add-on's function is wrapped once,
+  // keyed by itself, so removeListener and hasListener still find it. Only
+  // emitted for a bundle that compares against one of the two Chrome names.
   function installWebRequestErrorNames() {
     if (!CONFIG.webRequestErrorNames || typeof WeakMap !== "function") return;
     var CHROME_NAMES = { NS_ERROR_ABORT: "net::ERR_BLOCKED_BY_CLIENT", NS_BINDING_ABORTED: "net::ERR_ABORTED" };
+    var LOOPBACK_REDIRECT = "http://127.0.0.1/mozoauth2/";
+    var redirectDomain = null;
+    // The domain of Firefox's identity redirect URLs: the pref
+    // extensions.webextensions.identity.redirectDomain, read off this add-on's
+    // own redirect URL where it may call identity, else Firefox's default.
+    function identityRedirectDomain() {
+      if (redirectDomain !== null) return redirectDomain;
+      redirectDomain = "extensions.allizom.org";
+      namespaces.some(function (ns) {
+        try {
+          var own = new URL(ns.identity.getRedirectURL()).hostname;
+          redirectDomain = own.slice(own.indexOf(".") + 1);
+          return true;
+        } catch (e) { return false; }
+      });
+      return redirectDomain;
+    }
+    function isIdentityRedirect(url) {
+      if (typeof url !== "string") return false;
+      if (url.indexOf(LOOPBACK_REDIRECT) === 0) return true;
+      var host = "";
+      try { host = new URL(url).hostname; } catch (e) { return false; }
+      var suffix = "." + identityRedirectDomain();
+      return url.indexOf("https:") === 0 && host.length > suffix.length && host.slice(-suffix.length) === suffix;
+    }
     function translate(details) {
       var error = details && typeof details === "object" ? details.error : undefined;
       if (typeof error !== "string" || !Object.prototype.hasOwnProperty.call(CHROME_NAMES, error)) return details;
+      if (error === "NS_ERROR_ABORT" && isIdentityRedirect(details.url)) return details;
       var out = {};
       Object.keys(details).forEach(function (k) { out[k] = details[k]; });
       out.error = CHROME_NAMES[error];
