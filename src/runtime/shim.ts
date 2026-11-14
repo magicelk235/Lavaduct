@@ -120,6 +120,10 @@ const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|ses
 // A CustomEvent the code makes itself, whose detail a content script may hand
 // the page's world.
 const CUSTOM_EVENT_RE = /\bnew\s+(?:[\w$]+\s*\.\s*)?CustomEvent\b|\binitCustomEvent\s*\(/;
+// A window method taken off the window rather than called on it: by name
+// (`["setTimeout", "setInterval"].forEach((k) => wrap(window, k))`, Bugsnag) or
+// read without a call (`var raf = window.requestAnimationFrame`).
+const WINDOW_METHOD_TAKEN_RE = /["'`](?:setTimeout|setInterval|requestAnimationFrame|requestIdleCallback|addEventListener)["'`]|\b(?:window|self)\s*\.\s*(?:setTimeout|setInterval|clearTimeout|clearInterval|requestAnimationFrame|cancelAnimationFrame|requestIdleCallback|cancelIdleCallback|queueMicrotask|fetch|getComputedStyle|matchMedia)\b(?!\s*\()/;
 // A member of MV2's browserAction read (`chrome.browserAction.onClicked`), which
 // an MV3 bundle's Firefox branch does; not the name alone, which polyfill
 // metadata and message keys carry.
@@ -217,6 +221,7 @@ interface Usage {
   consolePatch: boolean;
   runtimeId: boolean;
   selectorCall: boolean;
+  windowMethodTaken: boolean;
   /** The add-on's Chrome ID is written into its code. */
   chromeIdLiteral: boolean;
 }
@@ -226,7 +231,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false, windowMethodTaken: false,
   };
   const ownId = chromeId.toLowerCase();
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -276,6 +281,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
       if (!found.consolePatch) found.consolePatch = CONSOLE_PATCH_RE.test(src);
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
       if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
+      if (!found.windowMethodTaken) found.windowMethodTaken = WINDOW_METHOD_TAKEN_RE.test(src);
       // The page bridge lavaduct writes holds the ID too; it isn't the add-on's code.
       if (!found.chromeIdLiteral && ownId) found.chromeIdLiteral = src.includes(ownId) && !basename(file).startsWith(`${NAME}-`);
     }
@@ -377,6 +383,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     pacPage: usage.proxySettings ? PAC_PAGE : "",
     messageJson: usage.messaging,
     pageEventDetail: usage.customEvent,
+    windowMethodReceivers: usage.windowMethodTaken,
     ownIdSelectors: usage.runtimeId && usage.selectorCall,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,

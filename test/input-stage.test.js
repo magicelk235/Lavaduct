@@ -60,7 +60,7 @@ test("a worker's self.window alias goes, since an event page's window can't be a
   const code = '"use strict";var a=self.window||0;self.window=self;start(),globalThis.window = globalThis;x.self.window=self;';
   const dir = stageWith({ "sw.js": code, "page.js": code });
   applySourceRewrites(dir, { manifest_version: 3, name: "T", version: "1", background: { service_worker: "sw.js" } });
-  assert.equal(readFileSync(join(dir, "sw.js"), "utf-8"), '"use strict";var a=self.window||0;self;start(),globalThis;x.self.window=self;');
+  assert.equal(readFileSync(join(dir, "sw.js"), "utf-8"), '"use strict";var a=self.window||0;self;start(),globalThis;(x.self===globalThis?{}:x.self).window=self;');
   assert.equal(readFileSync(join(dir, "page.js"), "utf-8"), code, "only the background's own scripts change");
 });
 

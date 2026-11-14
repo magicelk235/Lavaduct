@@ -1013,12 +1013,14 @@ function rewritePredicateBodies(src: string, yes: (check: string) => string): st
 
 /**
  * The worker's "am I the worker?" checks in every script the background loads,
- * once the worker's importScripts targets and chunks are known (wireBackground):
+ * once the worker's importScripts targets, chunks and module imports are known
+ * (wireBackground, backgroundModuleImports):
  *   - the background-literal checks rewriteBackgroundContextChecks fixes in the
  *     manifest's scripts, now in the hoisted files too;
  *   - `location.pathname == "/<worker script>"` (Hola's is_bg);
  *   - a worker test inside an is…Background()/isServiceWorker() body (Total
- *     Adblock's `"undefined" == typeof document`).
+ *     Adblock's `"undefined" == typeof document`);
+ *   - a worker test an MV3 branch picks (@webext-core's isBackground()).
  * The worker's own script only runs as the background, so its checks become
  * true. The other files are chunks the add-on's pages may load too, so there
  * the check gains `|| BACKGROUND_FLAG` and keeps its answer in the pages.
@@ -1042,6 +1044,7 @@ export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: s
     const yes = (check: string) => (isWorker ? "true" : `(${check}||${BACKGROUND_FLAG})`);
     let next = content.replace(pathRe, (check) => yes(check));
     next = rewritePredicateBodies(next, yes);
+    next = rewriteMv3WorkerTests(next, yes);
     if (!isWorker) {
       next = next
         .replace(BG_CHECK_RETURN_RE, (whole, pre: string, post: string) => pre + yes(whole.slice(pre.length, whole.length - post.length)) + post)
@@ -1055,10 +1058,47 @@ export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: s
   return modified;
 }
 
+// @webext-core/proxy-service's isBackground() (WXT add-ons): `manifest.background ?
+// manifest.manifest_version === 3 ? isBackgroundServiceWorker() : isBackgroundPage()
+// : false`, whose worker test is `typeof window === "undefined"`. Minified, the
+// names are gone (`e.manifest_version===3?nD():tD()`), but a branch on MV3 that
+// picks a worker test still asks "am I the background?". In the event page the
+// test says no, so the background proxied every call to its own services through
+// runtime.sendMessage, which never reaches the sender (StayFocusd's timers).
+const MV3_WORKER_BRANCH_RE = new RegExp(
+  String.raw`(manifest_version\s*===?\s*3\s*\?\s*)(?:([A-Za-z_$][\w$]*)\s*\(\s*\)|(${WINDOW_IS_UNDEFINED}))`,
+  "g",
+);
+
+function rewriteMv3WorkerTests(src: string, yes: (check: string) => string): string {
+  const names = new Set<string>();
+  let next = src.replace(MV3_WORKER_BRANCH_RE, (whole, head: string, name: string | undefined, test: string | undefined) => {
+    if (test) return head + yes(test);
+    if (name) names.add(name);
+    return whole;
+  });
+  for (const name of names) {
+    const n = regexEscape(name);
+    const definition = new RegExp(
+      String.raw`(\bfunction\s+${n}\s*\(\s*\)\s*\{\s*return\s*|(?<![\w$.])${n}\s*=\s*(?:function\s*\(\s*\)\s*\{\s*return\s*|\(\s*\)\s*=>\s*))(${WINDOW_IS_UNDEFINED})(?=\s*[;}),])`,
+      "g",
+    );
+    next = next.replace(definition, (_whole, head: string, test: string) => head + yes(test));
+  }
+  return next;
+}
+
 // A worker gives itself a window with `self.window = self`. In the event page that
 // replaces it, window is a getter-only accessor, and the assignment throws in
 // strict code, ending the script there. window already is the global in a page.
 const WINDOW_SELF_ALIAS_RE = /(^|[^.\w$])(?:self|globalThis)\s*\.\s*window\s*=\s*(self|globalThis)\b(?!\s*[.[(=])/g;
+// Bundlers reach the global under a name of their own: webpack 4 passes it to a
+// module as a parameter (`(function(e){e.window={}}).call(this,r(58))`), webpack 5
+// hands it out as `__webpack_require__.g` (`n.g.window=self`). Which object the
+// receiver holds is only known when it runs, so the assignment goes to a
+// throwaway object when the receiver is the global, and to the receiver
+// otherwise. Runs after the alias above, which it would otherwise guard too.
+const WINDOW_ASSIGN_RE = /(^|[^.\w$#])([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*window\s*=(?![=>])/g;
 
 // `import "./x.js"`, `import { a } from "../y.js"`, `export * from "./z.mjs"`:
 // relative static imports, the only ones resolvable without running the code.
@@ -1087,19 +1127,43 @@ function backgroundModuleClosure(stageDir: string, manifest: Manifest): string[]
   return files;
 }
 
+/** The modules a module worker imports statically, relative to the stage, its own scripts left out. */
+export function backgroundModuleImports(stageDir: string, manifest: Manifest): string[] {
+  const own = new Set(backgroundScriptPaths(stageDir, manifest));
+  return backgroundModuleClosure(stageDir, manifest)
+    .filter((file) => !own.has(file))
+    .map((file) => relative(stageDir, file).split(sep).join("/"));
+}
+
 function rewriteWorkerWindowAlias(stageDir: string, manifest: Manifest): number {
   if (typeof manifest.background?.service_worker !== "string") return 0;
-  let modified = 0;
   // An imported module may be the pages' too; in a page window already is the
   // global, so dropping the alias changes nothing there.
-  for (const file of backgroundModuleClosure(stageDir, manifest)) {
+  return rewriteWindowAssignments(backgroundModuleClosure(stageDir, manifest));
+}
+
+/**
+ * Take a converted worker's window assignments out of the scripts it hoisted
+ * from importScripts (`loaded`, relative to the stage), which the staging
+ * rewrites ran before. A page that loads the same script loses nothing: there
+ * too window is the global, whose window can't be replaced.
+ */
+export function rewriteHoistedWindowAssignments(stageDir: string, loaded: string[]): number {
+  return rewriteWindowAssignments(loaded.map((rel) => join(stageDir, rel.replace(/^\.?\//, ""))));
+}
+
+function rewriteWindowAssignments(files: string[]): number {
+  let modified = 0;
+  for (const file of files) {
     let content: string;
     try {
       content = readFileSync(file, "utf-8");
     } catch {
       continue;
     }
-    const next = content.replace(WINDOW_SELF_ALIAS_RE, "$1$2");
+    const next = content
+      .replace(WINDOW_SELF_ALIAS_RE, "$1$2")
+      .replace(WINDOW_ASSIGN_RE, (_whole, pre: string, recv: string) => `${pre}(${recv}===globalThis?{}:${recv}).window=`);
     if (next !== content) {
       writeFileSync(file, next, "utf-8");
       modified++;
@@ -1314,7 +1378,7 @@ export function applySourceRewrites(stageDir: string, manifest: Manifest, chrome
     { name: "Rewrote chrome-extension://${…} URLs to resolve the add-on's own ID at runtime", count: rewriteSelfUrlHosts(stageDir) },
     { name: "Rewrote @@extension_id placeholder URLs", count: rewriteExtensionIdPlaceholderUrls(stageDir) },
     { name: "Corrected the background-context check", count: rewriteBackgroundContextChecks(stageDir, manifest) },
-    { name: "Dropped the worker's self.window alias, which an event page refuses", count: rewriteWorkerWindowAlias(stageDir, manifest) },
+    { name: "Dropped the worker's window assignments, which an event page refuses,", count: rewriteWorkerWindowAlias(stageDir, manifest) },
     { name: "Guarded location.ancestorOrigins[0] reads", count: guardAncestorOriginsAccess(stageDir) },
     { name: 'Replaced Function("return this")() global lookups with globalThis', count: rewriteFunctionGlobalLookups(stageDir) },
   ];

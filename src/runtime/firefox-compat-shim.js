@@ -21,6 +21,8 @@
 //   - storage.session.setAccessLevel, which code waits on, and the session
 //     area where Firefox has none (content scripts, pages framed in a site);
 //   - window.chrome in content scripts, and json() bodies in their own realm;
+//   - window methods a content script calls without the window, which a
+//     Firefox content script's window (an Xray) refuses;
 //   - CustomEvent details a content script hands the page, which Chrome clones
 //     for the page's world;
 //   - selectors holding runtime.id unquoted, which a Chrome ID parses in and
@@ -2363,6 +2365,39 @@
     Object.defineProperty(G, "CustomEvent", { value: CustomEvent, writable: true, configurable: true });
   }
 
+  // ── Window methods called without the window in content scripts ────────────
+  // A content script's `window` is an Xray to the page's window, and its own
+  // global isn't a Window. A method read off window and called bare, or on the
+  // content script's global, throws "'setTimeout' called on an object that does
+  // not implement interface Window"; Chrome's isolated world is a Window, and a
+  // method called without a receiver runs on it. Bugsnag keeps
+  // window.setTimeout and calls it bare (StayFocusd's content scripts). Each
+  // method becomes one that runs Firefox's own on the window when it gets no
+  // receiver or the global; the property is the content script's alone, so the
+  // page never sees it. Only for a bundle that takes such a method by name.
+  var WINDOW_METHODS = ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "requestAnimationFrame",
+    "cancelAnimationFrame", "requestIdleCallback", "cancelIdleCallback", "queueMicrotask", "fetch", "atob", "btoa",
+    "getComputedStyle", "getSelection", "matchMedia", "structuredClone", "addEventListener", "removeEventListener",
+    "dispatchEvent"];
+  function installWindowMethodReceivers() {
+    if (!CONFIG.windowMethodReceivers || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    var win = window;
+    WINDOW_METHODS.forEach(function (name) {
+      var desc = null;
+      for (var o = win; o && !desc; o = Object.getPrototypeOf(o)) desc = Object.getOwnPropertyDescriptor(o, name) || null;
+      if (!desc || typeof desc.value !== "function") return;
+      var native = desc.value;
+      var method = function () {
+        return native.apply(this === undefined || this === null || this === G ? win : this, arguments);
+      };
+      try { Object.defineProperty(method, "name", { value: name, configurable: true }); } catch (e) {}
+      try { Object.defineProperty(method, "length", { value: native.length, configurable: true }); } catch (e) {}
+      try {
+        Object.defineProperty(win, name, { value: method, writable: true, configurable: true, enumerable: desc.enumerable === true });
+      } catch (e) { dbg("can't give window." + name + " a receiver:", errorMessage(e)); }
+    });
+  }
+
   // ── json() bodies in content scripts ────────────────────────────────────────
   // A content script's Response and Request are the page's, seen through an
   // Xray, so json() builds its objects in the page's realm: their prototype is
@@ -4630,6 +4665,7 @@
   try { installContentGlobals(); } catch (e) { dbg("content globals shim failed:", errorMessage(e)); }
   try { installOwnIdSelectors(); } catch (e) { dbg("own ID selector shim failed:", errorMessage(e)); }
   try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
+  try { installWindowMethodReceivers(); } catch (e) { dbg("window method receiver shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installContentConsole(); } catch (e) { dbg("content console shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
