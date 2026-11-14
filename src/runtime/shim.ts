@@ -200,15 +200,18 @@ interface Usage {
   cookieStoreId: boolean;
   runtimeId: boolean;
   selectorCall: boolean;
+  /** The add-on's Chrome ID is written into its code. */
+  chromeIdLiteral: boolean;
 }
 
-function scanUsage(dir: string): Usage {
+function scanUsage(dir: string, chromeId = ""): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
     extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false,
   };
+  const ownId = chromeId.toLowerCase();
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
     let src: string;
@@ -252,6 +255,8 @@ function scanUsage(dir: string): Usage {
       if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
       if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
+      // The page bridge lavaduct writes holds the ID too; it isn't the add-on's code.
+      if (!found.chromeIdLiteral && ownId) found.chromeIdLiteral = src.includes(ownId) && !basename(file).startsWith(`${NAME}-`);
     }
   }
   return found;
@@ -270,7 +275,7 @@ function permissionAnswers(declared: string[]): Record<string, boolean> {
 }
 
 function shimSource(dir: string, config: ShimConfig): string {
-  const usage = scanUsage(dir);
+  const usage = scanUsage(dir, config.extensionId ?? "");
   // The config goes in as a JSON literal, so nothing from the manifest is ever
   // interpolated into code. JSON.stringify leaves U+2028/U+2029 raw, which are
   // line terminators inside a JS string literal; escape them.
@@ -323,6 +328,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     promiseOnlyCalls: usage.promiseOnlyCalls.sort(),
     sessionAccess: usage.sessionAccess,
     defaultCookieStore: usage.cookieStoreId,
+    ownIdMessages: usage.chromeIdLiteral,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so

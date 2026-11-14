@@ -33,7 +33,8 @@
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
 //     temporarily again and again;
 //   - the "browser_action" menu context, which Firefox refuses from MV3;
-//   - Chrome's callback on methods Firefox only gives a promise.
+//   - Chrome's callback on methods Firefox only gives a promise;
+//   - messages and ports addressed to the add-on's own Chrome ID.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -2813,6 +2814,35 @@
     });
   }
 
+  // ── Messages addressed to the add-on's own Chrome ID ────────────────────────
+  // Chrome code that knows its ID passes it to runtime.sendMessage and
+  // runtime.connect, and Chrome takes that as a message to itself (webext-redux
+  // stores are built with `extensionId`). Firefox's add-on has its gecko ID, so
+  // the message goes to an extension that doesn't exist: "Receiving end does
+  // not exist", and the port disconnects. The Chrome ID becomes runtime.id for
+  // the call. A lone string is a message, not an ID, as in Chrome. Only emitted
+  // for a bundle that has its Chrome ID in its code.
+  function installOwnChromeIdMessages() {
+    if (!CONFIG.ownIdMessages || !CONFIG.extensionId) return;
+    var chromeId = String(CONFIG.extensionId).toLowerCase();
+    namespaces.forEach(function (ns) {
+      var rt = null;
+      try { rt = ns.runtime; } catch (e) {}
+      if (!rt) return;
+      [["sendMessage", 2], ["connect", 1]].forEach(function (pair) {
+        var original = rt[pair[0]];
+        if (typeof original !== "function") return;
+        replaceMember(rt, pair[0], function () {
+          var args = Array.prototype.slice.call(arguments);
+          if (args.length >= pair[1] && typeof args[0] === "string" && args[0].toLowerCase() === chromeId) {
+            try { args[0] = rt.id; } catch (e) {}
+          }
+          return original.apply(rt, args);
+        });
+      });
+    });
+  }
+
   // ── the "browser_action" menu context in MV3 ────────────────────────────────
   // Chrome's contextMenus takes "browser_action" from an MV3 extension and
   // keeps the item for its other contexts. Firefox's menus schema offers it to
@@ -4076,6 +4106,7 @@
   try { installMenuActionContext(); } catch (e) { dbg("menu action context shim failed:", errorMessage(e)); }
   try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
+  try { installOwnChromeIdMessages(); } catch (e) { dbg("own Chrome ID message shim failed:", errorMessage(e)); }
   try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
   try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
   try { installDeclarativeContent(); } catch (e) { dbg("declarativeContent shim failed:", errorMessage(e)); }
