@@ -1149,6 +1149,57 @@
     } catch (e) {}
   }
 
+  // ── Requests to the add-on's own Chrome origin and manifest ────────────────
+  // In Chrome an extension can request its own files at
+  // chrome-extension://<its id>/…, and its own manifest.json reads as shipped.
+  // Firefox fails the first with "NetworkError when attempting to fetch
+  // resource", the add-on living at moz-extension://<uuid>/, and its
+  // manifest.json is the one lavaduct rewrote. McAfee WebAdvisor's WASM builds
+  // chrome-extension://<its id>/manifest.json at runtime and checks its content;
+  // without it the background never set up its message dispatcher. A URL that
+  // fetch or XMLHttpRequest opens at the Chrome origin goes to the add-on's
+  // own, and in its pages its manifest.json comes from the copy staged as
+  // shipped. Only the URL a request opens is mapped: an own-origin URL inside a
+  // query string or a body (an OAuth redirect_uri) goes out as written.
+  // Emitted for code that names the Chrome ID, or manifest.json.
+  function installOwnChromeUrls() {
+    var chromeOrigin = CONFIG.ownChromeUrls && CONFIG.extensionId ? "chrome-extension://" + String(CONFIG.extensionId).toLowerCase() : "";
+    var shipped = isExtensionPage && CONFIG.chromeManifest ? ORIGIN + "/" + CONFIG.chromeManifest : "";
+    if ((!chromeOrigin && !shipped) || !ORIGIN) return;
+    function mapped(raw) {
+      var u;
+      try { u = new URL(String(raw), loc ? loc.href : undefined); } catch (e) { return null; }
+      var origin = originOf(u).toLowerCase();
+      var fromChrome = !!chromeOrigin && origin === chromeOrigin;
+      if (!fromChrome && origin !== ORIGIN.toLowerCase()) return null;
+      if (shipped && u.pathname === "/manifest.json") return shipped;
+      return fromChrome ? ORIGIN + u.pathname + u.search + u.hash : null;
+    }
+    var prior = null;
+    try { prior = G.fetch; } catch (e) {}
+    if (typeof prior === "function") {
+      try {
+        G.fetch = function fetch(input, init) {
+          var isRequest = typeof Request === "function" && input instanceof Request;
+          var to = mapped(isRequest ? input.url : input);
+          if (to === null) return prior.apply(G, arguments);
+          return prior.call(G, isRequest ? new Request(to, input) : to, init);
+        };
+      } catch (e) {}
+    }
+    var xhr = null;
+    try { xhr = typeof XMLHttpRequest === "function" ? XMLHttpRequest.prototype : null; } catch (e) {}
+    if (xhr && typeof xhr.open === "function") {
+      var nativeOpen = xhr.open;
+      replaceMember(xhr, "open", function open(method, url) {
+        var args = Array.prototype.slice.call(arguments);
+        var to = args.length > 1 ? mapped(url) : null;
+        if (to !== null) args[1] = to;
+        return nativeOpen.apply(this, args);
+      });
+    }
+  }
+
   // ── ServiceWorkerGlobalScope ────────────────────────────────────────────────
   // A Chrome background is a service worker, and a bundle that shares code
   // between it and its pages asks where it runs:
@@ -4077,6 +4128,7 @@
   try { installOffscreen(); } catch (e) { dbg("offscreen shim failed:", errorMessage(e)); }
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
   try { installFavicon(); } catch (e) { dbg("favicon shim failed:", errorMessage(e)); }
+  try { installOwnChromeUrls(); } catch (e) { dbg("own Chrome URL shim failed:", errorMessage(e)); }
   try { installServiceWorkerScope(); } catch (e) { dbg("ServiceWorkerGlobalScope shim failed:", errorMessage(e)); }
   try { installAssignableStorageGlobals(); } catch (e) { dbg("assignable storage globals failed:", errorMessage(e)); }
   try { installServiceWorkerRegistration(); } catch (e) { dbg("registration shim failed:", errorMessage(e)); }

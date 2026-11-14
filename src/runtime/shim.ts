@@ -19,6 +19,37 @@ export const PAC_PAGE = `${NAME}-pac.html`;
 /** Its script, copied from src/runtime/pac-sandbox.js. */
 const PAC_SCRIPT = `${NAME}-pac.js`;
 const PAC_TEMPLATE = "pac-sandbox.js";
+/** The manifest.json the extension shipped with, which a fetch of its own manifest returns. */
+export const CHROME_MANIFEST_FILE = `${NAME}-chrome-manifest.json`;
+
+// Code, WebAssembly included, that names something: a request URL built at
+// runtime can only be found by the pieces the binary or bundle carries.
+function codeNames(dir: string, needle: string): boolean {
+  const lower = needle.toLowerCase();
+  for (const file of walkScripts(dir, [], [".js", ".mjs", ".wasm"])) {
+    if (basename(file) === SHIM_FILENAME) continue;
+    try {
+      if (readFileSync(file, "latin1").toLowerCase().includes(lower)) return true;
+    } catch {}
+  }
+  return false;
+}
+
+/**
+ * Stage the manifest.json the extension shipped with beside the rewritten one,
+ * for code (or WebAssembly) that names manifest.json: in Chrome a fetch of the
+ * extension's own manifest.json returns the file as shipped, and McAfee
+ * WebAdvisor checks it. Returns whether it was staged.
+ */
+export function stageChromeManifest(extPath: string, stageDir: string): boolean {
+  if (!codeNames(stageDir, "manifest.json")) return false;
+  try {
+    writeFileSync(join(stageDir, CHROME_MANIFEST_FILE), readFileSync(join(extPath, "manifest.json")));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Build-time settings baked into the shim. */
 export interface ShimConfig {
@@ -288,6 +319,9 @@ function shimSource(dir: string, config: ShimConfig): string {
     noDefaultPanel: config.noDefaultPanel === true,
     panelQuery: (config.panelQuery ?? "").replace(/^\?/, ""),
     extensionId: config.extensionId ?? "",
+    // Requests to chrome-extension://<Chrome ID>/…, for code that names the ID.
+    ownChromeUrls: !!config.extensionId && codeNames(dir, config.extensionId),
+    chromeManifest: existsSync(join(dir, CHROME_MANIFEST_FILE)) ? CHROME_MANIFEST_FILE : "",
     favicon: usage.favicon,
     offscreen: usage.offscreen,
     newTab: usage.newTab,
