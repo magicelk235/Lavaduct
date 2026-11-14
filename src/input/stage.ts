@@ -938,12 +938,14 @@ function rewritePredicateBodies(src: string, yes: (check: string) => string): st
 
 /**
  * The worker's "am I the worker?" checks in every script the background loads,
- * once the worker's importScripts targets and chunks are known (wireBackground):
+ * once the worker's importScripts targets, chunks and module imports are known
+ * (wireBackground, backgroundModuleImports):
  *   - the background-literal checks rewriteBackgroundContextChecks fixes in the
  *     manifest's scripts, now in the hoisted files too;
  *   - `location.pathname == "/<worker script>"` (Hola's is_bg);
  *   - a worker test inside an is…Background()/isServiceWorker() body (Total
- *     Adblock's `"undefined" == typeof document`).
+ *     Adblock's `"undefined" == typeof document`);
+ *   - a worker test an MV3 branch picks (@webext-core's isBackground()).
  * The worker's own script only runs as the background, so its checks become
  * true. The other files are chunks the add-on's pages may load too, so there
  * the check gains `|| BACKGROUND_FLAG` and keeps its answer in the pages.
@@ -967,6 +969,7 @@ export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: s
     const yes = (check: string) => (isWorker ? "true" : `(${check}||${BACKGROUND_FLAG})`);
     let next = content.replace(pathRe, (check) => yes(check));
     next = rewritePredicateBodies(next, yes);
+    next = rewriteMv3WorkerTests(next, yes);
     if (!isWorker) {
       next = next
         .replace(BG_CHECK_RETURN_RE, (whole, pre: string, post: string) => pre + yes(whole.slice(pre.length, whole.length - post.length)) + post)
@@ -978,6 +981,36 @@ export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: s
     }
   }
   return modified;
+}
+
+// @webext-core/proxy-service's isBackground() (WXT add-ons): `manifest.background ?
+// manifest.manifest_version === 3 ? isBackgroundServiceWorker() : isBackgroundPage()
+// : false`, whose worker test is `typeof window === "undefined"`. Minified, the
+// names are gone (`e.manifest_version===3?nD():tD()`), but a branch on MV3 that
+// picks a worker test still asks "am I the background?". In the event page the
+// test says no, so the background proxied every call to its own services through
+// runtime.sendMessage, which never reaches the sender (StayFocusd's timers).
+const MV3_WORKER_BRANCH_RE = new RegExp(
+  String.raw`(manifest_version\s*===?\s*3\s*\?\s*)(?:([A-Za-z_$][\w$]*)\s*\(\s*\)|(${WINDOW_IS_UNDEFINED}))`,
+  "g",
+);
+
+function rewriteMv3WorkerTests(src: string, yes: (check: string) => string): string {
+  const names = new Set<string>();
+  let next = src.replace(MV3_WORKER_BRANCH_RE, (whole, head: string, name: string | undefined, test: string | undefined) => {
+    if (test) return head + yes(test);
+    if (name) names.add(name);
+    return whole;
+  });
+  for (const name of names) {
+    const n = regexEscape(name);
+    const definition = new RegExp(
+      String.raw`(\bfunction\s+${n}\s*\(\s*\)\s*\{\s*return\s*|(?<![\w$.])${n}\s*=\s*(?:function\s*\(\s*\)\s*\{\s*return\s*|\(\s*\)\s*=>\s*))(${WINDOW_IS_UNDEFINED})(?=\s*[;}),])`,
+      "g",
+    );
+    next = next.replace(definition, (_whole, head: string, test: string) => head + yes(test));
+  }
+  return next;
 }
 
 // A worker gives itself a window with `self.window = self`. In the event page that
@@ -1017,6 +1050,14 @@ function backgroundModuleClosure(stageDir: string, manifest: Manifest): string[]
     }
   }
   return files;
+}
+
+/** The modules a module worker imports statically, relative to the stage, its own scripts left out. */
+export function backgroundModuleImports(stageDir: string, manifest: Manifest): string[] {
+  const own = new Set(backgroundScriptPaths(stageDir, manifest));
+  return backgroundModuleClosure(stageDir, manifest)
+    .filter((file) => !own.has(file))
+    .map((file) => relative(stageDir, file).split(sep).join("/"));
 }
 
 function rewriteWorkerWindowAlias(stageDir: string, manifest: Manifest): number {
