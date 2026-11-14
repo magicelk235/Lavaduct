@@ -92,6 +92,9 @@ const LOCKS_REF_RE = /\bnavigator\s*\.\s*locks\b/;
 const SW_MANIFEST_REF_RE = /\bservice_worker\b/;
 const PERMISSIONS_CALL_RE = /\bpermissions\s*\.\s*(?:contains|request|remove|getAll)\b/;
 const EXTRA_HEADERS_RE = /["'`]extraHeaders["'`]/;
+// Chrome's names for a request an extension blocked, or one aborted, that a
+// bundle compares a webRequest error against.
+const CHROME_NET_ERROR_RE = /net::ERR_(?:BLOCKED_BY_CLIENT|ABORTED)\b/;
 // The MV2 menu context, which Firefox refuses from an MV3 add-on.
 const BROWSER_ACTION_CONTEXT_RE = /["'`]browser_action["'`]/;
 // A body read as JSON, whose objects a Firefox content script gets from the page's realm.
@@ -186,6 +189,7 @@ interface Usage {
   locks: boolean;
   permissions: boolean;
   extraHeaders: boolean;
+  chromeNetErrors: boolean;
   browserActionContext: boolean;
   bodyJson: boolean;
   storage: boolean;
@@ -209,7 +213,7 @@ function scanUsage(dir: string): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
+    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
     promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false,
   };
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
@@ -235,6 +239,7 @@ function scanUsage(dir: string): Usage {
       if (!found.locks) found.locks = LOCKS_REF_RE.test(src);
       if (!found.permissions) found.permissions = PERMISSIONS_CALL_RE.test(src);
       if (!found.extraHeaders) found.extraHeaders = EXTRA_HEADERS_RE.test(src);
+      if (!found.chromeNetErrors) found.chromeNetErrors = CHROME_NET_ERROR_RE.test(src);
       if (!found.browserActionContext) found.browserActionContext = BROWSER_ACTION_CONTEXT_RE.test(src);
       if (!found.bodyJson) found.bodyJson = BODY_JSON_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
@@ -316,6 +321,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     webpackChunkGlobal: config.webpackChunkGlobal ?? "",
     permissionAnswers: usage.permissions ? permissionAnswers(config.declaredPermissions ?? []) : null,
     extraHeaders: usage.extraHeaders,
+    webRequestErrorNames: usage.chromeNetErrors,
     menuActionContext: usage.browserActionContext,
     contentBodyJson: usage.bodyJson,
     storageClone: usage.storage,
