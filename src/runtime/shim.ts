@@ -57,6 +57,8 @@ export interface ShimConfig {
   externalIds?: string[];
   /** The page bridge lets the add-on's pages frame sites (framedSites), with session rules of its own. */
   frameGrants?: boolean;
+  /** The scripts of the manifest's content_scripts that run in the isolated world, root-relative. */
+  contentScripts?: string[];
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
@@ -118,6 +120,10 @@ const STORAGE_GLOBAL_ASSIGN_RE = /\b(?:self|globalThis)\s*\.\s*(localStorage|ses
 // A CustomEvent the code makes itself, whose detail a content script may hand
 // the page's world.
 const CUSTOM_EVENT_RE = /\bnew\s+(?:[\w$]+\s*\.\s*)?CustomEvent\b|\binitCustomEvent\s*\(/;
+// A window method taken off the window rather than called on it: by name
+// (`["setTimeout", "setInterval"].forEach((k) => wrap(window, k))`, Bugsnag) or
+// read without a call (`var raf = window.requestAnimationFrame`).
+const WINDOW_METHOD_TAKEN_RE = /["'`](?:setTimeout|setInterval|requestAnimationFrame|requestIdleCallback|addEventListener)["'`]|\b(?:window|self)\s*\.\s*(?:setTimeout|setInterval|clearTimeout|clearInterval|requestAnimationFrame|cancelAnimationFrame|requestIdleCallback|cancelIdleCallback|queueMicrotask|fetch|getComputedStyle|matchMedia)\b(?!\s*\()/;
 // A member of MV2's browserAction read (`chrome.browserAction.onClicked`), which
 // an MV3 bundle's Firefox branch does; not the name alone, which polyfill
 // metadata and message keys carry.
@@ -135,6 +141,12 @@ const SESSION_ACCESS_RE = /\bsetAccessLevel\b/;
 // the like; Firefox refuses even the default store from an add-on without the
 // cookies permission.
 const COOKIE_STORE_ID_RE = /\bcookieStoreId\b/;
+// Chrome's frozen condition, which Firefox's tabs.query refuses.
+const FROZEN_KEY_RE = /\bfrozen\s*:|["'`]frozen["'`]/;
+// console's methods replaced, or console handed to code that may replace them
+// (`Object.assign(console, …)`, `(function (c) { … })(console)`): in a content
+// script the page's console only lets each be replaced once.
+const CONSOLE_PATCH_RE = /\bconsole\s*(?:\.\s*[\w$]+|\[[^\]\n]{1,40}\])\s*=(?!=)|\b(?:assign|defineProperty|defineProperties)\s*\(\s*console\b|\(\s*console\s*\)/;
 // The add-on's own ID read, and selector calls it can end up in unquoted: a
 // Chrome ID is a CSS identifier, Firefox's gecko ID isn't.
 const RUNTIME_ID_RE = /\bruntime\s*(?:\?\.|\.)\s*id\b/;
@@ -209,17 +221,23 @@ interface Usage {
   promiseOnlyCalls: string[];
   sessionAccess: boolean;
   cookieStoreId: boolean;
+  frozenKey: boolean;
+  consolePatch: boolean;
   runtimeId: boolean;
   selectorCall: boolean;
+  windowMethodTaken: boolean;
+  /** The add-on's Chrome ID is written into its code. */
+  chromeIdLiteral: boolean;
 }
 
-function scanUsage(dir: string): Usage {
+function scanUsage(dir: string, chromeId = ""): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, hasListenersCall: false,
+    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false, windowMethodTaken: false, hasListenersCall: false,
   };
+  const ownId = chromeId.toLowerCase();
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
     let src: string;
@@ -264,11 +282,47 @@ function scanUsage(dir: string): Usage {
       if (!found.hasListenersCall) found.hasListenersCall = HAS_LISTENERS_CALL_RE.test(src);
       if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
       if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
+      if (!found.frozenKey) found.frozenKey = FROZEN_KEY_RE.test(src);
+      if (!found.consolePatch) found.consolePatch = CONSOLE_PATCH_RE.test(src);
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
       if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
+      if (!found.windowMethodTaken) found.windowMethodTaken = WINDOW_METHOD_TAKEN_RE.test(src);
+      // The page bridge lavaduct writes holds the ID too; it isn't the add-on's code.
+      if (!found.chromeIdLiteral && ownId) found.chromeIdLiteral = src.includes(ownId) && !basename(file).startsWith(`${NAME}-`);
     }
   }
   return found;
+}
+
+// A name a script declares with `function` or `var`, which at the top of a
+// script makes it a property of the global, and a name read off window or self.
+const DECLARED_NAME_RE = /(?<![\w$.])(?:function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|var\s+([A-Za-z_$][\w$]*))/g;
+const WINDOW_MEMBER_RE = /(?<![\w$.])(?:window|self)\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)/g;
+
+/**
+ * The names the content scripts declare and also read off window or self. In
+ * Chrome's isolated world window is the global, so `function f` is window.f; a
+ * Firefox content script's window is an Xray to the page's, which doesn't have
+ * it (the shim's installContentGlobals). A declaration inside a function is
+ * collected too; the shim's accessor answers only what the global holds.
+ */
+function contentGlobalNames(dir: string, scripts: string[]): string[] {
+  const root = resolve(dir);
+  const declared = new Set<string>();
+  const read = new Set<string>();
+  for (const rel of new Set(scripts.map((s) => s.replace(/^(?:\.?\/)+/, "")))) {
+    const file = resolve(root, rel);
+    if (!file.startsWith(root + sep) || basename(file) === SHIM_FILENAME) continue;
+    let src: string;
+    try {
+      src = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    for (const m of src.matchAll(DECLARED_NAME_RE)) declared.add(m[1] ?? m[2]);
+    for (const m of src.matchAll(WINDOW_MEMBER_RE)) read.add(m[1]);
+  }
+  return [...read].filter((name) => declared.has(name)).sort();
 }
 
 /**
@@ -284,7 +338,7 @@ function permissionAnswers(declared: string[]): Record<string, boolean> {
 }
 
 function shimSource(dir: string, config: ShimConfig): string {
-  const usage = scanUsage(dir);
+  const usage = scanUsage(dir, config.extensionId ?? "");
   // The config goes in as a JSON literal, so nothing from the manifest is ever
   // interpolated into code. JSON.stringify leaves U+2028/U+2029 raw, which are
   // line terminators inside a JS string literal; escape them.
@@ -334,6 +388,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     pacPage: usage.proxySettings ? PAC_PAGE : "",
     messageJson: usage.messaging,
     pageEventDetail: usage.customEvent,
+    windowMethodReceivers: usage.windowMethodTaken,
     ownIdSelectors: usage.runtimeId && usage.selectorCall,
     storageGlobalsAssigned: config.serviceWorker === true ? usage.storageGlobalsAssigned.sort() : [],
     falsyListenerArgs: usage.falsyListenerArg,
@@ -342,6 +397,10 @@ function shimSource(dir: string, config: ShimConfig): string {
     promiseOnlyCalls: usage.promiseOnlyCalls.sort(),
     sessionAccess: usage.sessionAccess,
     defaultCookieStore: usage.cookieStoreId,
+    ownIdMessages: usage.chromeIdLiteral,
+    tabsQueryFrozen: usage.frozenKey,
+    contentConsole: usage.consolePatch,
+    contentGlobals: contentGlobalNames(dir, config.contentScripts ?? []),
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
@@ -654,9 +713,10 @@ export function wireBackground(dir: string, manifest: Manifest, shimFile?: strin
  * `${…}` handling: interpolations re-enter code mode, nested templates included
  * (MetaMask's 1MB chunk 6078 nests templates two deep).
  * Returns the index where onCode returned true, else -1 (end of input reached,
- * or an unterminated construct).
+ * or an unterminated construct). `onLiteral(i)`, when given, hears the index of
+ * each string literal's opening quote and each code-level template's backtick.
  */
-function walkCode(src: string, start: number, onCode: (c: string, i: number) => boolean): number {
+function walkCode(src: string, start: number, onCode: (c: string, i: number) => boolean, onLiteral?: (i: number) => void): number {
   // Context stack: "T" = inside template-literal text; a number = inside a `${}`
   // interpolation, holding its open-brace count so the matching "}" hands control
   // back to the surrounding template text instead of being reported as code.
@@ -670,7 +730,7 @@ function walkCode(src: string, start: number, onCode: (c: string, i: number) => 
       if (c === "$" && src[i + 1] === "{") { stack.push(0); i++; continue; }
       continue;
     }
-    if (c === "`") { stack.push("T"); continue; }
+    if (c === "`") { onLiteral?.(i); stack.push("T"); continue; }
     if (typeof top === "number") {
       if (c === "}") {
         if (top === 0) { stack.pop(); continue; } // closes the ${ — resume template text
@@ -680,6 +740,7 @@ function walkCode(src: string, start: number, onCode: (c: string, i: number) => 
       }
     }
     if (c === '"' || c === "'") {
+      onLiteral?.(i);
       // skip the string literal
       i++;
       while (i < src.length) {
@@ -748,6 +809,13 @@ export function matchBalancedBrace(src: string, open: number): number {
     return false;
   });
   return at < 0 ? -1 : at + 1;
+}
+
+/** Indexes of every string literal's opening quote and every template's opening backtick. */
+export function literalStarts(src: string): Set<number> {
+  const starts = new Set<number>();
+  walkCode(src, 0, () => false, (i) => starts.add(i));
+  return starts;
 }
 
 // Keywords a regex literal can directly follow (`return/,/.test(x)` is how terser
@@ -1219,10 +1287,14 @@ function importsFromLiteralList(src: string, callAt: number, arg: string): strin
 
 // A pure webpack async chunk is a single statement:
 //   (globalThis.webpackChunkNAME = globalThis.webpackChunkNAME || []).push([[ids], {modules}]);
-// optionally preceded by a license banner / "use strict" and followed only by a
-// sourcemap pragma. Anything else before/after is real top-level code — that's an
-// entry script, not a registration, and must not be loaded into the background.
-const CHUNK_PREFIX_RE = /^(?:\uFEFF|\s|;|["']use strict["'];?|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*$/;
+// optionally preceded by a license banner / "use strict" / Sentry's debug-ID
+// snippet (its bundler plugin tops every emitted file with
+// `!function(){try{…e._sentryDebugIds[n]="<id>"…}catch(e){}}();`) and followed
+// only by a sourcemap or debugId pragma. Anything else before/after is real
+// top-level code — that's an entry script, not a registration, and must not be
+// loaded into the background.
+const SENTRY_DEBUG_ID_SNIPPET = String.raw`!function\(\)\{try\{(?:(?!\}catch\()[\s\S]){0,1000}?_sentryDebugIds(?:(?!\}catch\()[\s\S]){0,1000}?\}catch\([\w$]+\)\{\}\}\(\);?`;
+const CHUNK_PREFIX_RE = new RegExp(String.raw`^(?:\uFEFF|\s|;|["']use strict["'];?|\/\/[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|${SENTRY_DEBUG_ID_SNIPPET})*$`);
 const CHUNK_SUFFIX_RE = /^(?:\s|;|\/\/[#@][^\n]*(?:\n|$)|\/\*[#@][\s\S]*?\*\/)*$/;
 
 /**
@@ -1277,22 +1349,55 @@ function collectWebpackChunks(dir: string, swPath: string, hoisted: Set<string>)
   // own folder (webpack's automatic publicPath). The pages' build may share the
   // chunk global, and its chunks must stay out of the background.
   const base = posix.dirname(swPath);
-  return chunks
-    .filter((rel) => {
-      const fromWorker = base === "." ? rel : posix.relative(base, rel);
-      return !fromWorker.startsWith("../") && fromWorker.startsWith(named.prefix) && fromWorker.endsWith(named.suffix);
-    })
-    .sort();
+  const allowed = chunks.filter((rel) => {
+    const fromWorker = base === "." ? rel : posix.relative(base, rel);
+    return !fromWorker.startsWith("../") && fromWorker.startsWith(named.prefix) && fromWorker.endsWith(named.suffix);
+  });
+  // When the file name is the chunk id between fixed strings, the pages' build
+  // can share the pattern as well as the global (Bardeen: `id + ".js"` for
+  // both), and only the chunks the worker can reach are its own.
+  const reachable = named.byId ? reachableChunks(dir, base, swSrc, named) : null;
+  return (reachable ? allowed.filter((rel) => reachable.has(rel)) : allowed).sort();
+}
+
+// A chunk loaded by id: `__webpack_require__.e(123)`, or a named id in a
+// development build.
+const CHUNK_LOAD_RE = /(?<![\w$])[\w$]+\.e\(\s*(\d+|"[^"\\\n]*"|'[^'\\\n]*')\s*\)/g;
+
+/**
+ * The chunk files a worker can load: the ids its own code passes to
+ * `__webpack_require__.e`, and those the chunks it loads pass on. Null when the
+ * worker names no chunk id itself (an id built at runtime), where nothing can
+ * be ruled out.
+ */
+function reachableChunks(dir: string, base: string, swSrc: string, named: { prefix: string; suffix: string }): Set<string> | null {
+  const pending = [...swSrc.matchAll(CHUNK_LOAD_RE)].map((m) => m[1]);
+  if (!pending.length) return null;
+  const files = new Set<string>();
+  while (pending.length) {
+    const rel = posix.join(base, named.prefix + pending.pop()!.replace(/^["']|["']$/g, "") + named.suffix);
+    if (files.has(rel)) continue;
+    files.add(rel);
+    let src: string;
+    try {
+      src = readFileSync(join(dir, rel), "utf-8");
+    } catch {
+      continue; // a chunk id with no file of its own
+    }
+    for (const m of src.matchAll(CHUNK_LOAD_RE)) pending.push(m[1]);
+  }
+  return files;
 }
 
 /**
  * The fixed start and end of the file names a webpack worker's chunk filename
  * function returns, read from its text without running it:
  *   __webpack_require__.u = chunkId => "bg." + ({96: "vendors"}[chunkId] || chunkId) + ".bundle.js"
- * gives { prefix: "bg.", suffix: ".bundle.js" }. Null when there is no such
- * function or it isn't a plain concatenation.
+ * gives { prefix: "bg.", suffix: ".bundle.js", byId: false }; `t => "" + t + ".js"`
+ * gives byId: true, the name being the chunk id itself between the two. Null
+ * when there is no such function or it isn't a plain concatenation.
  */
-function chunkFileTemplate(swSrc: string): { prefix: string; suffix: string } | null {
+function chunkFileTemplate(swSrc: string): { prefix: string; suffix: string; byId: boolean } | null {
   const m = /(?:^|[^\w$.])[\w$]+\.u\s*=\s*(?:function\s*\(\s*[\w$]+\s*\)\s*\{\s*return\s+|\(?\s*[\w$]+\s*\)?\s*=>\s*)/.exec(swSrc);
   if (!m) return null;
   // The body runs to the first `;`, `,` or closing bracket outside brackets and strings.
@@ -1316,7 +1421,8 @@ function chunkFileTemplate(swSrc: string): { prefix: string; suffix: string } | 
   const lit = String.raw`(["'])([^"'\\]*)\1`;
   const head = new RegExp(`^${lit}\\s*\\+`).exec(body);
   const tail = new RegExp(`\\+\\s*${lit}$`).exec(body);
-  return { prefix: head ? head[2] : "", suffix: tail ? tail[2] : "" };
+  const middle = body.slice(head ? head[0].length : 0, tail ? body.length - tail[0].length : body.length).trim();
+  return { prefix: head ? head[2] : "", suffix: tail ? tail[2] : "", byId: /^[\w$]+$/.test(middle) };
 }
 
 // The chunk-loading global a webpack bundle declares, dot or bracket form:

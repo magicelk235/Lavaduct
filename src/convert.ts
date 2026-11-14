@@ -5,7 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { ConvertOptions, ConvertResult, Issue, Manifest, SignRoute } from "./types.js";
 import { ENV_PREFIX, NAME } from "./name.js";
 import { extractExtension } from "./input/extract.js";
-import { applySourceRewrites, matchManifestPathCase, normalizeLocaleCatalogs, removeUnreadableLocales, rewriteHoistedBackgroundChecks, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
+import { applySourceRewrites, backgroundModuleImports, matchManifestPathCase, normalizeLocaleCatalogs, removeUnreadableLocales, rewriteHoistedBackgroundChecks, rewriteHoistedWindowAssignments, stageExtension, stripDanglingSourcemaps } from "./input/stage.js";
 import { synthesizePlaceholderIcons } from "./input/icons.js";
 import {
   analyzeManifest,
@@ -239,6 +239,7 @@ function buildAddon(
         ? (Array.isArray(manifest.externally_connectable.ids) ? manifest.externally_connectable.ids : [])
         : undefined,
       frameGrants: settings.oauthBridge !== false && !!src.chromeId && framedSites(stageDir, manifest).length > 0,
+      contentScripts: (manifest.content_scripts ?? []).filter((cs) => cs.world !== "MAIN").flatMap((cs) => cs.js ?? []),
     });
     if (settings.debug) {
       log.ok(`Debug build: shim tracing on, kept in storage.local under ${DEBUG_LOG_KEY} (read it with ${NAME} --logs). Don't ship this build.`);
@@ -293,9 +294,14 @@ function buildAddon(
   if (bg.converted) {
     log.ok(`Service worker → background.scripts${bg.hoisted.length ? `, importScripts hoisted: ${bg.hoisted.join(", ")}` : ""}`);
     const worker = manifest.background?.service_worker;
-    const loaded = (out.background?.scripts ?? []).filter((s): s is string => typeof s === "string" && s !== shimFile);
+    const loaded = [
+      ...(out.background?.scripts ?? []).filter((s): s is string => typeof s === "string" && s !== shimFile),
+      ...backgroundModuleImports(stageDir, manifest),
+    ];
     const checks = typeof worker === "string" ? rewriteHoistedBackgroundChecks(stageDir, worker, loaded) : 0;
     if (checks > 0) log.ok(`Corrected the worker's background checks in ${checks} background script(s)`);
+    const windows = rewriteHoistedWindowAssignments(stageDir, loaded);
+    if (windows > 0) log.ok(`Dropped the worker's window assignments, which an event page refuses, in ${windows} hoisted script(s)`);
   }
   const icons = synthesizePlaceholderIcons(stageDir, out, src.name);
   if (icons.length > 0) log.ok(`Synthesized placeholder icons (${icons.join("/")}px); the manifest had none`);
