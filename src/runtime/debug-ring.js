@@ -144,7 +144,14 @@ var __SHIM_DEBUG_WRITE__ = (function () {
             return orig.apply(con, arguments);
           };
           teed.__debugRingTee = true;
-          con[level] = teed;
+          // Defined, not assigned: in a content script console is an Xray to the
+          // page's, where an assigned method can never be replaced again, and
+          // the add-on's own wrapper would fail (Firefox Quirks J11).
+          try {
+            Object.defineProperty(con, level, { value: teed, writable: true, configurable: true, enumerable: true });
+          } catch (e) {
+            con[level] = teed;
+          }
         });
       }
     } catch (e) {}

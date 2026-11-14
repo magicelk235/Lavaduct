@@ -35,7 +35,9 @@
 //   - the "browser_action" menu context, which Firefox refuses from MV3;
 //   - Chrome's callback on methods Firefox only gives a promise;
 //   - messages and ports addressed to the add-on's own Chrome ID;
-//   - tabs.query's frozen condition, which Firefox's schema refuses.
+//   - tabs.query's frozen condition, which Firefox's schema refuses;
+//   - console methods a content script replaces, which the page's console
+//     seen through an Xray only lets it replace once.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -2341,6 +2343,31 @@
     });
   }
 
+  // ── console methods a content script replaces ──────────────────────────────
+  // A content script's console is the page's, seen through an Xray. The first
+  // plain assignment to one of its methods leaves an expando that is neither
+  // writable nor configurable, so the next assignment is ignored, or throws
+  // "'error' is read-only" in strict code. Chrome's isolated world has its own
+  // console, whose methods stay writable: bundles wrap console.error in each
+  // content script (Brisk Teaching's Object.assign), and the second one died at
+  // the top. Each method is defined as a writable expando first, which later
+  // assignments keep (the Xray reports the native method as writable already,
+  // so the descriptor can't tell); the page's console is never touched. Only
+  // emitted for a bundle that assigns to console or passes it on.
+  function installContentConsole() {
+    if (!CONFIG.contentConsole || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    var con = null;
+    try { con = console; } catch (e) {}
+    if (!con) return;
+    Object.keys(con).forEach(function (name) {
+      try {
+        var d = Object.getOwnPropertyDescriptor(con, name);
+        if (!d || typeof d.value !== "function") return;
+        Object.defineProperty(con, name, { value: d.value, writable: true, configurable: true, enumerable: true });
+      } catch (e) {}
+    });
+  }
+
   // ── browserAction in an MV3 add-on ──────────────────────────────────────────
   // Firefox gives an MV3 add-on `action` and no `browserAction`, as Chrome does.
   // A bundle that also ships to Firefox as MV2 picks its Firefox branch by user
@@ -4122,6 +4149,7 @@
   try { installOwnIdSelectors(); } catch (e) { dbg("own ID selector shim failed:", errorMessage(e)); }
   try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
+  try { installContentConsole(); } catch (e) { dbg("content console shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
   try { installDefaultCookieStore(); } catch (e) { dbg("default cookie store shim failed:", errorMessage(e)); }
   try { installTabsQueryFrozen(); } catch (e) { dbg("tabs.query frozen shim failed:", errorMessage(e)); }
