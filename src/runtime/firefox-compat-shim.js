@@ -824,8 +824,12 @@
   // ── chrome.identity ─────────────────────────────────────────────────────────
   // Firefox implements getRedirectURL and launchWebAuthFlow only. getAuthToken
   // runs Google's OAuth flow through launchWebAuthFlow with Firefox's loopback
-  // redirect (http://127.0.0.1/mozoauth2/<id>), which Google accepts without a
-  // verified domain. The add-on's OAuth client has to allow that redirect.
+  // redirect (http://127.0.0.1/mozoauth2/<id>), which Firefox intercepts
+  // whether or not anything listens on port 80. The add-on's OAuth client has
+  // to allow that redirect, and a Chrome extension client doesn't: Google
+  // answers invalid_request for the loopback and redirect_uri_mismatch for
+  // getRedirectURL()'s https URL (measured November 2026), so the flow window
+  // shows Google's error page and the call fails once it's closed.
   var TOKEN_STORE_KEY = "__identityShimTokens";
   var PROFILE_SCOPE_RE = /^(?:email|openid|profile)$|userinfo\.(?:email|profile)$/;
 
