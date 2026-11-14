@@ -707,9 +707,10 @@ export function wireBackground(dir: string, manifest: Manifest, shimFile?: strin
  * `${…}` handling: interpolations re-enter code mode, nested templates included
  * (MetaMask's 1MB chunk 6078 nests templates two deep).
  * Returns the index where onCode returned true, else -1 (end of input reached,
- * or an unterminated construct).
+ * or an unterminated construct). `onLiteral(i)`, when given, hears the index of
+ * each string literal's opening quote and each code-level template's backtick.
  */
-function walkCode(src: string, start: number, onCode: (c: string, i: number) => boolean): number {
+function walkCode(src: string, start: number, onCode: (c: string, i: number) => boolean, onLiteral?: (i: number) => void): number {
   // Context stack: "T" = inside template-literal text; a number = inside a `${}`
   // interpolation, holding its open-brace count so the matching "}" hands control
   // back to the surrounding template text instead of being reported as code.
@@ -723,7 +724,7 @@ function walkCode(src: string, start: number, onCode: (c: string, i: number) => 
       if (c === "$" && src[i + 1] === "{") { stack.push(0); i++; continue; }
       continue;
     }
-    if (c === "`") { stack.push("T"); continue; }
+    if (c === "`") { onLiteral?.(i); stack.push("T"); continue; }
     if (typeof top === "number") {
       if (c === "}") {
         if (top === 0) { stack.pop(); continue; } // closes the ${ — resume template text
@@ -733,6 +734,7 @@ function walkCode(src: string, start: number, onCode: (c: string, i: number) => 
       }
     }
     if (c === '"' || c === "'") {
+      onLiteral?.(i);
       // skip the string literal
       i++;
       while (i < src.length) {
@@ -801,6 +803,13 @@ export function matchBalancedBrace(src: string, open: number): number {
     return false;
   });
   return at < 0 ? -1 : at + 1;
+}
+
+/** Indexes of every string literal's opening quote and every template's opening backtick. */
+export function literalStarts(src: string): Set<number> {
+  const starts = new Set<number>();
+  walkCode(src, 0, () => false, (i) => starts.add(i));
+  return starts;
 }
 
 // Keywords a regex literal can directly follow (`return/,/.test(x)` is how terser
