@@ -27,7 +27,8 @@
 //     Firefox's gecko ID doesn't;
 //   - storage.managed.get() without a policy, which Chrome answers as an empty area;
 //   - runtime.onUserScriptMessage/onUserScriptConnect before Firefox's runtime
-//     userScripts grant, Chrome's chrome.runtime in the USER_SCRIPT world, and
+//     userScripts grant; Chrome's USER_SCRIPT world (chrome.runtime, CustomEvent
+//     details cloned into the reading world, no cloneInto/exportFunction); and
 //     relative import() in registered user-script code, against the add-on;
 //   - webpack chunks of a worker bundle, listed ahead of the worker;
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
@@ -2464,20 +2465,132 @@
   }
 
   // ── USER_SCRIPT world ──────────────────────────────────────────────────────
-  // With messaging on, Chrome's USER_SCRIPT world gets chrome.runtime with id
-  // (a template property on every runtime object), lastError, sendMessage,
+  // Every USER_SCRIPT registration gets a first code entry that makes the world
+  // look like Chrome's to the add-on's code. It runs in the same world ahead of
+  // the scripts, as source text, so it closes over nothing in this file.
+  //
+  // runtime: with messaging on, Chrome's world gets chrome.runtime with id (a
+  // template property on every runtime object), lastError, sendMessage,
   // connect, onMessage and onConnect. Firefox gives it sendMessage and connect
-  // only, so a script reading chrome.runtime.id gets undefined and one adding an
-  // onMessage listener throws. Every USER_SCRIPT registration gets a first code
-  // entry that fills in id and inert onMessage/onConnect events (Firefox never
-  // delivers tabs.sendMessage to that world). It runs in the same world ahead of
-  // the scripts, and changes nothing where messaging is off (no chrome.runtime).
+  // only, so a script reading chrome.runtime.id gets undefined and one adding
+  // an onMessage listener throws. id and inert onMessage/onConnect events are
+  // filled in (Firefox never delivers tabs.sendMessage to that world); nothing
+  // changes where messaging is off (no chrome.runtime).
+  //
+  // CustomEvent details: Chrome structured-clones a detail into the world that
+  // reads it (blink's WorldSafeV8Reference), so a user script reads a plain
+  // object of its own from the page or a content script, and they read its
+  // details. Firefox hands the user-script world the page's object through an
+  // Xray, which refuses an object of this world as a property value ("Not
+  // allowed to define cross-origin object as property on [Object] or [Array]
+  // XrayWrapper"), and a content script's object, whose every property read
+  // throws "Permission denied to access property"; the page can't read this
+  // world's objects either. Here a detail from another world reads as a clone
+  // in this one, and an event this world creates carries a clone in the page's
+  // compartment while this world keeps reading its own object, as in the
+  // content-script shim. A detail cloneInto refuses (one holding a function)
+  // reads as before.
+  //
+  // cloneInto, exportFunction and createObjectIn: Firefox defines them in the
+  // user-script world, Chrome doesn't. A Chrome build that feature-detects them
+  // takes its Firefox code path, compiled for Firefox's content scripts and cut
+  // down in the Chrome build (Violentmonkey's GM_xmlhttpRequest clones a
+  // request into the page and then sets a property on it, which its Firefox
+  // build copies back first). With the details cloned as Chrome clones them,
+  // the three are taken out of the world, so the add-on takes its Chrome path.
+  function userScriptWorld(id) {
+    var G = globalThis;
+    try {
+      var c = typeof chrome === "object" && chrome || typeof browser === "object" && browser;
+      var r = c && c.runtime;
+      if (r) {
+        if (r.id == null) Object.defineProperty(r, "id", { value: id, enumerable: true, configurable: true });
+        var ev = function () {
+          var l = [];
+          return {
+            addListener: function (f) { if (l.indexOf(f) < 0) l.push(f); },
+            removeListener: function (f) { var i = l.indexOf(f); if (i >= 0) l.splice(i, 1); },
+            hasListener: function (f) { return l.indexOf(f) >= 0; },
+            hasListeners: function () { return l.length > 0; },
+          };
+        };
+        if (r.onMessage == null) r.onMessage = ev();
+        if (r.onConnect == null) r.onConnect = ev();
+        if (!("lastError" in r)) r.lastError = undefined;
+      }
+    } catch (e) {}
+    // The world outlives one registration's injection; set it up once.
+    var mark = typeof Symbol === "function" && Symbol.for("lavaduct.userScriptWorld");
+    if (!mark || G[mark]) return;
+    try {
+      Object.defineProperty(G, mark, { value: true });
+      var clone = G.cloneInto;
+      var page = typeof window === "object" && window;
+      var Native = page && page.CustomEvent;
+      var proto = Native && Native.prototype;
+      var desc = proto && Object.getOwnPropertyDescriptor(proto, "detail");
+      var nativeDetail = desc && desc.get;
+      var nativeInit = proto && proto.initCustomEvent;
+      if (typeof clone !== "function" || typeof Native !== "function" || typeof nativeDetail !== "function" || typeof WeakMap !== "function") return;
+      var isObject = function (v) { return v !== null && (typeof v === "object" || typeof v === "function"); };
+      // Events this world made, with the object it passed.
+      var own = new WeakMap();
+      // Events from other worlds, with the detail they carry and its clone here.
+      var read = new WeakMap();
+      var into = function (v, scope) {
+        try { return clone(v, scope, { wrapReflectors: true }); } catch (e) { return v; }
+      };
+      var CustomEvent = function CustomEvent(type, eventInitDict) {
+        // Without `new`, the native constructor throws its own TypeError.
+        if (!(this instanceof CustomEvent)) return Native.apply(this, arguments);
+        var init = eventInitDict;
+        if (init === null || typeof init !== "object" || !("detail" in init) || !isObject(init.detail)) return Reflect.construct(Native, arguments);
+        var detail = init.detail;
+        var event = new Native(type, { bubbles: init.bubbles, cancelable: init.cancelable, composed: init.composed, detail: into(detail, page) });
+        own.set(event, detail);
+        return event;
+      };
+      CustomEvent.prototype = proto;
+      try { Object.setPrototypeOf(CustomEvent, Object.getPrototypeOf(Native)); } catch (e) {}
+      Object.defineProperty(proto, "detail", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: function () {
+          if (own.has(this)) return own.get(this);
+          var detail = nativeDetail.call(this);
+          if (!isObject(detail)) return detail;
+          var seen = read.get(this);
+          if (seen && seen.from === detail) return seen.copy;
+          var copy = into(detail, G);
+          read.set(this, { from: detail, copy: copy });
+          return copy;
+        },
+      });
+      if (typeof nativeInit === "function") {
+        Object.defineProperty(proto, "initCustomEvent", {
+          configurable: true, enumerable: true, writable: true,
+          value: function initCustomEvent(type, bubbles, cancelable, detail) {
+            if (!isObject(detail)) {
+              own.delete(this);
+              return nativeInit.apply(this, arguments);
+            }
+            var result = nativeInit.call(this, type, bubbles, cancelable, into(detail, page));
+            own.set(this, detail);
+            return result;
+          },
+        });
+      }
+      try { Object.defineProperty(proto, "constructor", { value: CustomEvent, writable: true, configurable: true }); } catch (e) {}
+      Object.defineProperty(page, "CustomEvent", { value: CustomEvent, writable: true, configurable: true });
+      Object.defineProperty(G, "CustomEvent", { value: CustomEvent, writable: true, configurable: true });
+      ["cloneInto", "exportFunction", "createObjectIn"].forEach(function (name) {
+        try { delete G[name]; } catch (e) {}
+      });
+    } catch (e) {}
+  }
+
   function userScriptWorldPrelude() {
-    var id = JSON.stringify(String(api.runtime.id));
-    return "(function(){try{var c=typeof chrome==='object'&&chrome||typeof browser==='object'&&browser;var r=c&&c.runtime;if(!r)return;" +
-      "if(r.id==null)Object.defineProperty(r,'id',{value:" + id + ",enumerable:true,configurable:true});" +
-      "var ev=function(){var l=[];return{addListener:function(f){if(l.indexOf(f)<0)l.push(f)},removeListener:function(f){var i=l.indexOf(f);if(i>=0)l.splice(i,1)},hasListener:function(f){return l.indexOf(f)>=0},hasListeners:function(){return l.length>0}}};" +
-      "if(r.onMessage==null)r.onMessage=ev();if(r.onConnect==null)r.onConnect=ev();if(!('lastError' in r))r.lastError=undefined;}catch(e){}})();";
+    return "(" + userScriptWorld + ")(" + JSON.stringify(String(api.runtime.id)) + ");";
   }
 
   function withPrelude(script) {
