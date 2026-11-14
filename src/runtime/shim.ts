@@ -715,6 +715,20 @@ export function matchBalancedParen(src: string, open: number): number {
   return at < 0 ? -1 : at + 1;
 }
 
+/** matchBalancedParen for a "{" (a block, an object, or the brace of a `${`). */
+export function matchBalancedBrace(src: string, open: number): number {
+  let depth = 0;
+  const at = walkCode(src, open, (c) => {
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return true;
+    }
+    return false;
+  });
+  return at < 0 ? -1 : at + 1;
+}
+
 // Keywords a regex literal can directly follow (`return/,/.test(x)` is how terser
 // emits it). An identifier ending just before the `/` that ISN'T one of these means
 // division (`n / 2`).
