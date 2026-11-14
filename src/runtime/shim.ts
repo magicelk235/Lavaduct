@@ -132,9 +132,14 @@ const CHROME_NET_ERROR_RE = /net::ERR_(?:BLOCKED_BY_CLIENT|ABORTED)\b/;
 const BROWSER_ACTION_CONTEXT_RE = /["'`]browser_action["'`]/;
 // A body read as JSON, whose objects a Firefox content script gets from the page's realm.
 const BODY_JSON_RE = /\.\s*json\s*\(\s*\)/;
-// A global looked up through self or window, which in a Firefox content script
-// is the page's window, whose built-ins are the page's.
-const WINDOW_GLOBAL_LOOKUP_RE = /\btypeof\s+(?:self|window)\b|\b(?:self|window)\s*\.\s*(?:Object|Array|Reflect|Symbol|Promise|Map|Set|Math|JSON|Proxy|Intl|Date|RegExp|Error|ArrayBuffer|Uint8Array)\b/;
+// A write onto a built-in reached through a global alias (`root.Reflect = …`,
+// `Object.defineProperty(root.Reflect, …)`, `global.Symbol.observable = …`),
+// which in a Firefox content script lands on the page's built-in when the alias
+// is self or window.
+const BUILTIN_ALIAS_WRITE_RE = /[\w$]\s*\.\s*(?:Object|Array|Reflect|Symbol|Promise|Map|Set|WeakMap|WeakSet|JSON|Math|Number|String|Date|RegExp|Error|ArrayBuffer|Uint8Array|Intl|Proxy)(?:\s*\.\s*[\w$]+){0,2}\s*=(?![=>])|\bdefinePropert(?:y|ies)\s*\(\s*[\w$]+\s*\.\s*(?:Object|Array|Reflect|Symbol|Promise|Map|Set|WeakMap|WeakSet|JSON|Math|Number|String|Date|RegExp|Error|ArrayBuffer|Uint8Array|Intl|Proxy)\s*[,.)]/;
+// Code written for Firefox's content-script Xrays, which may build page values
+// with `new window.Object()` and the like on purpose.
+const FIREFOX_AWARE_RE = /\b(?:wrappedJSObject|cloneInto|exportFunction|XPCNativeWrapper)\b/;
 // The storage areas whose set the clone fallback wraps.
 const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
 // Chrome's proxy settings, which the shim emulates on proxy.onRequest.
@@ -234,7 +239,8 @@ interface Usage {
   chromeNetErrors: boolean;
   browserActionContext: boolean;
   bodyJson: boolean;
-  windowGlobalLookup: boolean;
+  builtinAliasWrite: boolean;
+  firefoxAware: boolean;
   storage: boolean;
   proxySettings: boolean;
   messaging: boolean;
@@ -260,7 +266,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, windowGlobalLookup: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
+    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, builtinAliasWrite: false, firefoxAware: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
     promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false,
   };
   const ownId = chromeId.toLowerCase();
@@ -290,7 +296,8 @@ function scanUsage(dir: string, chromeId = ""): Usage {
       if (!found.chromeNetErrors) found.chromeNetErrors = CHROME_NET_ERROR_RE.test(src);
       if (!found.browserActionContext) found.browserActionContext = BROWSER_ACTION_CONTEXT_RE.test(src);
       if (!found.bodyJson) found.bodyJson = BODY_JSON_RE.test(src);
-      if (!found.windowGlobalLookup) found.windowGlobalLookup = WINDOW_GLOBAL_LOOKUP_RE.test(src);
+      if (!found.builtinAliasWrite) found.builtinAliasWrite = BUILTIN_ALIAS_WRITE_RE.test(src);
+      if (!found.firefoxAware) found.firefoxAware = FIREFOX_AWARE_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.proxySettings) found.proxySettings = PROXY_SETTINGS_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
@@ -411,7 +418,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     webRequestErrorNames: usage.chromeNetErrors,
     menuActionContext: usage.browserActionContext,
     contentBodyJson: usage.bodyJson,
-    contentWindowBuiltins: usage.windowGlobalLookup,
+    contentWindowBuiltins: usage.builtinAliasWrite && !usage.firefoxAware,
     storageClone: usage.storage,
     proxySettings: usage.proxySettings,
     pacPage: usage.proxySettings ? PAC_PAGE : "",

@@ -15,10 +15,12 @@ import { buildShim, fakeBrowser, runInContext } from "./shim-sandbox.js";
 // test/firefox-content-window-builtins.test.js; here the page is a second vm
 // realm.
 
+// reflect-metadata's own shape: the global lookup, then a write onto root.Reflect.
 const LOOKUP = `var root = typeof global === "object" ? global : typeof self === "object" ? self : globalThis;`;
+const REFLECT_METADATA = `${LOOKUP} if (typeof root.Reflect === "undefined") { root.Reflect = Reflect3; }`;
 
-function contentScript(code = LOOKUP) {
-  const page = vm.runInNewContext("({ Object, Array, Reflect, Symbol, Promise, JSON, Map, Function, fetch: function fetch() {} })");
+function contentScript(code = REFLECT_METADATA) {
+  const page = vm.runInNewContext("({ Object, Array, Reflect, Symbol, Promise, JSON, Map, Uint8Array, Function, fetch: function fetch() {} })");
   const windowXray = { ...page };
   windowXray.self = windowXray;
   const ctx = runInContext(buildShim({}, { "cs.js": code }), {
@@ -38,6 +40,12 @@ test("a content script reaches its own built-ins through window and self, as in 
   assert.deepEqual([...out], [true, true, true, true, true, true, true]);
 });
 
+test("window gives the script's own global under a built-in's name, as in Chrome", () => {
+  const { ctx } = contentScript();
+  vm.runInContext(`var Atomics = "mine"; window.Promise = "polyfill";`, ctx);
+  assert.deepEqual([...vm.runInContext(`[window.Atomics, Promise]`, ctx)], ["mine", "polyfill"]);
+});
+
 test("reflect-metadata's global lookup defines its functions on the script's own Reflect", () => {
   const { ctx, page } = contentScript();
   vm.runInContext(`${LOOKUP} Object.defineProperty(root.Reflect, "metadata", { configurable: true, writable: true, value: function metadata() {} });`, ctx);
@@ -51,12 +59,21 @@ test("only ECMAScript built-ins are aliased; Function and the window's web APIs 
   assert.equal(vm.runInContext("window.fetch", ctx), page.fetch);
 });
 
-test("extension pages and bundles without a window global lookup keep Firefox's window", () => {
-  const none = contentScript("console.log(1);");
+test("extension pages, and bundles that never write onto a built-in through an alias, keep Firefox's window", () => {
+  const none = contentScript(`${LOOKUP} console.log(root.document);`);
   assert.equal(none.windowXray.Reflect, none.page.Reflect);
 
   const page = vm.runInNewContext("({ Reflect })");
   const win = { Reflect: page.Reflect };
-  runInContext(buildShim({}, { "p.js": LOOKUP }), { browser: fakeBrowser(), globals: { window: win } });
+  runInContext(buildShim({}, { "p.js": REFLECT_METADATA }), { browser: fakeBrowser(), globals: { window: win } });
   assert.equal(win.Reflect, page.Reflect, "an extension page's window is left alone");
+});
+
+test("a Firefox-aware bundle keeps window's built-ins the page's, so it can still build page values with them", () => {
+  // Code written for Firefox's Xrays makes values the page can read with
+  // `new window.Object()` or `new window.Uint8Array()`, next to cloneInto.
+  const firefoxAware = `${REFLECT_METADATA} const v = new window.Object(); v.x = 1; window.wrappedJSObject.data = cloneInto({ a: 1 }, window);`;
+  const { windowXray, page } = contentScript(firefoxAware);
+  assert.equal(windowXray.Object, page.Object);
+  assert.equal(windowXray.Uint8Array, page.Uint8Array);
 });

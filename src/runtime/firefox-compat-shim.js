@@ -2281,10 +2281,13 @@
   // [Object] or [Array] XrayWrapper": reflect-metadata (tsyringe, inversify)
   // takes `self` as its global and defines its functions on root.Reflect, and
   // Avast Online Security's content script died on that line on every page.
-  // The ECMAScript built-ins are set on the Xray to the script's own, which only
-  // this add-on's content scripts see. Function stays the page's, so code it
-  // builds keeps running under the page's CSP, and so do the window's web APIs.
-  // Emitted for a bundle that looks the global up through self or window.
+  // The ECMAScript built-ins on the Xray become accessors onto the sandbox's own
+  // (a script's own `var Map` included), seen by this add-on's content scripts
+  // only. Function stays the page's, so code it builds keeps running under the
+  // page's CSP, and so do the window's web APIs. Emitted for a bundle that
+  // writes onto a built-in through a global alias, and never for one that is
+  // Firefox-aware (wrappedJSObject, cloneInto, exportFunction), which may build
+  // page values with `new window.Object()` on purpose.
   var OWN_BUILTINS = ["Object", "Array", "Boolean", "Number", "String", "Symbol", "BigInt", "Math", "JSON", "Reflect", "Proxy",
     "Promise", "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "Date", "RegExp", "Intl", "Atomics", "Iterator",
     "Error", "AggregateError", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
@@ -2293,12 +2296,18 @@
   function installContentWindowBuiltins() {
     if (!CONFIG.contentWindowBuiltins || isExtensionPage || typeof window !== "object" || !window || window === G) return;
     OWN_BUILTINS.forEach(function (name) {
-      var own;
-      try { own = G[name]; } catch (e) { return; }
-      if (own == null) return;
       try {
-        if (window[name] === own) return;
-        Object.defineProperty(window, name, { value: own, writable: true, configurable: true, enumerable: false });
+        if (!Object.getOwnPropertyDescriptor(G, name)) return;
+        Object.defineProperty(window, name, {
+          configurable: true,
+          enumerable: false,
+          get: function () {
+            var d = Object.getOwnPropertyDescriptor(G, name);
+            if (!d) return undefined;
+            return d.get ? d.get.call(G) : d.value;
+          },
+          set: function (value) { G[name] = value; },
+        });
       } catch (e) {}
     });
   }
