@@ -1011,12 +1011,49 @@ function rewritePredicateBodies(src: string, yes: (check: string) => string): st
     head + body.replace(UNDEFINED_GLOBAL_RE, yes));
 }
 
+// The path Firefox gives the event page it generates for background.scripts:
+// where Chrome's background is at /<worker script>, Firefox's is here.
+const EVENT_PAGE_PATH = "/_generated_background_page.html";
+
+/**
+ * `<value>.pathname` compared with the worker script's own path, either way
+ * round, with ==, ===, != or !==; the value a plain identifier or member chain
+ * (`e`, `t.location`), never `location` itself, which pathRe answers outright.
+ * Groups: 1 value, 2 operator; reversed: 5 operator, 6 value.
+ */
+function workerPathRe(worker: string): RegExp {
+  const value = String.raw`[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*`;
+  const path = String.raw`\/${regexEscape(worker)}`;
+  return new RegExp(
+    String.raw`(?<![\w$.])(${value})\.pathname\s*([!=]==?)\s*(["'])${path}\3|(["'])${path}\4\s*([!=]==?)\s*(${value})\.pathname(?![\w$])`,
+    "g",
+  );
+}
+
+/**
+ * A path compared with the worker script's names Chrome's background, so the
+ * comparison accepts the event page's path too: for the background's own location
+ * or a sender URL from it, the answer is Chrome's. No page of the add-on has that
+ * path, so in a chunk its pages load too the answer there doesn't change, and the
+ * value's origin, which the bundle checks itself, is left to it.
+ */
+function workerPathOrEventPage(whole: string, value1?: string, op1?: string, _q1?: string, _q2?: string, op2?: string, value2?: string): string {
+  const value = value1 ?? value2 ?? "";
+  const op = op1 ?? op2 ?? "===";
+  if (/^(?:(?:self|globalThis|window)\.)?location$/.test(value)) return whole;
+  const negated = op.startsWith("!");
+  return `(${whole}${negated ? "&&" : "||"}${value}.pathname${op}${JSON.stringify(EVENT_PAGE_PATH)})`;
+}
+
 /**
  * The worker's "am I the worker?" checks in every script the background loads,
  * once the worker's importScripts targets and chunks are known (wireBackground):
  *   - the background-literal checks rewriteBackgroundContextChecks fixes in the
  *     manifest's scripts, now in the hoisted files too;
  *   - `location.pathname == "/<worker script>"` (Hola's is_bg);
+ *   - `<value>.pathname === "/<worker script>"` on a location passed in (Magical's
+ *     `rB(e){return aB(e)&&e.pathname==="/background/background.js"}`, called with
+ *     globalThis.location), see workerPathRe;
  *   - a worker test inside an is…Background()/isServiceWorker() body (Total
  *     Adblock's `"undefined" == typeof document`).
  * The worker's own script only runs as the background, so its checks become
@@ -1026,8 +1063,9 @@ function rewritePredicateBodies(src: string, yes: (check: string) => string): st
 export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: string, loaded: string[]): number {
   const worker = workerScript.replace(/^\.?\//, "");
   if (!worker) return 0;
-  const pathCheck = String.raw`(?:(?:self|globalThis|window)\.)?location\.pathname\s*===?\s*(["'])\/?${regexEscape(worker)}\1`;
+  const pathCheck = String.raw`(?<![\w$.])(?:(?:self|globalThis|window)\.)?location\.pathname\s*===?\s*(["'])\/?${regexEscape(worker)}\1`;
   const pathRe = new RegExp(`${pathCheck}|(["'])\\/?${regexEscape(worker)}\\2\\s*===?\\s*(?:(?:self|globalThis|window)\\.)?location\\.pathname`, "g");
+  const workerPath = workerPathRe(worker);
   let modified = 0;
   for (const rel of loaded) {
     const name = rel.replace(/^\.?\//, "");
@@ -1040,7 +1078,9 @@ export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: s
     }
     const isWorker = name === worker;
     const yes = (check: string) => (isWorker ? "true" : `(${check}||${BACKGROUND_FLAG})`);
-    let next = content.replace(pathRe, (check) => yes(check));
+    // Before pathRe, which would otherwise take the `location.pathname` tail of
+    // `e.location.pathname`; the value isn't known to be this context's location.
+    let next = content.replace(workerPath, workerPathOrEventPage).replace(pathRe, (check) => yes(check));
     next = rewritePredicateBodies(next, yes);
     if (!isWorker) {
       next = next
