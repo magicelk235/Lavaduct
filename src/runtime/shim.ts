@@ -57,6 +57,8 @@ export interface ShimConfig {
   externalIds?: string[];
   /** The page bridge lets the add-on's pages frame sites (framedSites), with session rules of its own. */
   frameGrants?: boolean;
+  /** The scripts of the manifest's content_scripts that run in the isolated world, root-relative. */
+  contentScripts?: string[];
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
@@ -132,6 +134,12 @@ const SESSION_ACCESS_RE = /\bsetAccessLevel\b/;
 // the like; Firefox refuses even the default store from an add-on without the
 // cookies permission.
 const COOKIE_STORE_ID_RE = /\bcookieStoreId\b/;
+// Chrome's frozen condition, which Firefox's tabs.query refuses.
+const FROZEN_KEY_RE = /\bfrozen\s*:|["'`]frozen["'`]/;
+// console's methods replaced, or console handed to code that may replace them
+// (`Object.assign(console, …)`, `(function (c) { … })(console)`): in a content
+// script the page's console only lets each be replaced once.
+const CONSOLE_PATCH_RE = /\bconsole\s*(?:\.\s*[\w$]+|\[[^\]\n]{1,40}\])\s*=(?!=)|\b(?:assign|defineProperty|defineProperties)\s*\(\s*console\b|\(\s*console\s*\)/;
 // The add-on's own ID read, and selector calls it can end up in unquoted: a
 // Chrome ID is a CSS identifier, Firefox's gecko ID isn't.
 const RUNTIME_ID_RE = /\bruntime\s*(?:\?\.|\.)\s*id\b/;
@@ -205,17 +213,22 @@ interface Usage {
   promiseOnlyCalls: string[];
   sessionAccess: boolean;
   cookieStoreId: boolean;
+  frozenKey: boolean;
+  consolePatch: boolean;
   runtimeId: boolean;
   selectorCall: boolean;
+  /** The add-on's Chrome ID is written into its code. */
+  chromeIdLiteral: boolean;
 }
 
-function scanUsage(dir: string): Usage {
+function scanUsage(dir: string, chromeId = ""): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
-    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false,
+    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
+    promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false,
   };
+  const ownId = chromeId.toLowerCase();
   for (const file of walkScripts(dir, [], [".js", ".mjs", ".html", ".htm", ".css"])) {
     if (basename(file) === SHIM_FILENAME) continue;
     let src: string;
@@ -259,11 +272,46 @@ function scanUsage(dir: string): Usage {
       if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
       if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
       if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
+      if (!found.frozenKey) found.frozenKey = FROZEN_KEY_RE.test(src);
+      if (!found.consolePatch) found.consolePatch = CONSOLE_PATCH_RE.test(src);
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
       if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
+      // The page bridge lavaduct writes holds the ID too; it isn't the add-on's code.
+      if (!found.chromeIdLiteral && ownId) found.chromeIdLiteral = src.includes(ownId) && !basename(file).startsWith(`${NAME}-`);
     }
   }
   return found;
+}
+
+// A name a script declares with `function` or `var`, which at the top of a
+// script makes it a property of the global, and a name read off window or self.
+const DECLARED_NAME_RE = /(?<![\w$.])(?:function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|var\s+([A-Za-z_$][\w$]*))/g;
+const WINDOW_MEMBER_RE = /(?<![\w$.])(?:window|self)\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)/g;
+
+/**
+ * The names the content scripts declare and also read off window or self. In
+ * Chrome's isolated world window is the global, so `function f` is window.f; a
+ * Firefox content script's window is an Xray to the page's, which doesn't have
+ * it (the shim's installContentGlobals). A declaration inside a function is
+ * collected too; the shim's accessor answers only what the global holds.
+ */
+function contentGlobalNames(dir: string, scripts: string[]): string[] {
+  const root = resolve(dir);
+  const declared = new Set<string>();
+  const read = new Set<string>();
+  for (const rel of new Set(scripts.map((s) => s.replace(/^(?:\.?\/)+/, "")))) {
+    const file = resolve(root, rel);
+    if (!file.startsWith(root + sep) || basename(file) === SHIM_FILENAME) continue;
+    let src: string;
+    try {
+      src = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    for (const m of src.matchAll(DECLARED_NAME_RE)) declared.add(m[1] ?? m[2]);
+    for (const m of src.matchAll(WINDOW_MEMBER_RE)) read.add(m[1]);
+  }
+  return [...read].filter((name) => declared.has(name)).sort();
 }
 
 /**
@@ -279,7 +327,7 @@ function permissionAnswers(declared: string[]): Record<string, boolean> {
 }
 
 function shimSource(dir: string, config: ShimConfig): string {
-  const usage = scanUsage(dir);
+  const usage = scanUsage(dir, config.extensionId ?? "");
   // The config goes in as a JSON literal, so nothing from the manifest is ever
   // interpolated into code. JSON.stringify leaves U+2028/U+2029 raw, which are
   // line terminators inside a JS string literal; escape them.
@@ -336,6 +384,10 @@ function shimSource(dir: string, config: ShimConfig): string {
     promiseOnlyCalls: usage.promiseOnlyCalls.sort(),
     sessionAccess: usage.sessionAccess,
     defaultCookieStore: usage.cookieStoreId,
+    ownIdMessages: usage.chromeIdLiteral,
+    tabsQueryFrozen: usage.frozenKey,
+    contentConsole: usage.consolePatch,
+    contentGlobals: contentGlobalNames(dir, config.contentScripts ?? []),
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
