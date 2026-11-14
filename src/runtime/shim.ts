@@ -409,7 +409,7 @@ export function derivePanelPage(dir: string, manifest: Manifest): string {
     if (!/\bsidePanel\s*\./.test(src)) continue;
     used = true;
     for (let at = src.indexOf("setOptions("); at >= 0; at = src.indexOf("setOptions(", at + 11)) {
-      const end = matchBalancedParen(src, at + 10);
+      const end = matchBalanced(src, at + 10);
       const args = src.slice(at, end < 0 ? at + 600 : end);
       pathRe.lastIndex = 0;
       for (let m = pathRe.exec(args); m; m = pathRe.exec(args)) {
@@ -629,7 +629,7 @@ export function wireBackground(dir: string, manifest: Manifest, shimFile?: strin
 }
 
 /**
- * Lexing walk shared by matchBalancedParen and pushArrayElementCount so the two
+ * Lexing walk shared by matchBalanced and pushArrayElementCount so the two
  * can never disagree about what is code. Invokes onCode(c, i) for every character
  * outside string/template/comment/regex content. Template literals get full
  * `${…}` handling: interpolations re-enter code mode, nested templates included
@@ -697,16 +697,18 @@ function walkCode(src: string, start: number, onCode: (c: string, i: number) => 
 }
 
 /**
- * Given the index of an opening "(" in `src`, return the index just PAST its
- * matching ")", honoring nested parens and skipping string/template/comment/regex
- * content (see walkCode). Returns -1 if no balanced close is found. A ")" inside
- * a template interpolation still counts — interpolations are code.
+ * Given the index of an opening "(", "[" or "{" in `src`, return the index just
+ * PAST its matching closer, honoring nesting and skipping string/template/comment/
+ * regex content (see walkCode). Returns -1 if no balanced close is found. A closer
+ * inside a template interpolation still counts — interpolations are code.
  */
-export function matchBalancedParen(src: string, open: number): number {
+function matchBalanced(src: string, open: number): number {
+  const opener = src[open];
+  const closer = opener === "(" ? ")" : opener === "[" ? "]" : "}";
   let depth = 0;
   const at = walkCode(src, open, (c) => {
-    if (c === "(") depth++;
-    else if (c === ")") {
+    if (c === opener) depth++;
+    else if (c === closer) {
       depth--;
       if (depth === 0) return true;
     }
@@ -805,16 +807,16 @@ function hoistImportScripts(dir: string, swPath: string): HoistResult {
 // as a bare literal does, but relative to the extension ROOT, not the worker's dir.
 // Rewrite each such call to the root-absolute literal "/js/a.js" before the argument
 // list is classified, so it is hoisted like any static target instead of being
-// neutralized as "dynamic" with its code lost. Shared with the analyzer.
+// neutralized as "dynamic" with its code lost.
 const GETURL_LITERAL_RE = /(?:[A-Za-z_$][\w$]*\s*\.\s*)*runtime\s*\.\s*getURL\s*\(\s*(["'`])([^"'`$\\]+)\1\s*\)/g;
-export function rootLiteralsFromGetURL(argList: string): string {
+function rootLiteralsFromGetURL(argList: string): string {
   return argList.replace(GETURL_LITERAL_RE, (_m, _q, lit: string) => JSON.stringify("/" + lit.replace(/^\/+/, "")));
 }
 
 /**
- * Replace every importScripts(...) call in ONE file with a void-0 no-op and
- * return the resolvable string-literal targets (root-relative, existing on disk)
- * plus whether any call had a runtime-computed argument.
+ * Replace every importScripts call in ONE file (see importScriptsCalls) with a
+ * void-0 no-op and return the resolvable string-literal targets (root-relative,
+ * existing on disk) plus whether any call had a runtime-computed argument.
  */
 function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: string): { targets: string[]; dynamic: boolean } {
   if (!insideStage(dir, rootRel)) return { targets: [], dynamic: false };
@@ -825,30 +827,16 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
   } catch {
     return { targets: [], dynamic: false };
   }
-  if (!/\bimportScripts\s*\(/.test(src)) return { targets: [], dynamic: false };
+  const calls = importScriptsCalls(src);
+  if (calls.length === 0) return { targets: [], dynamic: false };
 
   const targets: string[] = [];
   let dynamic = false;
-  // The end of each call comes from matchBalancedParen, not a `[^)]*` regex: an
-  // argument can contain parens itself (webpack's `importScripts(o.p+o.u(t))`), and
-  // cutting at the first ")" leaves a dangling one behind, a SyntaxError.
-  // The match also takes any receiver chain ending in `.importScripts(`, so
-  // `self.importScripts(...)` (Workbox) or a bundler alias (`var g=self;
-  // g.importScripts(…)`) is replaced as one span; leaving the receiver behind would
-  // emit `self.void 0`. A bare `importScripts(` still matches via the leading `\b`.
-  const callOpenRe = /(?:[A-Za-z_$][\w$]*(?:\s*(?:\?\.\s*[\w$]+|\.\s*[\w$]+|\[[^\]]*\]))*\s*(?:\?\.|\.)\s*)?\bimportScripts\s*\(/g;
-  let neutralized = 0;
   let out = "";
   let last = 0;
-  let mm: RegExpExecArray | null;
-  while ((mm = callOpenRe.exec(src))) {
-    const openParen = mm.index + mm[0].length - 1; // index of the "(" itself
-    const end = matchBalancedParen(src, openParen); // index just past the ")"
-    if (end < 0) continue; // unbalanced (shouldn't happen in valid JS) → leave as-is
-    const argList = rootLiteralsFromGetURL(src.slice(openParen + 1, end - 1));
-    const classified = importScriptsTargets(src, mm.index, argList);
-    if (classified.dynamic) dynamic = true;
-    for (const literal of classified.literals) {
+  for (const call of calls) {
+    if (call.dynamic) dynamic = true;
+    for (const literal of call.literals) {
       // A leading "/" is the extension root; anything else is relative to the
       // worker's own dir. join() would glue a root-absolute literal onto the
       // worker's dir ("src" + "/src/lib/a.js"), a path that exists nowhere.
@@ -857,17 +845,199 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
       // Unresolved, or not a file → no script entry; the call is still neutralised.
       if (insideStage(dir, fromRoot) && isFile(join(dir, fromRoot))) targets.push(fromRoot);
     }
-    out += src.slice(last, mm.index) + "void 0 /* importScripts hoisted to background.scripts */";
-    last = end;
-    neutralized++;
-    callOpenRe.lastIndex = end; // continue scanning after the full call
+    out += src.slice(last, call.start) + "void 0 /* importScripts hoisted to background.scripts */";
+    last = call.end;
   }
   out += src.slice(last);
 
   // Write whenever ANY call was neutralised: an unresolved target must be
   // de-fanged too, or it throws on the undefined global.
-  if (neutralized > 0) writeFileSync(filePath, out, "utf-8");
+  writeFileSync(filePath, out, "utf-8");
   return { targets, dynamic };
+}
+
+/** One importScripts call in a file: its span, the files it names, and whether it computes any. */
+export interface ImportScriptsCall {
+  /** Start of the call, receiver chain included. */
+  start: number;
+  /** Index just past its closing ")". */
+  end: number;
+  literals: string[];
+  dynamic: boolean;
+}
+
+/**
+ * Every importScripts call in `src`, in order, classified (getURL literals read as
+ * root paths): a call by name, `importScripts.call(scope, …urls)`, and
+ * `importScripts.apply(scope, urls)`. An apply whose list isn't an array literal is
+ * resolved through the function forwarding its arguments (see forwardedTargets).
+ * Shared with the analyzer.
+ *
+ * The end of each call comes from matchBalanced, not a `[^)]*` regex: an
+ * argument can contain parens itself (webpack's `importScripts(o.p+o.u(t))`), and
+ * cutting at the first ")" leaves a dangling one behind, a SyntaxError. The match
+ * also takes any receiver chain ending in `.importScripts`, so `self.importScripts(…)`
+ * (Workbox) or a bundler alias (`var g=self; g.importScripts(…)`) is one span;
+ * leaving the receiver behind would emit `self.void 0`. A bare `importScripts(`
+ * still matches via the leading `\b`.
+ */
+export function importScriptsCalls(src: string): ImportScriptsCall[] {
+  const calls: ImportScriptsCall[] = [];
+  if (!/\bimportScripts\s*(?:\.\s*(?:apply|call)\s*)?\(/.test(src)) return calls;
+  const callOpenRe = /(?:([A-Za-z_$][\w$]*(?:\s*(?:\?\.\s*[\w$]+|\.\s*[\w$]+|\[[^\]]*\]))*)\s*(?:\?\.|\.)\s*)?\bimportScripts\s*(?:\.\s*(apply|call)\s*)?\(/g;
+  for (let mm: RegExpExecArray | null; (mm = callOpenRe.exec(src)); ) {
+    const openParen = mm.index + mm[0].length - 1; // index of the "(" itself
+    const end = matchBalanced(src, openParen); // index just past the ")"
+    if (end < 0) continue; // unbalanced (shouldn't happen in valid JS) → leave as-is
+    callOpenRe.lastIndex = end; // continue scanning after the full call
+    const inner = src.slice(openParen + 1, end - 1);
+    let classified: { literals: string[]; dynamic: boolean };
+    if (!mm[2]) {
+      classified = importScriptsTargets(src, mm.index, rootLiteralsFromGetURL(inner));
+    } else {
+      // The first argument of call and apply is the scope, not a URL.
+      const urls = splitTopLevelArgs(inner).slice(1).join(",");
+      if (mm[2] === "call") classified = importScriptsTargets(src, mm.index, rootLiteralsFromGetURL(urls));
+      else {
+        const list = /^\s*\[([\s\S]*)\]\s*$/.exec(urls);
+        classified = list && matchBalanced(urls, urls.indexOf("[")) === urls.lastIndexOf("]") + 1
+          ? importScriptsTargets(src, mm.index, rootLiteralsFromGetURL(list[1]))
+          : forwardedTargets(src, mm.index, mm[1] ?? "", urls);
+      }
+    }
+    calls.push({ start: mm.index, end, ...classified });
+  }
+  return calls;
+}
+
+/** An identifier as a regex source: `$` is its only character with a meaning there. */
+const identPattern = (name: string): string => name.replace(/\$/g, "\\$");
+
+/**
+ * The files a function that forwards its own arguments to importScripts loads:
+ * Closure's safe importScripts (safevalues' workerGlobalScopeImportScripts),
+ *   function Aa(a){a.importScripts.apply(a,G.apply(1,arguments).map(unwrap))}
+ *   var Ba=y(["mustache.js"]); … Aa(self,za(Ba));
+ * (Google Dictionary). The apply at `callAt` must sit in a named function whose
+ * argument list feeds it; every reference to that name must be a call, so no
+ * caller is out of sight; and each URL a call passes must come down to one string
+ * literal (resolveUrlLiteral). When the receiver is the function's first parameter,
+ * that argument is the scope, not a URL. Anything short of that is dynamic.
+ */
+function forwardedTargets(src: string, callAt: number, receiver: string, urls: string): { literals: string[]; dynamic: boolean } {
+  const fn = enclosingFunction(src, callAt);
+  const dynamic = { literals: [], dynamic: true };
+  if (!fn) return dynamic;
+  const fed = new RegExp(`(?<![\\w$.])(?:${["arguments", ...fn.params].map(identPattern).join("|")})(?![\\w$])`);
+  if (!fed.test(urls)) return dynamic;
+  const skipScope = fn.params[0] !== undefined && receiver.trim() === fn.params[0];
+
+  const literals: string[] = [];
+  let isDynamic = false;
+  const refRe = new RegExp(`(?<![\\w$.])${identPattern(fn.name)}(?![\\w$])`, "g");
+  for (let m: RegExpExecArray | null; (m = refRe.exec(src)); ) {
+    if (m.index === fn.nameAt) continue;
+    const open = /^\s*\(/.exec(src.slice(m.index + m[0].length, m.index + m[0].length + 64));
+    if (!open) { isDynamic = true; continue; }
+    const openParen = m.index + m[0].length + open[0].length - 1;
+    const end = matchBalanced(src, openParen);
+    if (end < 0) { isDynamic = true; continue; }
+    const args = splitTopLevelArgs(rootLiteralsFromGetURL(src.slice(openParen + 1, end - 1)));
+    for (const arg of skipScope ? args.slice(1) : args) {
+      const found = resolveUrlLiteral(src, arg, 0);
+      if (found?.length === 1) literals.push(found[0]);
+      else isDynamic = true;
+    }
+  }
+  return { literals, dynamic: isDynamic };
+}
+
+/**
+ * The innermost named function whose braced body contains `at`: `function f(…){`,
+ * `f=function(…){` or `f=(…)=>{`. A method (`o.f=function`, `{f:function}`) has no
+ * name here: its callers go through the object, out of sight of a scan for `f(`.
+ * Heads are scanned forward and a body that ends before `at` is skipped whole, so
+ * a big bundle is read about once.
+ */
+function enclosingFunction(src: string, at: number): { name: string; nameAt: number; params: string[] } | null {
+  const headRe = /(?:(?<![\w$.])([A-Za-z_$][\w$]*)\s*=\s*)?(?:\bfunction\b\s*([A-Za-z_$][\w$]*)?\s*\(([^()]*)\)|\(([^()]*)\)\s*=>|([A-Za-z_$][\w$]*)\s*=>)\s*\{/g;
+  let best: { name: string; nameAt: number; params: string[] } | null = null;
+  for (let m: RegExpExecArray | null; (m = headRe.exec(src)) && m.index < at; ) {
+    const brace = m.index + m[0].length - 1;
+    if (brace >= at) break;
+    const end = matchBalanced(src, brace);
+    if (end < 0) return best;
+    if (end <= at) { headRe.lastIndex = end; continue; }
+    // Callers use the name it is assigned to (`var Aa=function Ab(a){…}`). A name
+    // of its own counts only for a declaration, at the start of a statement: an
+    // expression's name (`o.f=function Ab(a){…}`) is visible inside it alone.
+    const declared = m[1] === undefined && m[2] !== undefined && /(?:^|[;{}\n]|\*\/)\s*$/.test(src.slice(Math.max(0, m.index - 64), m.index));
+    const name = m[1] ?? (declared ? m[2] : undefined);
+    const nameAt = m[1] !== undefined ? m.index : src.indexOf(m[2], m.index + 8);
+    const params = (m[3] ?? m[4] ?? m[5] ?? "").split(",").map((p) => p.replace(/^\s*\.\.\./, "").replace(/=[\s\S]*$/, "").trim()).filter(Boolean);
+    best = name ? { name, nameAt, params } : null;
+    headRe.lastIndex = brace + 1;
+  }
+  return best;
+}
+
+/**
+ * The string literals an expression comes down to, read without running it: a
+ * literal; an interpolation-free template, tagged or not; an array literal; a
+ * variable assigned exactly once in the file (its initializer); or a call, through
+ * its arguments, which sees through the template-tag and TrustedResourceUrl
+ * wrappers Closure puts around a URL (`za(y(["mustache.js"]))`). Null when any
+ * part is anything else. A caller wanting one URL needs exactly one literal back:
+ * a template with an interpolation gives two pieces and so names nothing.
+ */
+function resolveUrlLiteral(src: string, expr: string, depth: number): string[] | null {
+  const e = expr.replace(/\/\*[\s\S]*?\*\//g, "").trim();
+  if (!e || depth > 6) return null;
+  const whole = /^"([^"\\]*)"$|^'([^'\\]*)'$|^(?:[A-Za-z_$][\w$.]*\s*)?`((?:[^`$\\]|\$(?!\{))*)`$/.exec(e);
+  if (whole) return [whole[1] ?? whole[2] ?? whole[3]];
+  if (e.startsWith("[") && matchBalanced(e, 0) === e.length) return resolveAll(src, e.slice(1, -1), depth);
+  const call = /^[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\(/.exec(e);
+  if (call && matchBalanced(e, call[0].length - 1) === e.length) return resolveAll(src, e.slice(call[0].length, -1), depth);
+  if (/^[A-Za-z_$][\w$]*$/.test(e)) {
+    const init = soleInitializer(src, e);
+    return init === null ? null : resolveUrlLiteral(src, init, depth + 1);
+  }
+  return null;
+}
+
+function resolveAll(src: string, list: string, depth: number): string[] | null {
+  const out: string[] = [];
+  for (const item of splitTopLevelArgs(list)) {
+    if (!item.trim()) continue;
+    const found = resolveUrlLiteral(src, item, depth + 1);
+    if (!found) return null;
+    out.push(...found);
+  }
+  return out;
+}
+
+/**
+ * The expression assigned to `name`, when the file assigns it exactly once
+ * (`var Ba=…`, `,Ba=…` or `Ba=…`) and never updates it in place. Null otherwise.
+ */
+function soleInitializer(src: string, name: string): string | null {
+  const n = identPattern(name);
+  if (new RegExp(`(?<![\\w$.])${n}\\s*(?:[-+*/%&|^]|\\*\\*|<<|>>>?|\\?\\?|&&|\\|\\|)=|(?:\\+\\+|--)\\s*${n}(?![\\w$])|(?<![\\w$.])${n}\\s*(?:\\+\\+|--)`).test(src)) return null;
+  const assigns = [...src.matchAll(new RegExp(`(?<![\\w$.])${n}\\s*=(?![=>])`, "g"))];
+  if (assigns.length !== 1) return null;
+  const start = assigns[0].index + assigns[0][0].length;
+  // The initializer runs to the first top-level "," or ";", or a bracket closing
+  // the statement it sits in.
+  let depth = 0;
+  const stop = walkCode(src, start, (c) => {
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") {
+      if (depth === 0) return true;
+      depth--;
+    } else if ((c === "," || c === ";") && depth === 0) return true;
+    return false;
+  });
+  return src.slice(start, stop < 0 ? src.length : stop);
 }
 
 /**
@@ -875,9 +1045,9 @@ function neutralizeImportScripts(dir: string, rootRel: string, resolveDir: strin
  * the file names it statically imports, and whether any argument is computed at
  * runtime. A whole string literal names a file. A literal that is only part of an
  * expression names nothing (`importScripts('./' + script)` is not "./"); a loop
- * over a literal list is resolved instead. Shared with the analyzer.
+ * over a literal list is resolved instead.
  */
-export function importScriptsTargets(src: string, callAt: number, argList: string): { literals: string[]; dynamic: boolean } {
+function importScriptsTargets(src: string, callAt: number, argList: string): { literals: string[]; dynamic: boolean } {
   const literals: string[] = [];
   let dynamic = false;
   // "…" | '…' | an interpolation-free template (a `${…}` one is runtime-computed).
@@ -1062,7 +1232,7 @@ function collectWebpackChunks(dir: string, swPath: string, hoisted: Set<string>)
     const m = pushRe.exec(src);
     if (!m || !CHUNK_PREFIX_RE.test(src.slice(0, m.index))) continue;
     const open = m.index + m[0].length - 1; // the push's "("
-    const end = matchBalancedParen(src, open);
+    const end = matchBalanced(src, open);
     if (end < 0) continue;
     if (pushArrayElementCount(src.slice(open + 1, end - 1)) !== 2) continue;
     if (!CHUNK_SUFFIX_RE.test(src.slice(end))) continue;
@@ -1144,7 +1314,7 @@ export function workerChunkGlobal(dir: string, manifest: Manifest): string {
 
 /**
  * Given the text between push( and ), verify it is a single array literal and
- * count its top-level elements. Shares walkCode's lexing with matchBalancedParen,
+ * count its top-level elements. Shares walkCode's lexing with matchBalanced,
  * tracking all bracket kinds so a comma only counts at the array's own level.
  * Returns -1 when the text isn't one bare array literal.
  */
