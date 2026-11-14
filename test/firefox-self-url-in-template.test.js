@@ -34,7 +34,7 @@ Promise.all([loaded(box.querySelector("#inline")), loaded(box.querySelector("#al
 // A 1×1 PNG.
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
 
-test("a content script's chrome-extension://${runtime.id} URLs inside templates load the add-on's files", { skip: !firefox && "no Firefox installed" }, async (t) => {
+test("a content script's chrome-extension://${runtime.id} URLs inside templates load the add-on's files", { skip: !firefox && "no Firefox installed", timeout: 180_000 }, async (t) => {
   const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "text/html" });
     res.end("<!doctype html><html><head><title>waiting</title></head><body><p>page</p></body></html>");
@@ -63,10 +63,12 @@ test("a content script's chrome-extension://${runtime.id} URLs inside templates 
       globalThis.__selfUrlTab = win.gBrowser.addTab(${JSON.stringify(url)}, { triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal() });
       return 1;
     })()`);
-    for (let i = 0; i < 150; i++) {
+    // The content script sets the title once both images have settled. Wait on
+    // that with a deadline rather than a fixed number of polls: under load a
+    // tab can take many seconds to commit its page.
+    for (const end = Date.now() + 120_000; Date.now() < end; await sleep(100)) {
       const now = await chrome(`globalThis.__selfUrlTab.linkedBrowser.contentTitle`);
       if (now && now.startsWith("{")) return now;
-      await sleep(100);
     }
     return "timed out";
   });

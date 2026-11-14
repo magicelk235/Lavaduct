@@ -35,7 +35,13 @@
 //   - runtime.onInstalled's repeated "install" for an add-on that is loaded
 //     temporarily again and again;
 //   - the "browser_action" menu context, which Firefox refuses from MV3;
-//   - Chrome's callback on methods Firefox only gives a promise.
+//   - Chrome's callback on methods Firefox only gives a promise;
+//   - messages and ports addressed to the add-on's own Chrome ID;
+//   - tabs.query's frozen condition, which Firefox's schema refuses;
+//   - console methods a content script replaces, which the page's console
+//     seen through an Xray only lets it replace once;
+//   - a content script's own globals read off window or self, which are the
+//     page's window in Firefox.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -2197,6 +2203,42 @@
     defineMissing(window, "chrome", ns);
   }
 
+  // ── A content script's globals on window ───────────────────────────────────
+  // In Chrome's isolated world window is the content script's global, so a
+  // top-level `function localize() {}` or `var settings` is window.localize and
+  // window.settings, and `window.settings = x` changes `settings`. A Firefox
+  // content script's globals live in its sandbox, and window and self are
+  // Xrays to the page's window, which have neither: Liner's content script
+  // called window.localize() as it started and died there. For each name the
+  // content scripts declare and read off window or self, the Xray gets an
+  // accessor onto the sandbox's own property, seen by this add-on's content
+  // scripts only, never by the page. A name window already has is left alone.
+  function installContentGlobals() {
+    var names = CONFIG.contentGlobals;
+    if (!Array.isArray(names) || !names.length || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    names.forEach(function (name) {
+      try {
+        if (typeof name !== "string" || name in window) return;
+        Object.defineProperty(window, name, {
+          configurable: true,
+          enumerable: true,
+          get: function () {
+            // Read the sandbox's own property only: the sandbox inherits from
+            // window, so a plain read of a missing name would come back here.
+            var d = Object.getOwnPropertyDescriptor(G, name);
+            if (!d) return undefined;
+            return d.get ? d.get.call(G) : d.value;
+          },
+          set: function (value) {
+            var d = Object.getOwnPropertyDescriptor(G, name);
+            if (!d) Object.defineProperty(G, name, { value: value, writable: true, enumerable: true, configurable: true });
+            else if (d.set || d.writable) G[name] = value;
+          },
+        });
+      } catch (e) {}
+    });
+  }
+
   // ── The add-on's ID in a CSS selector ──────────────────────────────────────
   // A Chrome ID is 32 letters from a to p, a CSS identifier, so code written for
   // Chrome puts chrome.runtime.id in selectors unquoted: Hypothesis's boot script
@@ -2341,6 +2383,31 @@
     });
   }
 
+  // ── console methods a content script replaces ──────────────────────────────
+  // A content script's console is the page's, seen through an Xray. The first
+  // plain assignment to one of its methods leaves an expando that is neither
+  // writable nor configurable, so the next assignment is ignored, or throws
+  // "'error' is read-only" in strict code. Chrome's isolated world has its own
+  // console, whose methods stay writable: bundles wrap console.error in each
+  // content script (Brisk Teaching's Object.assign), and the second one died at
+  // the top. Each method is defined as a writable expando first, which later
+  // assignments keep (the Xray reports the native method as writable already,
+  // so the descriptor can't tell); the page's console is never touched. Only
+  // emitted for a bundle that assigns to console or passes it on.
+  function installContentConsole() {
+    if (!CONFIG.contentConsole || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    var con = null;
+    try { con = console; } catch (e) {}
+    if (!con) return;
+    Object.keys(con).forEach(function (name) {
+      try {
+        var d = Object.getOwnPropertyDescriptor(con, name);
+        if (!d || typeof d.value !== "function") return;
+        Object.defineProperty(con, name, { value: d.value, writable: true, configurable: true, enumerable: true });
+      } catch (e) {}
+    });
+  }
+
   // ── browserAction in an MV3 add-on ──────────────────────────────────────────
   // Firefox gives an MV3 add-on `action` and no `browserAction`, as Chrome does.
   // A bundle that also ships to Firefox as MV2 picks its Firefox branch by user
@@ -2436,6 +2503,32 @@
           });
           return respond(ns, p, cb);
         });
+      });
+    });
+  }
+
+  // ── tabs.query's frozen condition ──────────────────────────────────────────
+  // Chrome 132 added `frozen` to tabs.query. Firefox's schema has no such
+  // property and throws "Unexpected property" synchronously, so the whole
+  // query fails. Firefox never freezes a tab the way Chrome does: frozen: false
+  // is dropped, and frozen: true matches no tab. Only emitted for a bundle
+  // that names frozen.
+  function installTabsQueryFrozen() {
+    if (!CONFIG.tabsQueryFrozen) return;
+    namespaces.forEach(function (ns) {
+      var tabs = null;
+      try { tabs = ns.tabs; } catch (e) {}
+      if (!tabs || typeof tabs.query !== "function") return;
+      var original = tabs.query;
+      replaceMember(tabs, "query", function (info) {
+        if (!info || typeof info !== "object" || !Object.prototype.hasOwnProperty.call(info, "frozen")) return original.apply(tabs, arguments);
+        var args = Array.prototype.slice.call(arguments);
+        var cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
+        if (info.frozen === true) return respond(ns, Promise.resolve([]), cb);
+        var rest = Object.assign({}, info);
+        delete rest.frozen;
+        args[0] = rest;
+        return original.apply(tabs, args);
       });
     });
   }
@@ -3099,6 +3192,35 @@
         wrapSend(ns, tabs, "sendMessage");
         wrapConnect(tabs, "connect");
       }
+    });
+  }
+
+  // ── Messages addressed to the add-on's own Chrome ID ────────────────────────
+  // Chrome code that knows its ID passes it to runtime.sendMessage and
+  // runtime.connect, and Chrome takes that as a message to itself (webext-redux
+  // stores are built with `extensionId`). Firefox's add-on has its gecko ID, so
+  // the message goes to an extension that doesn't exist: "Receiving end does
+  // not exist", and the port disconnects. The Chrome ID becomes runtime.id for
+  // the call. A lone string is a message, not an ID, as in Chrome. Only emitted
+  // for a bundle that has its Chrome ID in its code.
+  function installOwnChromeIdMessages() {
+    if (!CONFIG.ownIdMessages || !CONFIG.extensionId) return;
+    var chromeId = String(CONFIG.extensionId).toLowerCase();
+    namespaces.forEach(function (ns) {
+      var rt = null;
+      try { rt = ns.runtime; } catch (e) {}
+      if (!rt) return;
+      [["sendMessage", 2], ["connect", 1]].forEach(function (pair) {
+        var original = rt[pair[0]];
+        if (typeof original !== "function") return;
+        replaceMember(rt, pair[0], function () {
+          var args = Array.prototype.slice.call(arguments);
+          if (args.length >= pair[1] && typeof args[0] === "string" && args[0].toLowerCase() === chromeId) {
+            try { args[0] = rt.id; } catch (e) {}
+          }
+          return original.apply(rt, args);
+        });
+      });
     });
   }
 
@@ -4501,11 +4623,14 @@
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installContentGlobals(); } catch (e) { dbg("content globals shim failed:", errorMessage(e)); }
   try { installOwnIdSelectors(); } catch (e) { dbg("own ID selector shim failed:", errorMessage(e)); }
   try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
+  try { installContentConsole(); } catch (e) { dbg("content console shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
   try { installDefaultCookieStore(); } catch (e) { dbg("default cookie store shim failed:", errorMessage(e)); }
+  try { installTabsQueryFrozen(); } catch (e) { dbg("tabs.query frozen shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }
@@ -4517,6 +4642,7 @@
   try { installFalsyListenerArgs(); } catch (e) { dbg("falsy listener argument shim failed:", errorMessage(e)); }
   try { installMessageJsonFallback(); } catch (e) { dbg("message JSON fallback failed:", errorMessage(e)); }
   try { installUserScriptTabMessages(); } catch (e) { dbg("user script tab messages shim failed:", errorMessage(e)); }
+  try { installOwnChromeIdMessages(); } catch (e) { dbg("own Chrome ID message shim failed:", errorMessage(e)); }
   try { installExternalSenders(); } catch (e) { dbg("externally_connectable filter failed:", errorMessage(e)); }
   try { installInjectedScriptShim(); } catch (e) { dbg("injected script shim failed:", errorMessage(e)); }
   try { installDeclarativeContent(); } catch (e) { dbg("declarativeContent shim failed:", errorMessage(e)); }
