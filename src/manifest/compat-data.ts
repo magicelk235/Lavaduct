@@ -193,6 +193,10 @@ const SHIMMED_APIS: Record<string, { message: string; fix: string }> = {
     message: "identity.onSignInChanged exists but never fires, because Firefox has no browser sign-in.",
     fix: "Don't rely on it to detect sign-out.",
   },
+  "declarativeNetRequest.setExtensionActionOptions": {
+    message: "declarativeNetRequest.setExtensionActionOptions exists and settles without effect, because Firefox can't show matched-rule counts on the toolbar button.",
+    fix: "A count turned on with displayActionCountAsBadgeText never shows; set the badge yourself if it matters.",
+  },
 };
 
 // Advice for APIs Firefox lacks, keyed like FIREFOX_API_SUPPORT. Members of a missing
@@ -225,7 +229,6 @@ const API_FIXES: Record<string, string> = {
   "browsingData.removeWebSQL": "Call browsingData.remove() with the data types Firefox supports.",
   "declarativeNetRequest.getMatchedRules": "Firefox doesn't report matched rules; declarativeNetRequest.testMatchOutcome() helps while developing.",
   "declarativeNetRequest.onRuleMatchedDebug": "Firefox doesn't report matched rules; declarativeNetRequest.testMatchOutcome() helps while developing.",
-  "declarativeNetRequest.setExtensionActionOptions": "Firefox can't show matched-rule counts on the toolbar button.",
   "downloads.onDeterminingFilename": "Pass the filename to downloads.download() instead.",
   "downloads.setShelfEnabled": PERMISSION_NOTES["downloads.ui"],
   "downloads.setUiOptions": PERMISSION_NOTES["downloads.ui"],

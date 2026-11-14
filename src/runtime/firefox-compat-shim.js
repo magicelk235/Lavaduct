@@ -2071,6 +2071,25 @@
     });
   }
 
+  // ── declarativeNetRequest.setExtensionActionOptions ─────────────────────────
+  // Firefox can't show matched-rule counts on the toolbar button and has no
+  // setExtensionActionOptions, so a call throws "is not a function". Chrome
+  // builds call it in their install and update handlers, mostly to turn the
+  // count off, and Malwarebytes Browser Guard awaits it in onInstalled: the
+  // steps after it (its uninstall URL; on update its badge colour and stale
+  // dynamic rules) were lost. The backfill settles and changes nothing, which
+  // is what Firefox's toolbar button shows either way.
+  function installActionCountOptions() {
+    namespaces.forEach(function (ns) {
+      var dnr = null;
+      try { dnr = ns.declarativeNetRequest; } catch (e) {}
+      if (!dnr || typeof dnr !== "object") return;
+      defineMissing(dnr, "setExtensionActionOptions", function setExtensionActionOptions(options, cb) {
+        return respond(ns, Promise.resolve(), cb);
+      });
+    });
+  }
+
   // ── storage.session.setAccessLevel, and the area where Firefox has none ─────
   // Firefox's session area has no setAccessLevel and is never open to content
   // scripts. Code waiting on the call's callback would wait forever, so the call
@@ -4140,6 +4159,7 @@
   try { installChromeUrls(); } catch (e) { dbg("chrome:// URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
   try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
+  try { installActionCountOptions(); } catch (e) { dbg("setExtensionActionOptions shim failed:", errorMessage(e)); }
   try { installRuleFilter(); } catch (e) { dbg("declarativeNetRequest rule filter failed:", errorMessage(e)); }
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
