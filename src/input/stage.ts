@@ -2,6 +2,7 @@ import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, write
 import { join, dirname, resolve, relative, sep, posix } from "node:path";
 import type { Manifest } from "../types.js";
 import { mapManifestPaths, parseJsonc } from "../manifest/manifest.js";
+import { matchBalancedBrace } from "../runtime/shim.js";
 
 /** Names/globs excluded from the clean staged extension. */
 const EXCLUDE_EXACT = new Set([
@@ -482,6 +483,8 @@ export function stripDanglingSourcemaps(stageDir: string): number {
 // registered verbatim with the provider (Claude in Chrome:
 // chrome-extension://<id>/oauth_callback.html); rewriting one turns a working
 // login into "Redirect URI … is not supported by client". Keep them intact.
+// (A ${…} host that turns out to be the add-on's own ID is resolved at runtime by
+// rewriteSelfUrlHosts, which leaves every other value as written.)
 // A wildcard host ("chrome-extension://*/…", match patterns) still rewrites —
 // there the scheme is the only thing that can mismatch.
 const CHROME_SCHEME_RE = /(?<![-\w])chrome-extension:(?!\/\/[\w$])/g;
@@ -786,6 +789,78 @@ function rewriteSelfPageExtensionUrls(stageDir: string): number {
     });
     if (changed) {
       writeFileSync(file, next, "utf-8");
+      modified++;
+    }
+  }
+  return modified;
+}
+
+// What rewriteSelfPageExtensionUrls can't see: a `chrome-extension://${…}/` URL that is
+// only part of a template literal, or whose host is not spelled `runtime.id`. Loom styles
+// its in-page UI with `@font-face{src:url('chrome-extension://${chrome.runtime.id}/fonts/…')}`
+// and frames its camera check at `chrome-extension://${id}/html/permissionsCheck.html`,
+// where `id = chrome.runtime.id`; Monica builds every image URL as
+// `chrome-extension://${this.envvars?.extensionId}/static/${name}`, a field it fills from
+// runtime.id at startup. Firefox has no chrome-extension: scheme, so each font, image and
+// frame fails ("unknown protocol"), and its runtime.id is the gecko ID anyway, not the
+// host of any of its URLs.
+//
+// Which host the code means can't be read off the source: the same shape points at
+// ANOTHER extension's page when a bundle probes for one it knows (Grammarly builds
+// `chrome-extension://${thirdPartyExtensionsData[e].MSStoreId}…`), and that must stay as
+// written. So the host is checked when the URL is built, not when it is converted:
+// `chrome-extension://${X}` becomes `${(h => …)(X)}`, which yields the add-on's own
+// moz-extension origin when X is its runtime.id (or its own UUID host, as
+// location.host or @@extension_id give it), and the original text for any other value.
+// X is still evaluated where it was, so `this`, `await` and side effects are unchanged;
+// an interpolation count of a tagged template doesn't change either. Where the context
+// has no extension API (a page-world script), the original text comes back.
+//
+// This doesn't reopen the redirect_uri case CHROME_SCHEME_RE guards against. A provider
+// has the Chrome ID registered, and in Firefox runtime.id is the gecko ID
+// (`<chromeId>.<salt>@lavaduct`, or the --addon-id), so a redirect_uri built from
+// runtime.id never matched a registration to begin with; one built from the Chrome ID
+// as a literal (Claude in Chrome: `chrome-extension://${"fcoe…"}/oauth_callback.html`)
+// isn't the add-on's runtime.id and comes back untouched. The whole-URL form of the
+// same runtime.id URL has been going through getURL since rewriteSelfPageExtensionUrls.
+//
+// Template literals only. `"chrome-extension://" + X` has already had its scheme swapped
+// by rewriteChromeSchemeLiterals, which is right for a UUID host. Must run after the
+// whole-URL and origin rewrites, which give those forms plainer code. The fallback spells
+// the scheme in two pieces so that no pass, this one included, matches its own output.
+const SELF_URL_INTERPOLATION_RE = /(?<![-\w])chrome-extension:\/\/\$\{/g;
+// An interpolation longer than this is not a host expression; leave it alone.
+const MAX_HOST_EXPR = 400;
+const OWN_ORIGIN_FN =
+  '(h=>{try{var r=(globalThis.browser||globalThis.chrome||{}).runtime,o=new URL(r.getURL("/"));' +
+  'if(h===r.id||h===o.host)return o.protocol+"//"+o.host}catch(e){}return"chrome-"+`extension://${h}`})';
+
+function rewriteSelfUrlHosts(stageDir: string): number {
+  let modified = 0;
+  for (const file of walkScripts(stageDir)) {
+    let content: string;
+    try {
+      content = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!content.includes("chrome-extension://${")) continue;
+    let out = "";
+    let last = 0;
+    SELF_URL_INTERPOLATION_RE.lastIndex = 0;
+    for (let m: RegExpExecArray | null; (m = SELF_URL_INTERPOLATION_RE.exec(content)); ) {
+      const brace = m.index + m[0].length - 1;
+      const end = matchBalancedBrace(content, brace);
+      if (end < 0 || end - brace > MAX_HOST_EXPR) continue;
+      const expr = content.slice(brace + 1, end - 1);
+      if (!expr.trim()) continue;
+      // Doubled parens: `${a, b}` is one comma expression, not two arguments.
+      out += content.slice(last, m.index) + "${" + OWN_ORIGIN_FN + "((" + expr + "))}";
+      last = end;
+      SELF_URL_INTERPOLATION_RE.lastIndex = end;
+    }
+    if (last > 0) {
+      writeFileSync(file, out + content.slice(last), "utf-8");
       modified++;
     }
   }
@@ -1300,6 +1375,7 @@ export function applySourceRewrites(stageDir: string, manifest: Manifest, chrome
     { name: "Rewrote runtime.id-based extension-origin checks", count: rewriteExtensionOriginFromRuntimeId(stageDir, chromeId) },
     { name: "Rewrote chrome-extension: scheme literals", count: rewriteChromeSchemeLiterals(stageDir) },
     { name: "Rewrote self-page chrome-extension: URLs to runtime.getURL", count: rewriteSelfPageExtensionUrls(stageDir) },
+    { name: "Rewrote chrome-extension://${…} URLs to resolve the add-on's own ID at runtime", count: rewriteSelfUrlHosts(stageDir) },
     { name: "Rewrote @@extension_id placeholder URLs", count: rewriteExtensionIdPlaceholderUrls(stageDir) },
     { name: "Corrected the background-context check", count: rewriteBackgroundContextChecks(stageDir, manifest) },
     { name: "Dropped the worker's window assignments, which an event page refuses,", count: rewriteWorkerWindowAlias(stageDir, manifest) },
