@@ -34,7 +34,8 @@
 //     temporarily again and again;
 //   - the "browser_action" menu context, which Firefox refuses from MV3;
 //   - Chrome's callback on methods Firefox only gives a promise;
-//   - messages and ports addressed to the add-on's own Chrome ID.
+//   - messages and ports addressed to the add-on's own Chrome ID;
+//   - tabs.query's frozen condition, which Firefox's schema refuses.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -2439,6 +2440,32 @@
     });
   }
 
+  // ── tabs.query's frozen condition ──────────────────────────────────────────
+  // Chrome 132 added `frozen` to tabs.query. Firefox's schema has no such
+  // property and throws "Unexpected property" synchronously, so the whole
+  // query fails. Firefox never freezes a tab the way Chrome does: frozen: false
+  // is dropped, and frozen: true matches no tab. Only emitted for a bundle
+  // that names frozen.
+  function installTabsQueryFrozen() {
+    if (!CONFIG.tabsQueryFrozen) return;
+    namespaces.forEach(function (ns) {
+      var tabs = null;
+      try { tabs = ns.tabs; } catch (e) {}
+      if (!tabs || typeof tabs.query !== "function") return;
+      var original = tabs.query;
+      replaceMember(tabs, "query", function (info) {
+        if (!info || typeof info !== "object" || !Object.prototype.hasOwnProperty.call(info, "frozen")) return original.apply(tabs, arguments);
+        var args = Array.prototype.slice.call(arguments);
+        var cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : null;
+        if (info.frozen === true) return respond(ns, Promise.resolve([]), cb);
+        var rest = Object.assign({}, info);
+        delete rest.frozen;
+        args[0] = rest;
+        return original.apply(tabs, args);
+      });
+    });
+  }
+
   // ── webpack chunks of a worker bundle ──────────────────────────────────────
   // A webpack service worker loads an async chunk with importScripts, which runs
   // it synchronously, so startup code can require the chunk a microtask later.
@@ -4097,6 +4124,7 @@
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
   try { installDefaultCookieStore(); } catch (e) { dbg("default cookie store shim failed:", errorMessage(e)); }
+  try { installTabsQueryFrozen(); } catch (e) { dbg("tabs.query frozen shim failed:", errorMessage(e)); }
   try { installManagedStorage(); } catch (e) { dbg("storage.managed shim failed:", errorMessage(e)); }
   try { installUserScriptEvents(); } catch (e) { dbg("userScripts shim failed:", errorMessage(e)); }
   try { installOnInstalledRepeats(); } catch (e) { dbg("onInstalled shim failed:", errorMessage(e)); }

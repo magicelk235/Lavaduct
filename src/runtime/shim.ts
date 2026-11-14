@@ -127,6 +127,8 @@ const SESSION_ACCESS_RE = /\bsetAccessLevel\b/;
 // the like; Firefox refuses even the default store from an add-on without the
 // cookies permission.
 const COOKIE_STORE_ID_RE = /\bcookieStoreId\b/;
+// Chrome's frozen condition, which Firefox's tabs.query refuses.
+const FROZEN_KEY_RE = /\bfrozen\s*:|["'`]frozen["'`]/;
 // The add-on's own ID read, and selector calls it can end up in unquoted: a
 // Chrome ID is a CSS identifier, Firefox's gecko ID isn't.
 const RUNTIME_ID_RE = /\bruntime\s*(?:\?\.|\.)\s*id\b/;
@@ -198,6 +200,7 @@ interface Usage {
   promiseOnlyCalls: string[];
   sessionAccess: boolean;
   cookieStoreId: boolean;
+  frozenKey: boolean;
   runtimeId: boolean;
   selectorCall: boolean;
   /** The add-on's Chrome ID is written into its code. */
@@ -208,7 +211,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false,
+    extraHeaders: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false,
     promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false,
   };
   const ownId = chromeId.toLowerCase();
@@ -253,6 +256,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
       if (!found.falsyListenerArg) found.falsyListenerArg = hasFalsyListenerArg(src);
       if (!found.browserAction) found.browserAction = BROWSER_ACTION_MEMBER_RE.test(src);
       if (!found.cookieStoreId) found.cookieStoreId = COOKIE_STORE_ID_RE.test(src);
+      if (!found.frozenKey) found.frozenKey = FROZEN_KEY_RE.test(src);
       if (!found.runtimeId) found.runtimeId = RUNTIME_ID_RE.test(src);
       if (!found.selectorCall) found.selectorCall = SELECTOR_CALL_RE.test(src);
       // The page bridge lavaduct writes holds the ID too; it isn't the add-on's code.
@@ -329,6 +333,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     sessionAccess: usage.sessionAccess,
     defaultCookieStore: usage.cookieStoreId,
     ownIdMessages: usage.chromeIdLiteral,
+    tabsQueryFrozen: usage.frozenKey,
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
