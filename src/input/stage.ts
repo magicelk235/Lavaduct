@@ -984,6 +984,13 @@ export function rewriteHoistedBackgroundChecks(stageDir: string, workerScript: s
 // replaces it, window is a getter-only accessor, and the assignment throws in
 // strict code, ending the script there. window already is the global in a page.
 const WINDOW_SELF_ALIAS_RE = /(^|[^.\w$])(?:self|globalThis)\s*\.\s*window\s*=\s*(self|globalThis)\b(?!\s*[.[(=])/g;
+// Bundlers reach the global under a name of their own: webpack 4 passes it to a
+// module as a parameter (`(function(e){e.window={}}).call(this,r(58))`), webpack 5
+// hands it out as `__webpack_require__.g` (`n.g.window=self`). Which object the
+// receiver holds is only known when it runs, so the assignment goes to a
+// throwaway object when the receiver is the global, and to the receiver
+// otherwise. Runs after the alias above, which it would otherwise guard too.
+const WINDOW_ASSIGN_RE = /(^|[^.\w$#])([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*window\s*=(?![=>])/g;
 
 // `import "./x.js"`, `import { a } from "../y.js"`, `export * from "./z.mjs"`:
 // relative static imports, the only ones resolvable without running the code.
@@ -1014,17 +1021,33 @@ function backgroundModuleClosure(stageDir: string, manifest: Manifest): string[]
 
 function rewriteWorkerWindowAlias(stageDir: string, manifest: Manifest): number {
   if (typeof manifest.background?.service_worker !== "string") return 0;
-  let modified = 0;
   // An imported module may be the pages' too; in a page window already is the
   // global, so dropping the alias changes nothing there.
-  for (const file of backgroundModuleClosure(stageDir, manifest)) {
+  return rewriteWindowAssignments(backgroundModuleClosure(stageDir, manifest));
+}
+
+/**
+ * Take a converted worker's window assignments out of the scripts it hoisted
+ * from importScripts (`loaded`, relative to the stage), which the staging
+ * rewrites ran before. A page that loads the same script loses nothing: there
+ * too window is the global, whose window can't be replaced.
+ */
+export function rewriteHoistedWindowAssignments(stageDir: string, loaded: string[]): number {
+  return rewriteWindowAssignments(loaded.map((rel) => join(stageDir, rel.replace(/^\.?\//, ""))));
+}
+
+function rewriteWindowAssignments(files: string[]): number {
+  let modified = 0;
+  for (const file of files) {
     let content: string;
     try {
       content = readFileSync(file, "utf-8");
     } catch {
       continue;
     }
-    const next = content.replace(WINDOW_SELF_ALIAS_RE, "$1$2");
+    const next = content
+      .replace(WINDOW_SELF_ALIAS_RE, "$1$2")
+      .replace(WINDOW_ASSIGN_RE, (_whole, pre: string, recv: string) => `${pre}(${recv}===globalThis?{}:${recv}).window=`);
     if (next !== content) {
       writeFileSync(file, next, "utf-8");
       modified++;
@@ -1238,7 +1261,7 @@ export function applySourceRewrites(stageDir: string, manifest: Manifest, chrome
     { name: "Rewrote self-page chrome-extension: URLs to runtime.getURL", count: rewriteSelfPageExtensionUrls(stageDir) },
     { name: "Rewrote @@extension_id placeholder URLs", count: rewriteExtensionIdPlaceholderUrls(stageDir) },
     { name: "Corrected the background-context check", count: rewriteBackgroundContextChecks(stageDir, manifest) },
-    { name: "Dropped the worker's self.window alias, which an event page refuses", count: rewriteWorkerWindowAlias(stageDir, manifest) },
+    { name: "Dropped the worker's window assignments, which an event page refuses,", count: rewriteWorkerWindowAlias(stageDir, manifest) },
     { name: "Guarded location.ancestorOrigins[0] reads", count: guardAncestorOriginsAccess(stageDir) },
     { name: 'Replaced Function("return this")() global lookups with globalThis', count: rewriteFunctionGlobalLookups(stageDir) },
   ];
