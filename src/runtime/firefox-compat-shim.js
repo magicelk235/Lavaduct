@@ -37,7 +37,9 @@
 //   - messages and ports addressed to the add-on's own Chrome ID;
 //   - tabs.query's frozen condition, which Firefox's schema refuses;
 //   - console methods a content script replaces, which the page's console
-//     seen through an Xray only lets it replace once.
+//     seen through an Xray only lets it replace once;
+//   - a content script's own globals read off window or self, which are the
+//     page's window in Firefox.
 // A member is only defined where Firefox has none, and the parts with side
 // effects are only emitted for an add-on whose code needs them. Firefox's own
 // methods are wrapped only to translate an argument Chrome accepts and Firefox
@@ -2199,6 +2201,42 @@
     defineMissing(window, "chrome", ns);
   }
 
+  // ── A content script's globals on window ───────────────────────────────────
+  // In Chrome's isolated world window is the content script's global, so a
+  // top-level `function localize() {}` or `var settings` is window.localize and
+  // window.settings, and `window.settings = x` changes `settings`. A Firefox
+  // content script's globals live in its sandbox, and window and self are
+  // Xrays to the page's window, which have neither: Liner's content script
+  // called window.localize() as it started and died there. For each name the
+  // content scripts declare and read off window or self, the Xray gets an
+  // accessor onto the sandbox's own property, seen by this add-on's content
+  // scripts only, never by the page. A name window already has is left alone.
+  function installContentGlobals() {
+    var names = CONFIG.contentGlobals;
+    if (!Array.isArray(names) || !names.length || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    names.forEach(function (name) {
+      try {
+        if (typeof name !== "string" || name in window) return;
+        Object.defineProperty(window, name, {
+          configurable: true,
+          enumerable: true,
+          get: function () {
+            // Read the sandbox's own property only: the sandbox inherits from
+            // window, so a plain read of a missing name would come back here.
+            var d = Object.getOwnPropertyDescriptor(G, name);
+            if (!d) return undefined;
+            return d.get ? d.get.call(G) : d.value;
+          },
+          set: function (value) {
+            var d = Object.getOwnPropertyDescriptor(G, name);
+            if (!d) Object.defineProperty(G, name, { value: value, writable: true, enumerable: true, configurable: true });
+            else if (d.set || d.writable) G[name] = value;
+          },
+        });
+      } catch (e) {}
+    });
+  }
+
   // ── The add-on's ID in a CSS selector ──────────────────────────────────────
   // A Chrome ID is 32 letters from a to p, a CSS identifier, so code written for
   // Chrome puts chrome.runtime.id in selectors unquoted: Hypothesis's boot script
@@ -4146,6 +4184,7 @@
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installContentGlobals(); } catch (e) { dbg("content globals shim failed:", errorMessage(e)); }
   try { installOwnIdSelectors(); } catch (e) { dbg("own ID selector shim failed:", errorMessage(e)); }
   try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }

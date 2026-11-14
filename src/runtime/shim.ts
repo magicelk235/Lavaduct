@@ -57,6 +57,8 @@ export interface ShimConfig {
   externalIds?: string[];
   /** The page bridge lets the add-on's pages frame sites (framedSites), with session rules of its own. */
   frameGrants?: boolean;
+  /** The scripts of the manifest's content_scripts that run in the isolated world, root-relative. */
+  contentScripts?: string[];
 }
 
 // Parts of the shim with side effects beyond defining a missing member are only
@@ -272,6 +274,37 @@ function scanUsage(dir: string, chromeId = ""): Usage {
   return found;
 }
 
+// A name a script declares with `function` or `var`, which at the top of a
+// script makes it a property of the global, and a name read off window or self.
+const DECLARED_NAME_RE = /(?<![\w$.])(?:function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|var\s+([A-Za-z_$][\w$]*))/g;
+const WINDOW_MEMBER_RE = /(?<![\w$.])(?:window|self)\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)/g;
+
+/**
+ * The names the content scripts declare and also read off window or self. In
+ * Chrome's isolated world window is the global, so `function f` is window.f; a
+ * Firefox content script's window is an Xray to the page's, which doesn't have
+ * it (the shim's installContentGlobals). A declaration inside a function is
+ * collected too; the shim's accessor answers only what the global holds.
+ */
+function contentGlobalNames(dir: string, scripts: string[]): string[] {
+  const root = resolve(dir);
+  const declared = new Set<string>();
+  const read = new Set<string>();
+  for (const rel of new Set(scripts.map((s) => s.replace(/^(?:\.?\/)+/, "")))) {
+    const file = resolve(root, rel);
+    if (!file.startsWith(root + sep) || basename(file) === SHIM_FILENAME) continue;
+    let src: string;
+    try {
+      src = readFileSync(file, "utf-8");
+    } catch {
+      continue;
+    }
+    for (const m of src.matchAll(DECLARED_NAME_RE)) declared.add(m[1] ?? m[2]);
+    for (const m of src.matchAll(WINDOW_MEMBER_RE)) read.add(m[1]);
+  }
+  return [...read].filter((name) => declared.has(name)).sort();
+}
+
 /**
  * What the shim answers in permissions.contains/request for each permission
  * Firefox doesn't know, where Firefox itself would throw: granted when the
@@ -341,6 +374,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     ownIdMessages: usage.chromeIdLiteral,
     tabsQueryFrozen: usage.frozenKey,
     contentConsole: usage.consolePatch,
+    contentGlobals: contentGlobalNames(dir, config.contentScripts ?? []),
   }).replace(/[\u2028\u2029]/g, (c) => (c === "\u2028" ? "\\u2028" : "\\u2029"));
   let src = readFileSync(join(RUNTIME_DIR, SHIM_TEMPLATE), "utf-8");
   // Exact-string splices: a build without them never contains their source, so
