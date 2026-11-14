@@ -28,6 +28,7 @@ import {
   injectShimIntoHtmlPages,
   usesDebugger,
   usesProxySettings,
+  stageChromeManifest,
   wireBackground,
   workerChunkGlobal,
   writePacSandbox,
@@ -220,6 +221,7 @@ function buildAddon(
 
   let shimFile: string | undefined;
   if (settings.generateShim) {
+    if (stageChromeManifest(src.extPath, stageDir)) log.ok("Kept the manifest.json the extension shipped with, which its code reads back");
     const bg = manifest.background;
     shimFile = writeShim(stageDir, {
       debug: settings.debug === true,

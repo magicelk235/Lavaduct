@@ -19,6 +19,37 @@ export const PAC_PAGE = `${NAME}-pac.html`;
 /** Its script, copied from src/runtime/pac-sandbox.js. */
 const PAC_SCRIPT = `${NAME}-pac.js`;
 const PAC_TEMPLATE = "pac-sandbox.js";
+/** The manifest.json the extension shipped with, which a fetch of its own manifest returns. */
+export const CHROME_MANIFEST_FILE = `${NAME}-chrome-manifest.json`;
+
+// Code, WebAssembly included, that names something: a request URL built at
+// runtime can only be found by the pieces the binary or bundle carries.
+function codeNames(dir: string, needle: string): boolean {
+  const lower = needle.toLowerCase();
+  for (const file of walkScripts(dir, [], [".js", ".mjs", ".wasm"])) {
+    if (basename(file) === SHIM_FILENAME) continue;
+    try {
+      if (readFileSync(file, "latin1").toLowerCase().includes(lower)) return true;
+    } catch {}
+  }
+  return false;
+}
+
+/**
+ * Stage the manifest.json the extension shipped with beside the rewritten one,
+ * for code (or WebAssembly) that names manifest.json: in Chrome a fetch of the
+ * extension's own manifest.json returns the file as shipped, and McAfee
+ * WebAdvisor checks it. Returns whether it was staged.
+ */
+export function stageChromeManifest(extPath: string, stageDir: string): boolean {
+  if (!codeNames(stageDir, "manifest.json")) return false;
+  try {
+    writeFileSync(join(stageDir, CHROME_MANIFEST_FILE), readFileSync(join(extPath, "manifest.json")));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** Build-time settings baked into the shim. */
 export interface ShimConfig {
@@ -103,6 +134,14 @@ const CHROME_NET_ERROR_RE = /net::ERR_(?:BLOCKED_BY_CLIENT|ABORTED)\b/;
 const BROWSER_ACTION_CONTEXT_RE = /["'`]browser_action["'`]/;
 // A body read as JSON, whose objects a Firefox content script gets from the page's realm.
 const BODY_JSON_RE = /\.\s*json\s*\(\s*\)/;
+// A write onto a built-in reached through a global alias (`root.Reflect = …`,
+// `Object.defineProperty(root.Reflect, …)`, `global.Symbol.observable = …`),
+// which in a Firefox content script lands on the page's built-in when the alias
+// is self or window.
+const BUILTIN_ALIAS_WRITE_RE = /[\w$]\s*\.\s*(?:Object|Array|Reflect|Symbol|Promise|Map|Set|WeakMap|WeakSet|JSON|Math|Number|String|Date|RegExp|Error|ArrayBuffer|Uint8Array|Intl|Proxy)(?:\s*\.\s*[\w$]+){0,2}\s*=(?![=>])|\bdefinePropert(?:y|ies)\s*\(\s*[\w$]+\s*\.\s*(?:Object|Array|Reflect|Symbol|Promise|Map|Set|WeakMap|WeakSet|JSON|Math|Number|String|Date|RegExp|Error|ArrayBuffer|Uint8Array|Intl|Proxy)\s*[,.)]/;
+// Code written for Firefox's content-script Xrays, which may build page values
+// with `new window.Object()` and the like on purpose.
+const FIREFOX_AWARE_RE = /\b(?:wrappedJSObject|cloneInto|exportFunction|XPCNativeWrapper)\b/;
 // The storage areas whose set the clone fallback wraps.
 const STORAGE_AREA_RE = /\bstorage\s*\.\s*(?:local|sync|session)\b/;
 // Chrome's proxy settings, which the shim emulates on proxy.onRequest.
@@ -212,6 +251,8 @@ interface Usage {
   chromeNetErrors: boolean;
   browserActionContext: boolean;
   bodyJson: boolean;
+  builtinAliasWrite: boolean;
+  firefoxAware: boolean;
   storage: boolean;
   proxySettings: boolean;
   messaging: boolean;
@@ -240,7 +281,7 @@ function scanUsage(dir: string, chromeId = ""): Usage {
   const found: Usage = {
     favicon: false, offscreen: false, newTab: false, shortcutsPage: false, serviceWorkerScope: false,
     serviceWorkerClients: false, serviceWorkerRegistration: false, serviceWorkerState: false, pushManager: false, serviceWorkerManifest: false, serviceWorkerLifecycle: false, locks: false, permissions: false,
-    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
+    extraHeaders: false, chromeNetErrors: false, browserActionContext: false, bodyJson: false, builtinAliasWrite: false, firefoxAware: false, storage: false, proxySettings: false, messaging: false, customEvent: false, storageGlobalsAssigned: [], falsyListenerArg: false, injectsFiles: false, injectsCss: false, declarativeContent: false, browserAction: false, cookieStoreId: false, frozenKey: false, consolePatch: false,
     promiseOnlyCalls: [], sessionAccess: false, runtimeId: false, selectorCall: false, chromeIdLiteral: false, windowMethodTaken: false, homepageUrl: false, hasListenersCall: false,
   };
   const ownId = chromeId.toLowerCase();
@@ -270,6 +311,8 @@ function scanUsage(dir: string, chromeId = ""): Usage {
       if (!found.chromeNetErrors) found.chromeNetErrors = CHROME_NET_ERROR_RE.test(src);
       if (!found.browserActionContext) found.browserActionContext = BROWSER_ACTION_CONTEXT_RE.test(src);
       if (!found.bodyJson) found.bodyJson = BODY_JSON_RE.test(src);
+      if (!found.builtinAliasWrite) found.builtinAliasWrite = BUILTIN_ALIAS_WRITE_RE.test(src);
+      if (!found.firefoxAware) found.firefoxAware = FIREFOX_AWARE_RE.test(src);
       if (!found.storage) found.storage = STORAGE_AREA_RE.test(src);
       if (!found.proxySettings) found.proxySettings = PROXY_SETTINGS_RE.test(src);
       if (!found.messaging) found.messaging = MESSAGING_RE.test(src);
@@ -358,6 +401,9 @@ function shimSource(dir: string, config: ShimConfig): string {
     noDefaultPanel: config.noDefaultPanel === true,
     panelQuery: (config.panelQuery ?? "").replace(/^\?/, ""),
     extensionId: config.extensionId ?? "",
+    // Requests to chrome-extension://<Chrome ID>/…, for code that names the ID.
+    ownChromeUrls: !!config.extensionId && codeNames(dir, config.extensionId),
+    chromeManifest: existsSync(join(dir, CHROME_MANIFEST_FILE)) ? CHROME_MANIFEST_FILE : "",
     favicon: usage.favicon,
     offscreen: usage.offscreen,
     newTab: usage.newTab,
@@ -390,6 +436,7 @@ function shimSource(dir: string, config: ShimConfig): string {
     webRequestErrorNames: usage.chromeNetErrors,
     menuActionContext: usage.browserActionContext,
     contentBodyJson: usage.bodyJson,
+    contentWindowBuiltins: usage.builtinAliasWrite && !usage.firefoxAware,
     storageClone: usage.storage,
     proxySettings: usage.proxySettings,
     pacPage: usage.proxySettings ? PAC_PAGE : "",

@@ -1164,6 +1164,57 @@
     } catch (e) {}
   }
 
+  // ── Requests to the add-on's own Chrome origin and manifest ────────────────
+  // In Chrome an extension can request its own files at
+  // chrome-extension://<its id>/…, and its own manifest.json reads as shipped.
+  // Firefox fails the first with "NetworkError when attempting to fetch
+  // resource", the add-on living at moz-extension://<uuid>/, and its
+  // manifest.json is the one lavaduct rewrote. McAfee WebAdvisor's WASM builds
+  // chrome-extension://<its id>/manifest.json at runtime and checks its content;
+  // without it the background never set up its message dispatcher. A URL that
+  // fetch or XMLHttpRequest opens at the Chrome origin goes to the add-on's
+  // own, and in its pages its manifest.json comes from the copy staged as
+  // shipped. Only the URL a request opens is mapped: an own-origin URL inside a
+  // query string or a body (an OAuth redirect_uri) goes out as written.
+  // Emitted for code that names the Chrome ID, or manifest.json.
+  function installOwnChromeUrls() {
+    var chromeOrigin = CONFIG.ownChromeUrls && CONFIG.extensionId ? "chrome-extension://" + String(CONFIG.extensionId).toLowerCase() : "";
+    var shipped = isExtensionPage && CONFIG.chromeManifest ? ORIGIN + "/" + CONFIG.chromeManifest : "";
+    if ((!chromeOrigin && !shipped) || !ORIGIN) return;
+    function mapped(raw) {
+      var u;
+      try { u = new URL(String(raw), loc ? loc.href : undefined); } catch (e) { return null; }
+      var origin = originOf(u).toLowerCase();
+      var fromChrome = !!chromeOrigin && origin === chromeOrigin;
+      if (!fromChrome && origin !== ORIGIN.toLowerCase()) return null;
+      if (shipped && u.pathname === "/manifest.json") return shipped;
+      return fromChrome ? ORIGIN + u.pathname + u.search + u.hash : null;
+    }
+    var prior = null;
+    try { prior = G.fetch; } catch (e) {}
+    if (typeof prior === "function") {
+      try {
+        G.fetch = function fetch(input, init) {
+          var isRequest = typeof Request === "function" && input instanceof Request;
+          var to = mapped(isRequest ? input.url : input);
+          if (to === null) return prior.apply(G, arguments);
+          return prior.call(G, isRequest ? new Request(to, input) : to, init);
+        };
+      } catch (e) {}
+    }
+    var xhr = null;
+    try { xhr = typeof XMLHttpRequest === "function" ? XMLHttpRequest.prototype : null; } catch (e) {}
+    if (xhr && typeof xhr.open === "function") {
+      var nativeOpen = xhr.open;
+      replaceMember(xhr, "open", function open(method, url) {
+        var args = Array.prototype.slice.call(arguments);
+        var to = args.length > 1 ? mapped(url) : null;
+        if (to !== null) args[1] = to;
+        return nativeOpen.apply(this, args);
+      });
+    }
+  }
+
   // ── ServiceWorkerGlobalScope ────────────────────────────────────────────────
   // A Chrome background is a service worker, and a bundle that shares code
   // between it and its pages asks where it runs:
@@ -2035,6 +2086,25 @@
     });
   }
 
+  // ── declarativeNetRequest.setExtensionActionOptions ─────────────────────────
+  // Firefox can't show matched-rule counts on the toolbar button and has no
+  // setExtensionActionOptions, so a call throws "is not a function". Chrome
+  // builds call it in their install and update handlers, mostly to turn the
+  // count off, and Malwarebytes Browser Guard awaits it in onInstalled: the
+  // steps after it (its uninstall URL; on update its badge colour and stale
+  // dynamic rules) were lost. The backfill settles and changes nothing, which
+  // is what Firefox's toolbar button shows either way.
+  function installActionCountOptions() {
+    namespaces.forEach(function (ns) {
+      var dnr = null;
+      try { dnr = ns.declarativeNetRequest; } catch (e) {}
+      if (!dnr || typeof dnr !== "object") return;
+      defineMissing(dnr, "setExtensionActionOptions", function setExtensionActionOptions(options, cb) {
+        return respond(ns, Promise.resolve(), cb);
+      });
+    });
+  }
+
   // ── storage.session.setAccessLevel, and the area where Firefox has none ─────
   // Firefox's session area has no setAccessLevel and is never open to content
   // scripts. Code waiting on the call's callback would wait forever, so the call
@@ -2208,6 +2278,45 @@
     var ns = api;
     try { if (typeof chrome === "object" && chrome) ns = chrome; } catch (e) {}
     defineMissing(window, "chrome", ns);
+  }
+
+  // ── The script's own built-ins on window in content scripts ────────────────
+  // The same Xray makes `window.Reflect` and `self.Reflect` the page's Reflect
+  // (`self.Object !== Object`), where Chrome's isolated world has
+  // `window.Reflect === Reflect`. Defining a function on a page object through
+  // the Xray throws "Not allowed to define cross-origin object as property on
+  // [Object] or [Array] XrayWrapper": reflect-metadata (tsyringe, inversify)
+  // takes `self` as its global and defines its functions on root.Reflect, and
+  // Avast Online Security's content script died on that line on every page.
+  // The ECMAScript built-ins on the Xray become accessors onto the sandbox's own
+  // (a script's own `var Map` included), seen by this add-on's content scripts
+  // only. Function stays the page's, so code it builds keeps running under the
+  // page's CSP, and so do the window's web APIs. Emitted for a bundle that
+  // writes onto a built-in through a global alias, and never for one that is
+  // Firefox-aware (wrappedJSObject, cloneInto, exportFunction), which may build
+  // page values with `new window.Object()` on purpose.
+  var OWN_BUILTINS = ["Object", "Array", "Boolean", "Number", "String", "Symbol", "BigInt", "Math", "JSON", "Reflect", "Proxy",
+    "Promise", "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "Date", "RegExp", "Intl", "Atomics", "Iterator",
+    "Error", "AggregateError", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
+    "ArrayBuffer", "SharedArrayBuffer", "DataView", "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+    "Int32Array", "Uint32Array", "Float16Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array"];
+  function installContentWindowBuiltins() {
+    if (!CONFIG.contentWindowBuiltins || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    OWN_BUILTINS.forEach(function (name) {
+      try {
+        if (!Object.getOwnPropertyDescriptor(G, name)) return;
+        Object.defineProperty(window, name, {
+          configurable: true,
+          enumerable: false,
+          get: function () {
+            var d = Object.getOwnPropertyDescriptor(G, name);
+            if (!d) return undefined;
+            return d.get ? d.get.call(G) : d.value;
+          },
+          set: function (value) { G[name] = value; },
+        });
+      } catch (e) {}
+    });
   }
 
   // ── A content script's globals on window ───────────────────────────────────
@@ -4746,6 +4855,7 @@
   try { installOffscreen(); } catch (e) { dbg("offscreen shim failed:", errorMessage(e)); }
   try { installIdentity(); } catch (e) { dbg("identity shim failed:", errorMessage(e)); }
   try { installFavicon(); } catch (e) { dbg("favicon shim failed:", errorMessage(e)); }
+  try { installOwnChromeUrls(); } catch (e) { dbg("own Chrome URL shim failed:", errorMessage(e)); }
   try { installServiceWorkerScope(); } catch (e) { dbg("ServiceWorkerGlobalScope shim failed:", errorMessage(e)); }
   try { installAssignableStorageGlobals(); } catch (e) { dbg("assignable storage globals failed:", errorMessage(e)); }
   try { installServiceWorkerRegistration(); } catch (e) { dbg("registration shim failed:", errorMessage(e)); }
@@ -4757,10 +4867,12 @@
   try { installChromeUrls(); } catch (e) { dbg("chrome:// URL shim failed:", errorMessage(e)); }
   try { installBackendOrigin(); } catch (e) { dbg("backend origin shim failed:", errorMessage(e)); }
   try { installEnums(); } catch (e) { dbg("enum shim failed:", errorMessage(e)); }
+  try { installActionCountOptions(); } catch (e) { dbg("setExtensionActionOptions shim failed:", errorMessage(e)); }
   try { installRuleFilter(); } catch (e) { dbg("declarativeNetRequest rule filter failed:", errorMessage(e)); }
   try { installGetContexts(); } catch (e) { dbg("getContexts shim failed:", errorMessage(e)); }
   try { installSessionAccessLevel(); } catch (e) { dbg("storage.session.setAccessLevel shim failed:", errorMessage(e)); }
   try { installWindowChrome(); } catch (e) { dbg("window.chrome shim failed:", errorMessage(e)); }
+  try { installContentWindowBuiltins(); } catch (e) { dbg("content window built-ins shim failed:", errorMessage(e)); }
   try { installContentGlobals(); } catch (e) { dbg("content globals shim failed:", errorMessage(e)); }
   try { installOwnIdSelectors(); } catch (e) { dbg("own ID selector shim failed:", errorMessage(e)); }
   try { installPageEventDetail(); } catch (e) { dbg("CustomEvent detail shim failed:", errorMessage(e)); }
