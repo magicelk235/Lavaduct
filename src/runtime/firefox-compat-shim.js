@@ -2557,6 +2557,67 @@
     });
   }
 
+  // ── DOM prototype and window methods a content script replaces ─────────────
+  // A content script sees the page's window and DOM prototypes through Xrays,
+  // and they behave as console does (J11): the first plain assignment to a
+  // method they own (EventTarget.prototype.addEventListener,
+  // XMLHttpRequest.prototype.open, window.fetch) leaves an expando that is
+  // neither writable nor configurable, and the next throws `"addEventListener"
+  // is read-only` in strict code. An assignment on an object that only inherits
+  // the method (history.pushState) makes a writable expando and is fine.
+  // Chrome's isolated world has prototypes of its own that stay writable, and
+  // instrumentation wraps them in every content script, or twice in one
+  // (Sentry's fill() from its DOM and TryCatch integrations: Magical). Each
+  // member the bundle replaces (CONFIG.contentPatchedMembers: names under the
+  // interface whose prototype they're assigned on, or under "" when the code
+  // picks the object) is defined as a writable expando first, holding the
+  // method it already has, which later assignments keep. A name under "" is
+  // looked for on window and up the prototype chains of window, document and
+  // its root element. Expandos live in the content script's view only; the
+  // page's objects are never touched. Only emitted for a bundle that replaces
+  // prototype members or calls a fill helper with a literal name.
+  function installContentPatchedMembers() {
+    var spec = CONFIG.contentPatchedMembers;
+    if (!spec || isExtensionPage || typeof window !== "object" || !window || window === G) return;
+    var anyNames = spec[""] || [];
+    function keep(obj, names) {
+      names.forEach(function (name) {
+        try {
+          var d = Object.getOwnPropertyDescriptor(obj, name);
+          if (!d || typeof d.value !== "function" || !d.writable || !d.configurable) return;
+          Object.defineProperty(obj, name, { value: d.value, writable: true, configurable: true, enumerable: d.enumerable });
+        } catch (e) {}
+      });
+    }
+    if (anyNames.length) {
+      var seen = [];
+      var root = null;
+      try { root = document.documentElement; } catch (e) {}
+      [window, typeof document === "object" ? document : null, root].forEach(function (o) {
+        // Up to, not including, Object.prototype.
+        for (var depth = 0; o && depth < 16; depth++) {
+          var next = null;
+          try { next = Object.getPrototypeOf(o); } catch (e) {}
+          if (!next) break;
+          if (seen.indexOf(o) < 0) {
+            seen.push(o);
+            keep(o, anyNames);
+          }
+          o = next;
+        }
+      });
+    }
+    Object.keys(spec).forEach(function (iface) {
+      if (!iface) return;
+      var proto = null;
+      try {
+        var C = G[iface];
+        proto = typeof C === "function" ? C.prototype : null;
+      } catch (e) {}
+      if (proto && typeof proto === "object") keep(proto, spec[iface].concat(anyNames));
+    });
+  }
+
   // ── downloads.onDeterminingFilename ────────────────────────────────────────
   // Firefox has no such event: it takes the filename in downloads.download()
   // up front, before the download has an id, so Chrome's order (the callback
@@ -4879,6 +4940,7 @@
   try { installWindowMethodReceivers(); } catch (e) { dbg("window method receiver shim failed:", errorMessage(e)); }
   try { installContentBodyJson(); } catch (e) { dbg("content json() shim failed:", errorMessage(e)); }
   try { installContentConsole(); } catch (e) { dbg("content console shim failed:", errorMessage(e)); }
+  try { installContentPatchedMembers(); } catch (e) { dbg("content patched members shim failed:", errorMessage(e)); }
   try { installBrowserActionAlias(); } catch (e) { dbg("browserAction alias failed:", errorMessage(e)); }
   try { installDeterminingFilename(); } catch (e) { dbg("downloads.onDeterminingFilename shim failed:", errorMessage(e)); }
   try { installHomepageUrl(); } catch (e) { dbg("management homepageUrl shim failed:", errorMessage(e)); }
