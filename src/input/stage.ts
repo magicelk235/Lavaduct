@@ -2,7 +2,7 @@ import { cpSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, write
 import { join, dirname, resolve, relative, sep, posix } from "node:path";
 import type { Manifest } from "../types.js";
 import { mapManifestPaths, parseJsonc } from "../manifest/manifest.js";
-import { literalStarts, matchBalancedBrace } from "../runtime/shim.js";
+import { literalStarts, matchBalancedBrace } from "../runtime/js-scan.js";
 
 /** Names/globs excluded from the clean staged extension. */
 const EXCLUDE_EXACT = new Set([
