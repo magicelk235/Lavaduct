@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { readAppConstants } from "./appconstants.js";
 import { platform, type InstallCandidate, type Sandbox } from "./platform/index.js";
 import { pathKey } from "./platform/shared.js";
@@ -61,8 +62,18 @@ export function selectFirefox(installs: FirefoxInstall[], selector?: string): Fi
   const channel = Object.hasOwn(CHANNEL_ALIASES, lowered) ? CHANNEL_ALIASES[lowered] : lowered;
   const byChannel = installs.find((i) => i.channel === channel);
   if (byChannel) return byChannel;
+  // A found install's own launcher, compared without following symlinks: the
+  // snap's /snap/bin/firefox links to /usr/bin/snap, which leads to no install.
+  const launcher = launcherKey(selector);
+  const byLauncher = installs.find((i) => launcherKey(i.binary) === launcher);
+  if (byLauncher) return byLauncher;
   const candidate = platform.candidateFromPath(selector);
   if (!candidate) return undefined;
   const key = pathKey(candidate.installDir);
   return installs.find((i) => pathKey(i.installDir) === key) ?? toInstall(candidate);
+}
+
+function launcherKey(path: string): string {
+  const p = resolve(path);
+  return process.platform === "win32" ? p.toLowerCase() : p;
 }
