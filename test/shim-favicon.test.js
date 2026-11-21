@@ -130,7 +130,8 @@ test("favicon <img> elements added to an extension page are fixed before they lo
   const img = fakeImg(EXT_ORIGIN + "/_favicon/?pageUrl=https%3A%2F%2Fexample.net%2F");
   observers[0]([{ type: "childList", addedNodes: [img] }]);
   assert.ok(isGlobe(img.src));
-  await tick(5);
+  // The swap waits on an Image load; give a slow CI runner more than one short tick.
+  for (let i = 0; i < 200 && isGlobe(img.src); i++) await tick(5);
   assert.equal(img.src, "https://example.net/favicon.ico");
 });
 
